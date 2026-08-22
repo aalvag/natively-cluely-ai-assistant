@@ -173,6 +173,26 @@ async function updatePromptCache(promptText: string): Promise<void> {
 
 if (!parentPort) throw new Error('whisperWorker must be run as a Worker thread');
 
+process.on('uncaughtException', (err: any) => {
+  console.error('[WhisperWorker] Uncaught exception:', err);
+  try {
+    parentPort?.postMessage({
+      type: 'error',
+      message: err?.message || String(err),
+    });
+  } catch {}
+});
+
+process.on('unhandledRejection', (reason: any) => {
+  console.error('[WhisperWorker] Unhandled rejection:', reason);
+  try {
+    parentPort?.postMessage({
+      type: 'error',
+      message: reason?.message || String(reason),
+    });
+  } catch {}
+});
+
 // Loads @huggingface/transformers via a real dynamic import() at runtime.
 // Using new Function prevents TypeScript from rewriting import() → require()
 // in the CommonJS output, which would fail because the package is ESM-only.
@@ -269,8 +289,9 @@ parentPort.on('message', async (msg: any) => {
     }
     try {
       const { pipeline, env } = await loadTransformers();
-
-      env.cacheDir = msg.cacheDir;
+      if (msg.cacheDir) {
+        env.cacheDir = msg.cacheDir;
+      }
       env.allowRemoteModels = true;
 
       // Apply hardware-specific execution providers (CoreML, DirectML, CUDA, CPU)
@@ -563,7 +584,8 @@ parentPort.on('message', async (msg: any) => {
         opts.prompt_ids = cachedPromptIds;
       }
 
-      const result = await pipe(msg.audio, opts);
+      const audioInput = msg.audio instanceof Float32Array ? new Float32Array(msg.audio) : new Float32Array(Object.values(msg.audio));
+      const result = await pipe(audioInput, opts);
       parentPort!.postMessage({
         type: streaming ? 'partial' : 'result',
         taskId: msg.taskId,

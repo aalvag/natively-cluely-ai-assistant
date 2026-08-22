@@ -113,6 +113,18 @@ const buildOptions = {
   banner: {
     js: `try{if(process.env.NATIVELY_UI_EVAL==='1'&&!globalThis.__nativelyDnsPinned){globalThis.__nativelyDnsPinned=1;var __dns=require('dns');var __ol=__dns.lookup.bind(__dns);__dns.lookup=function(h,o,cb){if(typeof o==='function'){cb=o;o={};}if(h==='api.natively.software'){return __dns.resolve4(h,function(e,a){if(e||!a||!a.length)return __ol(h,o,cb);if(o&&o.all)return cb(null,[{address:a[0],family:4}]);return cb(null,a[0],4);});}return __ol(h,o,cb);};console.log('[eval] dns.lookup→resolve4 pinned for api.natively.software');}}catch(__e){try{console.warn('[eval] dns pin banner failed:',__e&&__e.message);}catch(_){}}`,
   },
+  plugins: [
+    ...(!fs.existsSync(premiumDir) ? [{
+      name: 'external-premium-fallback',
+      setup(b) {
+        b.onResolve({ filter: /premium/ }, args => {
+          if (args.kind !== 'entry-point') {
+            return { path: args.path, external: true };
+          }
+        });
+      },
+    }] : []),
+  ],
   logLevel: 'warning',
 };
 

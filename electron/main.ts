@@ -3487,9 +3487,7 @@ export class AppState {
       // trailing finals after Stop. `_isDraining` covers the ~250 ms grace
       // window between Stop click and STT socket close so the user's last
       // sentence isn't silently dropped.
-      if (!this.isMeetingActive && !this._isDraining) {
-        return;
-      }
+      if (!this.isMeetingActive && !this._isDraining) return;
 
       this.intelligenceManager.handleTranscript({
         speaker: speaker,
@@ -5875,21 +5873,6 @@ export class AppState {
   private startCaptureChannels(context: string): CaptureChannelStartResult {
     const started = { mic: false, system: false };
     try {
-      this.microphoneCapture?.start();
-      this.googleSTT_User?.start();
-      started.mic = true;
-    } catch (err) {
-      console.error(`[Main] ${context}: mic channel failed to start:`, err);
-      this.sendAudioCaptureFailed({
-        channel: 'mic',
-        message: `Microphone failed to start (${(err as Error)?.message || 'unknown error'}). Check that no other app holds the mic — the meeting continues with system audio only.`,
-        attempt: 0,
-        maxAttempts: 0,
-        terminal: true,
-        stuck: false,
-      });
-    }
-    try {
       this.systemAudioCapture?.start();
       this.googleSTT?.start();
       started.system = true;
@@ -5898,6 +5881,21 @@ export class AppState {
       this.sendAudioCaptureFailed({
         channel: 'system',
         message: `System audio failed to start (${(err as Error)?.message || 'unknown error'}). The meeting continues with microphone only.`,
+        attempt: 0,
+        maxAttempts: 0,
+        terminal: true,
+        stuck: false,
+      });
+    }
+    try {
+      this.microphoneCapture?.start();
+      this.googleSTT_User?.start();
+      started.mic = true;
+    } catch (err) {
+      console.error(`[Main] ${context}: mic channel failed to start:`, err);
+      this.sendAudioCaptureFailed({
+        channel: 'mic',
+        message: `Microphone failed to start (${(err as Error)?.message || 'unknown error'}). Check that no other app holds the mic — the meeting continues with system audio only.`,
         attempt: 0,
         maxAttempts: 0,
         terminal: true,
