@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-    X, Plus, Trash2, Check, Sparkles, FileText, Upload,
+    X, Plus, Trash2, Check, Sparkles, FileText, Upload, FolderOpen,
     Briefcase, Code2, Users, GraduationCap, Compass,
     Layers, BookOpen, CheckCircle2, ChevronRight, AlertCircle, Save
 } from 'lucide-react';
@@ -214,6 +214,8 @@ export const ModesSettings: React.FC<ModesSettingsProps> = ({
         }
     };
 
+    const [isUploadingFolder, setIsUploadingFolder] = useState(false);
+
     // ── Upload Reference File ──────────────────────────────────────────────────
     const handleUploadFile = async () => {
         if (!selectedModeId) return;
@@ -222,13 +224,33 @@ export const ModesSettings: React.FC<ModesSettingsProps> = ({
             const api = (window as any).electronAPI;
             if (!api?.modesUploadReferenceFile) return;
             const res = await api.modesUploadReferenceFile(selectedModeId);
-            if (res?.file) {
+            if (res?.files && Array.isArray(res.files)) {
+                setReferenceFiles(prev => [...prev, ...res.files]);
+            } else if (res?.file) {
                 setReferenceFiles(prev => [...prev, res.file]);
             }
         } catch (err) {
             console.error('[ModesSettings] Failed to upload file:', err);
         } finally {
             setIsUploadingFile(false);
+        }
+    };
+
+    // ── Upload Reference Folder / Repo ──────────────────────────────────────────
+    const handleUploadFolder = async () => {
+        if (!selectedModeId) return;
+        setIsUploadingFolder(true);
+        try {
+            const api = (window as any).electronAPI;
+            if (!api?.modesUploadReferenceFolder) return;
+            const res = await api.modesUploadReferenceFolder(selectedModeId);
+            if (res?.ingestedFiles && Array.isArray(res.ingestedFiles)) {
+                setReferenceFiles(prev => [...prev, ...res.ingestedFiles]);
+            }
+        } catch (err) {
+            console.error('[ModesSettings] Failed to upload folder:', err);
+        } finally {
+            setIsUploadingFolder(false);
         }
     };
 
@@ -491,53 +513,83 @@ export const ModesSettings: React.FC<ModesSettingsProps> = ({
 
                             {/* Reference Documents Section */}
                             <div className="space-y-3 pt-2">
-                                <div className="flex items-center justify-between">
+                                <div className="flex items-center justify-between gap-4">
                                     <div>
                                         <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                                            {t('Reference Files & Knowledge Documents')}
+                                            {t('Reference Files, Code & Knowledge Documents')}
                                         </h4>
                                         <p className={`text-[11px] ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>
-                                            {t('Upload PDFs, notes, or slides that the AI will semantically retrieve in real time.')}
+                                            {t('Upload CVs, PRDs, single code files, or entire repositories for real-time RAG grounding.')}
                                         </p>
                                     </div>
-                                    <button
-                                        onClick={handleUploadFile}
-                                        disabled={isUploadingFile}
-                                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-medium transition-colors"
-                                    >
-                                        <Upload size={13} />
-                                        <span>{isUploadingFile ? t('Uploading...') : t('Upload File')}</span>
-                                    </button>
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        <button
+                                            onClick={handleUploadFile}
+                                            disabled={isUploadingFile || isUploadingFolder}
+                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-medium transition-colors"
+                                        >
+                                            <Upload size={13} />
+                                            <span>{isUploadingFile ? t('Uploading...') : t('Upload Files')}</span>
+                                        </button>
+                                        <button
+                                            onClick={handleUploadFolder}
+                                            disabled={isUploadingFile || isUploadingFolder}
+                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 text-emerald-400 text-xs font-medium transition-colors"
+                                        >
+                                            <FolderOpen size={13} />
+                                            <span>{isUploadingFolder ? t('Scanning...') : t('Upload Repo / Folder')}</span>
+                                        </button>
+                                    </div>
                                 </div>
 
                                 {referenceFiles.length === 0 ? (
                                     <div className={`p-4 rounded-xl border border-dashed text-center text-xs ${isLight ? 'border-slate-300 text-slate-400' : 'border-white/10 text-slate-500'}`}>
-                                        {t('No reference documents attached to this mode yet.')}
+                                        {t('No reference documents or code attached to this mode yet.')}
                                     </div>
                                 ) : (
-                                    <div className="space-y-1.5">
-                                        {referenceFiles.map((file) => (
-                                            <div
-                                                key={file.id}
-                                                className={`flex items-center justify-between p-2.5 rounded-lg border text-xs ${
-                                                    isLight ? 'bg-white border-slate-200' : 'bg-white/5 border-white/10'
-                                                }`}
-                                            >
-                                                <div className="flex items-center gap-2 truncate">
-                                                    <FileText size={15} className="text-blue-400 shrink-0" />
-                                                    <span className="font-medium truncate">{file.fileName}</span>
-                                                    {file.pageCount && (
-                                                        <span className="text-[10px] opacity-50 shrink-0">({file.pageCount} pgs)</span>
-                                                    )}
-                                                </div>
-                                                <button
-                                                    onClick={() => handleDeleteFile(file.id)}
-                                                    className="text-red-400 hover:text-red-300 p-1 transition-colors"
+                                    <div className="space-y-1.5 max-h-60 overflow-y-auto custom-scrollbar">
+                                        {referenceFiles.map((file) => {
+                                            const ext = file.fileName.split('.').pop()?.toLowerCase() || '';
+                                            const isCode = ['ts', 'tsx', 'js', 'jsx', 'py', 'java', 'go', 'rs', 'cpp', 'c', 'h', 'cs', 'sql', 'sh', 'vue', 'svelte', 'html', 'css', 'yaml', 'yml', 'json'].includes(ext);
+                                            const isPdf = ext === 'pdf';
+                                            const isDocx = ext === 'docx';
+                                            const isMd = ext === 'md' || ext === 'markdown';
+
+                                            return (
+                                                <div
+                                                    key={file.id}
+                                                    className={`flex items-center justify-between p-2.5 rounded-lg border text-xs ${
+                                                        isLight ? 'bg-white border-slate-200' : 'bg-white/5 border-white/10'
+                                                    }`}
                                                 >
-                                                    <Trash2 size={14} />
-                                                </button>
-                                            </div>
-                                        ))}
+                                                    <div className="flex items-center gap-2 truncate">
+                                                        {isCode ? (
+                                                            <Code2 size={15} className="text-emerald-400 shrink-0" />
+                                                        ) : (
+                                                            <FileText size={15} className={isPdf ? 'text-rose-400 shrink-0' : isDocx ? 'text-blue-400 shrink-0' : isMd ? 'text-amber-400 shrink-0' : 'text-slate-400 shrink-0'} />
+                                                        )}
+                                                        <span className="font-medium truncate font-mono text-[11px]">{file.fileName}</span>
+                                                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono uppercase shrink-0 ${
+                                                            isCode ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
+                                                            isPdf ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20' :
+                                                            isDocx ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
+                                                            'bg-slate-500/10 text-slate-400 border border-slate-500/20'
+                                                        }`}>
+                                                            {ext || 'file'}
+                                                        </span>
+                                                        {file.pageCount && (
+                                                            <span className="text-[10px] opacity-50 shrink-0">({file.pageCount} pgs)</span>
+                                                        )}
+                                                    </div>
+                                                    <button
+                                                        onClick={() => handleDeleteFile(file.id)}
+                                                        className="text-red-400 hover:text-red-300 p-1 transition-colors"
+                                                    >
+                                                        <Trash2 size={14} />
+                                                    </button>
+                                                </div>
+                                            );
+                                        })}
                                     </div>
                                 )}
                             </div>

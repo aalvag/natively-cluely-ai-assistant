@@ -1420,10 +1420,9 @@ export class ModesManager {
     }
 
     // Hard cap for the always-pinned "Real-time prompt" (mode customContext).
-    // Roughly 300 tokens — enough for real mode instructions, small enough that
-    // a pasted document can't crowd out the transcript. Anything longer remains
-    // fully available to RETRIEVAL (reference-file path), so nothing is lost.
-    private static readonly PINNED_INSTRUCTIONS_MAX_CHARS = 1_200;
+    // 600 tokens (~2,400 chars) matching LAYER_BUDGET.custom_context allocation.
+    // Pinned into the prompt deterministically for custom instructions and profile notes.
+    private static readonly PINNED_INSTRUCTIONS_MAX_CHARS = 2_400;
 
     /**
      * PI v3 (W2): the active mode's user-authored "Real-time prompt"

@@ -16,8 +16,17 @@ import { fileURLToPath, pathToFileURL } from 'url';
 
 /** The complete shared document-format contract for Modes + Profile uploads. */
 export const SAFE_DOCUMENT_EXTENSIONS = new Set([
+  // Documents & Data
   '.txt', '.md', '.markdown', '.json', '.csv', '.tsv',
   '.xml', '.html', '.htm', '.log', '.pdf', '.docx',
+  '.yaml', '.yml', '.toml', '.graphql', '.proto',
+  // Programming & Source Code
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.py', '.java', '.go', '.rs', '.cpp', '.c', '.cc', '.cxx', '.h', '.hpp',
+  '.cs', '.rb', '.php', '.swift', '.kt', '.kts', '.scala',
+  '.sql', '.sh', '.bash', '.zsh', '.ps1',
+  '.vue', '.svelte', '.css', '.scss', '.sass', '.less',
+  '.dockerfile', '.prisma', '.env.example',
 ]);
 
 /** 50 MB hard cap — should be enforced by the upload UI's progress bar first. */

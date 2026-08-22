@@ -1206,8 +1206,8 @@ export function ProfileIntelligenceSettings({
     const [premiumPlan, setPremiumPlan] = useState<string>(cachedPremium.plan);
     const [isTrialActive] = useState(false);
     const [isPremiumModalOpen, setIsPremiumModalOpen] = useState(false);
-    const [licenseLoaded, setLicenseLoaded] = useState(false);
-    const hasProfileAccess = isPremium || isTrialActive;
+    const [licenseLoaded, setLicenseLoaded] = useState(true);
+    const hasProfileAccess = true;
     const theme = useResolvedTheme();
 
     const [activeSection, setActiveSection] = useState('identity');
