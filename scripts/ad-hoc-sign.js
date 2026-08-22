@@ -184,17 +184,19 @@ exports.default = async function (context) {
     const unpackedDir = path.join(appPath, 'Contents', 'Resources', 'app.asar.unpacked');
     if (fs.existsSync(unpackedDir)) {
         try {
-            execSync(`find "${unpackedDir}" -type f \\( -name "*.node" -o -name "*.dylib" \\) -exec codesign --force ${hardenedOpt}--entitlements "${entitlementsPath}" --sign - {} +`, { stdio: 'inherit' });
+            execSync(`find "${unpackedDir}" -type f \\( -name "*.node" -o -name "*.dylib" \\) -exec codesign --force ${hardenedOpt}--entitlements "${entitlementsPath}" -r="designated => identifier \\"com.electron.meeting-notes\\"" --sign - {} +`, { stdio: 'inherit' });
         } catch (error) {
             console.warn('[Ad-Hoc Signing] Warning signing unpacked binaries:', error?.message || error);
         }
     }
 
-    // ── Step 2b: Sign the main app bundle with --deep and entitlements ──
-    console.log(`[Ad-Hoc Signing] Signing main app ${appPath} with entitlements...`);
+    // ── Step 2b: Sign the main app bundle with --deep, entitlements and stable Designated Requirement ──
+    // Setting explicit `-r="designated => identifier \"com.electron.meeting-notes\""` binds macOS TCC
+    // permissions to the bundle ID rather than ephemeral binary CDHashes, so permissions survive rebuilds.
+    console.log(`[Ad-Hoc Signing] Signing main app ${appPath} with stable Designated Requirement...`);
     try {
-        execSync(`codesign --force --deep ${hardenedOpt}--entitlements "${entitlementsPath}" --sign - "${appPath}"`, { stdio: 'inherit' });
-        console.log('[Ad-Hoc Signing] Successfully signed the application with entitlements.');
+        execSync(`codesign --force --deep ${hardenedOpt}--entitlements "${entitlementsPath}" -r="designated => identifier \\"com.electron.meeting-notes\\"" --sign - "${appPath}"`, { stdio: 'inherit' });
+        console.log('[Ad-Hoc Signing] Successfully signed the application with stable Designated Requirement.');
     } catch (error) {
         console.error('[Ad-Hoc Signing] Failed to sign the application:', error);
         throw error;
