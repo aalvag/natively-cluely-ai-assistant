@@ -6900,6 +6900,21 @@ export class AppState {
   }
 
   public getKnowledgeOrchestrator(): any {
+    if (!this.knowledgeOrchestrator) {
+      try {
+        const db = DatabaseManager.getInstance();
+        const sqliteDb = db.getDb();
+        if (sqliteDb) {
+          const { ProfileIndex } = require('./localKnowledge/ProfileIndex');
+          const { LocalKnowledgeOrchestrator } = require('./localKnowledge/LocalKnowledgeOrchestrator');
+          const profileIndex = new ProfileIndex(sqliteDb);
+          this.knowledgeOrchestrator = new LocalKnowledgeOrchestrator({ profileIndex });
+          console.log('[AppState] Lazy LocalKnowledgeOrchestrator initialized on demand');
+        }
+      } catch (err) {
+        console.error('[AppState] Failed lazy LocalKnowledgeOrchestrator init:', err);
+      }
+    }
     return this.knowledgeOrchestrator;
   }
 

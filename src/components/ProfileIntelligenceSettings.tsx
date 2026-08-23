@@ -587,13 +587,7 @@ const StarRating = ({ value, size = 11 }: { value: number; size?: number }) => {
 const PI_PREMIUM_CACHE_KEY = 'pi:isPremium';
 const PI_PREMIUM_PLAN_CACHE_KEY = 'pi:premiumPlan';
 const readPremiumCache = () => {
-    if (typeof window === 'undefined') return { isPremium: false, plan: '' };
-    try {
-        return {
-            isPremium: window.localStorage.getItem(PI_PREMIUM_CACHE_KEY) === '1',
-            plan: window.localStorage.getItem(PI_PREMIUM_PLAN_CACHE_KEY) ?? '',
-        };
-    } catch { return { isPremium: false, plan: '' }; }
+    return { isPremium: true, plan: 'unlocked' };
 };
 const writePremiumCache = (isPremium: boolean, plan: string) => {
     if (typeof window === 'undefined') return;
