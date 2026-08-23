@@ -265,15 +265,148 @@ export class LocalKnowledgeOrchestrator {
   getCompanyResearchEngine(): { getCachedDossier: (_company: string) => null } {
     return { getCachedDossier: () => null };
   }
-  getNegotiationTracker(): null {
-    return null;
+  private roleInsightService: any = null;
+  private cachedCoverLetter: any = null;
+
+  getRoleInsightService(): any {
+    if (!this.roleInsightService) {
+      const { LocalRoleInsightService } = require('./LocalRoleInsightService');
+      this.roleInsightService = new LocalRoleInsightService(this.profileIndex, this.generateContentFn);
+    }
+    return this.roleInsightService;
   }
+
+  getNegotiationTracker(): { getState: () => any; isActive: () => boolean } {
+    return {
+      getState: () => ({ round: 1, history: [] }),
+      isActive: () => false,
+    };
+  }
+
+  resetNegotiationSession(): void {}
+
   getNegotiationScript(): null {
     return null;
   }
-  getCoverLetter(): null {
-    return null;
+
+  getCoverLetter(): any {
+    return this.cachedCoverLetter;
   }
+
+  async generateCoverLetterOnDemand(): Promise<any> {
+    const resume = this.profileIndex.get(DocType.RESUME);
+    const jd = this.profileIndex.get(DocType.JD);
+    if (!resume) return null;
+
+    const structured = (resume.structuredData || {}) as any;
+    const candidateName = structured.name || structured.candidate_name || 'Candidate';
+    const currentRole = structured.role || structured.current_role || structured.experience?.[0]?.role || 'Software Engineer';
+    const skillsList = Array.isArray(structured.skills_flat) && structured.skills_flat.length > 0
+      ? structured.skills_flat.slice(0, 10).join(', ')
+      : (Array.isArray(structured.skills) ? structured.skills.slice(0, 10).join(', ') : '');
+    const experienceSummary = Array.isArray(structured.experience)
+      ? structured.experience.slice(0, 3).map((e: any) => `${e.role || 'Role'} at ${e.company || 'Company'}: ${(e.bullets || []).slice(0, 2).join(' ')}`).join('\n')
+      : '';
+
+    const targetTitle = (jd?.structuredData as any)?.title || 'Software Engineer';
+    const targetCompany = (jd?.structuredData as any)?.company || 'your team';
+    const jdText = jd?.text || '';
+
+    const systemPrompt = `You write compelling, concise, and authentic cover letters. Return JSON only with no markdown fences, adhering to this exact schema:
+{
+  "greeting": "Dear Hiring Team at <Company>,",
+  "opening_hook": "<1-2 sentences capturing interest, naming the target position and expressing enthusiasm>",
+  "body_paragraphs": [
+    "<Paragraph 1 connecting candidate's key experience to the role requirements>",
+    "<Paragraph 2 detailing technical skills, impact, and why they excel in this environment>"
+  ],
+  "closing": "Sincerely,\\n<Candidate Name>",
+  "full_text": "<Complete joined letter formatted with double newlines between sections>"
+}`;
+
+    const userPrompt = `Candidate Name: ${candidateName}
+Current Role: ${currentRole}
+Key Skills: ${skillsList}
+Experience:
+${experienceSummary}
+
+Target Position: ${targetTitle}
+Target Company: ${targetCompany}
+Job Description Text:
+${jdText.slice(0, 3000)}`;
+
+    let generated: any = null;
+
+    if (typeof this.generateContentFn === 'function') {
+      try {
+        const raw = await this.generateContentFn([{ text: systemPrompt }, { text: userPrompt }]);
+        if (raw) {
+          const text = typeof raw === 'string' ? raw : String(raw);
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            generated = JSON.parse(jsonMatch[0]);
+          }
+        }
+      } catch (e) {
+        console.warn('[LocalKnowledgeOrchestrator] generateCoverLetter error:', e);
+      }
+    }
+
+    if (!generated) {
+      try {
+        const { app } = require('electron');
+        if (app && typeof app.getPath === 'function') {
+          const { LLMHelper } = require('../LLMHelper');
+          const { CredentialsManager } = require('../services/CredentialsManager');
+          if (CredentialsManager && typeof CredentialsManager.getInstance === 'function') {
+            const credMgr = CredentialsManager.getInstance();
+            const geminiKey = credMgr.getGeminiApiKey();
+            const groqKey = credMgr.getGroqApiKey();
+            const openaiKey = credMgr.getOpenaiApiKey();
+            const claudeKey = credMgr.getClaudeApiKey();
+            const deepseekKey = credMgr.getDeepseekApiKey();
+            if (geminiKey || groqKey || openaiKey || claudeKey || deepseekKey) {
+              const helper = new LLMHelper(geminiKey, false, undefined, undefined, groqKey, openaiKey, claudeKey, deepseekKey);
+              const raw = await helper.generateMeetingSummary(systemPrompt, userPrompt, systemPrompt);
+              if (raw) {
+                const jsonMatch = raw.match(/\{[\s\S]*\}/);
+                if (jsonMatch) {
+                  generated = JSON.parse(jsonMatch[0]);
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[LocalKnowledgeOrchestrator] generateCoverLetter fallback error:', e);
+      }
+    }
+
+    if (!generated || !generated.greeting || !generated.body_paragraphs) {
+      const greeting = `Dear Hiring Team at ${targetCompany},`;
+      const opening_hook = `I am writing to express my strong enthusiasm for the ${targetTitle} position at ${targetCompany}. With a proven track record as a ${currentRole}, I am confident in delivering immediate value to your engineering team.`;
+      const body_paragraphs = [
+        `Throughout my career, I have specialized in building robust, scalable solutions. My background encompasses ${skillsList || 'full-stack architecture, API development, and modern product engineering'}. In my recent roles, I have consistently taken features from concept to production while maintaining high performance and code quality.`,
+        `What excites me most about ${targetCompany} is the opportunity to solve complex problems and collaborate with a talented, high-impact team. I look forward to bringing my technical dedication and experience to your initiatives.`
+      ];
+      const closing = `Sincerely,\n${candidateName}`;
+      const full_text = `${greeting}\n\n${opening_hook}\n\n${body_paragraphs.join('\n\n')}\n\n${closing}`;
+
+      generated = {
+        greeting,
+        opening_hook,
+        body_paragraphs,
+        closing,
+        full_text,
+      };
+    } else if (!generated.full_text) {
+      generated.full_text = `${generated.greeting}\n\n${generated.opening_hook}\n\n${(generated.body_paragraphs || []).join('\n\n')}\n\n${generated.closing}`;
+    }
+
+    this.cachedCoverLetter = generated;
+    return generated;
+  }
+
   isIngesting(_docType: DocType): boolean {
     return false;
   }
