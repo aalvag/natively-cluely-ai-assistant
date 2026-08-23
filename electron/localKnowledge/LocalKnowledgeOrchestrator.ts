@@ -240,10 +240,10 @@ export class LocalKnowledgeOrchestrator {
       projects: structured.projects || [],
       education: structured.education || [],
       extractionMode: structured._extraction_mode || 'heuristic',
-      rawResumeText: resume?.text || '',
+      rawResumeText: resume?.content || '',
       hasActiveJD: Boolean(jd),
       activeJD: jd ? {
-        text: jd.text,
+        text: jd.content,
         title: (jd.structuredData as any)?.title || 'Target Role',
         company: (jd.structuredData as any)?.company || '',
       } : undefined,
@@ -310,7 +310,7 @@ export class LocalKnowledgeOrchestrator {
 
     const targetTitle = (jd?.structuredData as any)?.title || 'Software Engineer';
     const targetCompany = (jd?.structuredData as any)?.company || 'your team';
-    const jdText = jd?.text || '';
+    const jdText = jd?.content || '';
 
     const systemPrompt = `You write compelling, concise, and authentic cover letters. Return JSON only with no markdown fences, adhering to this exact schema:
 {

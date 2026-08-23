@@ -29,9 +29,10 @@ export const RoleInsightPanel: React.FC<RoleInsightProps> = ({
 
     const fetchStatusAndReport = async () => {
         try {
-            const st = await window.electronAPI?.roleInsightGetStatus?.();
+            const api = (window as any).electronAPI;
+            const st = await api?.roleInsightGetStatus?.();
             if (st) setStatus(st);
-            const repResult = await window.electronAPI?.roleInsightGetReport?.();
+            const repResult = await api?.roleInsightGetReport?.();
             if (repResult?.success && repResult.report) {
                 setReport(repResult.report);
             }
@@ -48,7 +49,8 @@ export const RoleInsightPanel: React.FC<RoleInsightProps> = ({
         setLoading(true);
         setError('');
         try {
-            const res = await window.electronAPI?.roleInsightAnalyse?.();
+            const api = (window as any).electronAPI;
+            const res = await api?.roleInsightAnalyse?.();
             if (res?.success && res.report) {
                 setReport(res.report);
                 setStatus((prev: any) => ({ ...prev, hasAnalysis: true }));

@@ -133,7 +133,7 @@ export class LocalRoleInsightService {
       const structuredJD = (jd?.structuredData || {}) as any;
       const jdTitle = structuredJD?.title || candidateRole || 'Target Role';
       const jdCompany = structuredJD?.company || 'Company';
-      const jdText = jd?.text || '';
+      const jdText = jd?.content || '';
 
       const systemPrompt = `You are an expert executive recruiter and career strategist. Analyze the candidate profile against the target job role.
 Return JSON ONLY adhering to this schema:

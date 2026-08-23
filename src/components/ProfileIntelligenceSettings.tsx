@@ -7,7 +7,8 @@ import {
 } from 'lucide-react';
 import { ThinkingOrb } from 'thinking-orbs';
 import { useToggleInit } from './settings/useToggleInit';
-import { PremiumUpgradeModal, RoleInsightPanel } from '../premium';
+import { PremiumUpgradeModal } from '../premium';
+import { RoleInsightPanel } from './RoleInsightPanel';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
 import { truncateResumeSummary } from '../utils/resumeSummary.mjs';
 import { CHECKOUT_URLS } from '../config/urls';
