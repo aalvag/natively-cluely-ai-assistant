@@ -1531,14 +1531,14 @@ export function ProfileIntelligenceSettings({
     // FileUploadEmpty stays: it also decides the "Requires Pro." hint, so it is
     // doing UI work, not just guarding — and a double gate here is idempotent.
     const browseResume = async () => {
-        if (!hasProfileAccess) { setIsPremiumModalOpen(true); return; }
+        setProfileError('');
         const fileResult = await window.electronAPI?.profileSelectFile?.();
         if (fileResult?.cancelled || !fileResult?.filePath) return;
         await doResumeUpload(fileResult.filePath);
     };
 
     const browseJD = async () => {
-        if (!hasProfileAccess) { setIsPremiumModalOpen(true); return; }
+        setJdError('');
         const fileResult = await window.electronAPI?.profileSelectFile?.();
         if (fileResult?.cancelled || !fileResult?.filePath) return;
         await doJdUpload(fileResult.filePath);

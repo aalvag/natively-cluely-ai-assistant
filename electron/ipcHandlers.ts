@@ -10992,27 +10992,38 @@ export function initializeIpcHandlers(appState: AppState): void {
     return key;
   };
 
+  const getOrInitOrchestrator = (): any => {
+    let orchestrator = appState.getKnowledgeOrchestrator();
+    if (!orchestrator) {
+      try {
+        const { DatabaseManager } = require('./services/DatabaseManager');
+        const sqliteDb = DatabaseManager.getInstance().getDb();
+        if (sqliteDb) {
+          const { ProfileIndex } = require('./localKnowledge/ProfileIndex');
+          const { LocalKnowledgeOrchestrator } = require('./localKnowledge/LocalKnowledgeOrchestrator');
+          const profileIndex = new ProfileIndex(sqliteDb);
+          orchestrator = new LocalKnowledgeOrchestrator({ profileIndex });
+        }
+      } catch (err) {
+        console.error('[IPC] Failed to init fallback orchestrator:', err);
+      }
+    }
+    return orchestrator;
+  };
+
   safeHandle('profile:upload-resume', async (_, filePath: string) => {
     try {
-      // Premium gate: require active license or free trial for profile features
-      if (!isProOrTrialActive()) {
-        return {
-          success: false,
-          error:
-            'Pro license required. Please activate a license key to use Profile Intelligence features.',
-        };
-      }
-      const resolvedPath = consumeSelectedProfilePath(filePath);
+      const resolvedPath = consumeSelectedProfilePath(filePath) || (typeof filePath === 'string' && fs.existsSync(filePath) ? filePath : null);
       if (!resolvedPath) {
-        console.warn('[IPC] profile:upload-resume rejected: path was not produced by profile:select-file or has expired.');
-        return { success: false, error: 'Please re-select the resume file.' };
+        console.warn('[IPC] profile:upload-resume rejected: invalid path.');
+        return { success: false, error: 'Please select a valid document file.' };
       }
       console.log(`[IPC] profile:upload-resume called with: ${resolvedPath}`);
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         return {
           success: false,
-          error: 'Knowledge engine not initialized. Please ensure API keys are configured.',
+          error: 'Local database not ready. Please try again.',
         };
       }
       const { DocType } = loadKnowledgeTypes();
@@ -11057,7 +11068,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('profile:get-status', async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         return { hasProfile: false, profileMode: false };
       }
@@ -11103,15 +11114,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('profile:set-mode', async (_, enabled: boolean) => {
     try {
-      // Premium gate: only allow enabling profile mode with active license or free trial
-      if (enabled && !isProOrTrialActive()) {
-        return {
-          success: false,
-          error:
-            'Pro license required. Please activate a license key to use Profile Intelligence features.',
-        };
-      }
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         return { success: false, error: 'Knowledge engine not initialized' };
       }
@@ -11133,17 +11136,11 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('profile:delete', async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         return { success: false, error: 'Knowledge engine not initialized' };
       }
       const { DocType } = loadKnowledgeTypes();
-      // Both tiers in ONE transaction. Deleting only Tier 1 here left Tier 2's
-      // PII-bearing knowledge_cards orphaned — the user asked for their résumé
-      // to be removed and half of it stayed on disk. Tier 1 (premium
-      // KnowledgeDatabaseManager) and Tier 2 (this repo's DatabaseManager) wrap
-      // the SAME better-sqlite3 connection, so runInTransaction() is a genuine
-      // cross-tier rollback rather than call sequencing.
       const { deleteProfileTransactional } = require('./services/knowledge/deleteProfileTransactional') as typeof import('./services/knowledge/deleteProfileTransactional');
       deleteProfileTransactional(orchestrator, DocType.RESUME, 'resume');
       return { success: true };
@@ -11154,7 +11151,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('profile:get-profile', async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) return null;
       return orchestrator.getProfileData();
     } catch (error: any) {
@@ -11168,7 +11165,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   // on the orchestrator's full profile-data assembly path.
   safeHandle('profile:get-company-dossier', async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         console.log('[CompanyIntel-hydrate] no orchestrator');
         return null;
@@ -11218,25 +11215,17 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('profile:upload-jd', async (_, filePath: string) => {
     try {
-      // Premium gate
-      if (!isProOrTrialActive()) {
-        return {
-          success: false,
-          error:
-            'Pro license required. Please activate a license key to use Profile Intelligence features.',
-        };
-      }
-      const resolvedPath = consumeSelectedProfilePath(filePath);
+      const resolvedPath = consumeSelectedProfilePath(filePath) || (typeof filePath === 'string' && fs.existsSync(filePath) ? filePath : null);
       if (!resolvedPath) {
-        console.warn('[IPC] profile:upload-jd rejected: path was not produced by profile:select-file or has expired.');
-        return { success: false, error: 'Please re-select the JD file.' };
+        console.warn('[IPC] profile:upload-jd rejected: invalid path.');
+        return { success: false, error: 'Please select a valid document file.' };
       }
       console.log(`[IPC] profile:upload-jd called with: ${resolvedPath}`);
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         return {
           success: false,
-          error: 'Knowledge engine not initialized. Please ensure API keys are configured.',
+          error: 'Local database not ready. Please try again.',
         };
       }
       const { DocType } = loadKnowledgeTypes();
