@@ -77,10 +77,24 @@ export class LocalKnowledgeOrchestrator {
   private readonly retrievalBudgetMs: number;
   private knowledgeMode = false;
 
-  constructor(deps: LocalKnowledgeOrchestratorDependencies) {
-    this.profileIndex = deps.profileIndex;
-    this.extractionOptions = deps.extractionOptions ?? {};
-    this.retrievalBudgetMs = deps.retrievalBudgetMs ?? RETRIEVAL_BUDGET_MS;
+  constructor(depsOrIndex: LocalKnowledgeOrchestratorDependencies | ProfileIndex | any) {
+    if (depsOrIndex instanceof ProfileIndex || (depsOrIndex && typeof depsOrIndex.get === 'function')) {
+      this.profileIndex = depsOrIndex;
+      this.extractionOptions = {};
+      this.retrievalBudgetMs = RETRIEVAL_BUDGET_MS;
+    } else if (depsOrIndex && depsOrIndex.profileIndex) {
+      this.profileIndex = depsOrIndex.profileIndex;
+      this.extractionOptions = depsOrIndex.extractionOptions ?? {};
+      this.retrievalBudgetMs = depsOrIndex.retrievalBudgetMs ?? RETRIEVAL_BUDGET_MS;
+    } else if (depsOrIndex && typeof depsOrIndex.exec === 'function') {
+      this.profileIndex = new ProfileIndex(depsOrIndex);
+      this.extractionOptions = {};
+      this.retrievalBudgetMs = RETRIEVAL_BUDGET_MS;
+    } else {
+      this.profileIndex = depsOrIndex?.profileIndex;
+      this.extractionOptions = depsOrIndex?.extractionOptions ?? {};
+      this.retrievalBudgetMs = depsOrIndex?.retrievalBudgetMs ?? RETRIEVAL_BUDGET_MS;
+    }
   }
 
   // --- Shape the deterministic selector reads ------------------------------

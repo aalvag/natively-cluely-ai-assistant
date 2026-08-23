@@ -113,11 +113,20 @@ export class ProfileIndex {
   private embeddingPipeline: EmbeddingPipeline | null;
   private retriever: ModeHybridRetriever | null = null;
 
-  constructor(deps: ProfileIndexDependencies) {
-    this.db = deps.db;
-    this.dbPath = deps.dbPath;
-    this.embeddingPipeline = deps.embeddingPipeline ?? null;
-    this.db.exec(CREATE_TABLE);
+  constructor(depsOrDb: ProfileIndexDependencies | Database.Database, dbPath?: string) {
+    if (depsOrDb && typeof (depsOrDb as any).exec === 'function') {
+      this.db = depsOrDb as Database.Database;
+      this.dbPath = dbPath || (depsOrDb as any).name || '';
+      this.embeddingPipeline = null;
+    } else {
+      const deps = depsOrDb as ProfileIndexDependencies;
+      this.db = deps?.db;
+      this.dbPath = deps?.dbPath || (deps?.db as any)?.name || '';
+      this.embeddingPipeline = deps?.embeddingPipeline ?? null;
+    }
+    if (this.db) {
+      this.db.exec(CREATE_TABLE);
+    }
   }
 
   /**

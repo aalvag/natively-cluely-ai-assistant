@@ -10996,7 +10996,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     let orchestrator = appState.getKnowledgeOrchestrator();
     if (!orchestrator) {
       try {
-        const { DatabaseManager } = require('./services/DatabaseManager');
+        const { DatabaseManager } = require('./db/DatabaseManager');
         const sqliteDb = DatabaseManager.getInstance().getDb();
         if (sqliteDb) {
           const { ProfileIndex } = require('./localKnowledge/ProfileIndex');
