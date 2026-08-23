@@ -1202,8 +1202,8 @@ export function ProfileIntelligenceSettings({
     // Safe as a panel-level call ONLY because this panel renders exactly one
     // switch. Add a second and it must move into a per-switch component.
     const piToggleInit = useToggleInit();
-    const [isPremium, setIsPremium] = useState(cachedPremium.isPremium);
-    const [premiumPlan, setPremiumPlan] = useState<string>(cachedPremium.plan);
+    const [isPremium, setIsPremium] = useState(true);
+    const [premiumPlan, setPremiumPlan] = useState<string>(cachedPremium.plan || 'local');
     const [isTrialActive] = useState(false);
     const [isPremiumModalOpen, setIsPremiumModalOpen] = useState(false);
     const [licenseLoaded, setLicenseLoaded] = useState(true);

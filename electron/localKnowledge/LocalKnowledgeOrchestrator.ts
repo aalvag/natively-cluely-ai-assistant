@@ -154,6 +154,80 @@ export class LocalKnowledgeOrchestrator {
     return this.knowledgeMode;
   }
 
+  getStatus(): {
+    hasResume: boolean;
+    hasJD: boolean;
+    activeMode: boolean;
+    resumeSummary?: {
+      name?: string;
+      role?: string;
+      totalExperienceYears?: number;
+    };
+  } {
+    const resume = this.profileIndex.get(DocType.RESUME);
+    const jd = this.profileIndex.get(DocType.JD);
+    const structured = resume?.structuredData as any;
+    return {
+      hasResume: Boolean(resume),
+      hasJD: Boolean(jd),
+      activeMode: this.knowledgeMode,
+      resumeSummary: structured ? {
+        name: structured.name || structured.candidate_name,
+        role: structured.role || structured.current_role || structured.experience?.[0]?.role,
+        totalExperienceYears: structured.total_years_experience || structured.experience?.length || 0,
+      } : undefined,
+    };
+  }
+
+  getProfileData(): Record<string, any> {
+    const resume = this.profileIndex.get(DocType.RESUME);
+    const jd = this.profileIndex.get(DocType.JD);
+    const structured = (resume?.structuredData || {}) as any;
+    return {
+      hasProfile: Boolean(resume),
+      profileMode: this.knowledgeMode,
+      name: structured.name || structured.candidate_name || '',
+      role: structured.role || structured.current_role || structured.experience?.[0]?.role || '',
+      experience: structured.experience || [],
+      skills: structured.skills || [],
+      projects: structured.projects || [],
+      education: structured.education || [],
+      rawResumeText: resume?.text || '',
+      hasActiveJD: Boolean(jd),
+      activeJD: jd ? {
+        text: jd.text,
+        title: (jd.structuredData as any)?.title || 'Target Role',
+        company: (jd.structuredData as any)?.company || '',
+      } : undefined,
+    };
+  }
+
+  setGenerateContentFn(_fn: any): void {}
+  setLiveCoachingContentFn(_fn: any): void {}
+  setSearchProviderResolver(_fn: any): void {}
+  setEmbedFn(_fn: any): void {}
+  setEmbedWithMetadataFn(_fn: any): void {}
+  setActiveSpaceFn(_fn: any): void {}
+  setEmbedQueryFn(_fn: any): void {}
+  setFastQueryEmbedFn(_fn: any): void {}
+  async ensureEmbeddingSpace(): Promise<void> {}
+  setConversationContextProvider(_fn: any): void {}
+  getCompanyResearchEngine(): { getCachedDossier: (_company: string) => null } {
+    return { getCachedDossier: () => null };
+  }
+  getNegotiationTracker(): null {
+    return null;
+  }
+  getNegotiationScript(): null {
+    return null;
+  }
+  getCoverLetter(): null {
+    return null;
+  }
+  isIngesting(_docType: DocType): boolean {
+    return false;
+  }
+
   // --- The grounding path --------------------------------------------------
 
   /**

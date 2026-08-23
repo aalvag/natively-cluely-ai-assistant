@@ -2552,9 +2552,15 @@ export class AppState {
       const db = DatabaseManager.getInstance();
       const sqliteDb = db.getDb();
 
-      if (sqliteDb && KnowledgeDatabaseManagerClass && KnowledgeOrchestratorClass) {
-        const knowledgeDb = new KnowledgeDatabaseManagerClass(sqliteDb);
-        this.knowledgeOrchestrator = new KnowledgeOrchestratorClass(knowledgeDb);
+      if (sqliteDb && KnowledgeOrchestratorClass) {
+        if (KnowledgeDatabaseManagerClass) {
+          const knowledgeDb = new KnowledgeDatabaseManagerClass(sqliteDb);
+          this.knowledgeOrchestrator = new KnowledgeOrchestratorClass(knowledgeDb);
+        } else {
+          const { ProfileIndex } = require('./localKnowledge/ProfileIndex');
+          const profileIndex = new ProfileIndex(sqliteDb);
+          this.knowledgeOrchestrator = new KnowledgeOrchestratorClass({ profileIndex });
+        }
 
         // Role Insight owns its own tables in the same SQLite file. It needs the
         // raw handle, which KnowledgeDatabaseManager does not expose, so it is

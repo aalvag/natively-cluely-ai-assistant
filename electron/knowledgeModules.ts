@@ -47,6 +47,10 @@ function requireDynamic(segments: string[]): UnknownModule {
   return require(specifier) as UnknownModule;
 }
 
+const LOCAL_MODULE_ALIASES: Record<string, string> = {
+  KnowledgeOrchestrator: 'LocalKnowledgeOrchestrator',
+};
+
 /**
  * Load a knowledge module by its path below the knowledge root, e.g. 'types'
  * or 'roleInsight/JdSourceResolver'. Premium wins; local is the fallback;
@@ -62,7 +66,11 @@ export function loadKnowledgeModule(name: string): UnknownModule | null {
     resolved = requireDynamic(['..', 'premium', 'electron', 'knowledge', ...name.split('/')]);
   } catch {
     try {
-      resolved = requireDynamic(['.', 'localKnowledge', ...name.split('/')]);
+      const localName = LOCAL_MODULE_ALIASES[name] || name;
+      resolved = requireDynamic(['.', 'localKnowledge', ...localName.split('/')]);
+      if (resolved && name === 'KnowledgeOrchestrator' && resolved.LocalKnowledgeOrchestrator) {
+        (resolved as any).KnowledgeOrchestrator = resolved.LocalKnowledgeOrchestrator;
+      }
     } catch {
       resolved = null;
     }
