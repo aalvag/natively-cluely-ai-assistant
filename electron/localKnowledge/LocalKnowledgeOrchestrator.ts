@@ -122,6 +122,8 @@ export class LocalKnowledgeOrchestrator {
 
   // --- Ingestion -----------------------------------------------------------
 
+  private generateContentFn: any = null;
+
   /**
    * Read, structure, and index one document.
    *
@@ -138,7 +140,36 @@ export class LocalKnowledgeOrchestrator {
 
     let extraction: { structured_data: Record<string, unknown>; extractionMode: string } | null = null;
     if (docType === DocType.RESUME) {
-      const result = await extractStructuredProfile(read.document, this.extractionOptions);
+      const opts: ExtractProfileOptions = { ...this.extractionOptions };
+      if (!opts.llmGenerateFn && typeof this.generateContentFn === 'function') {
+        opts.llmGenerateFn = async (sys: string, usr: string) => {
+          return await this.generateContentFn([{ text: sys }, { text: usr }]) || '';
+        };
+      }
+      if (!opts.llmGenerateFn) {
+        try {
+          const { app } = require('electron');
+          if (app && typeof app.getPath === 'function') {
+            const { LLMHelper } = require('../LLMHelper');
+            const { CredentialsManager } = require('../services/CredentialsManager');
+            const credMgr = CredentialsManager.getInstance();
+            const geminiKey = credMgr.getGeminiApiKey();
+            const groqKey = credMgr.getGroqApiKey();
+            const openaiKey = credMgr.getOpenaiApiKey();
+            const claudeKey = credMgr.getClaudeApiKey();
+            const deepseekKey = credMgr.getDeepseekApiKey();
+            if (geminiKey || groqKey || openaiKey || claudeKey || deepseekKey) {
+              const helper = new LLMHelper(geminiKey, false, undefined, undefined, groqKey, openaiKey, claudeKey, deepseekKey);
+              opts.llmGenerateFn = async (sys: string, usr: string) => {
+                return await helper.generateMeetingSummary(sys, usr, sys) || '';
+              };
+            }
+          }
+        } catch (e) {
+          console.warn('[LocalKnowledgeOrchestrator] LLMHelper fallback init error:', e);
+        }
+      }
+      const result = await extractStructuredProfile(read.document, opts);
       extraction = {
         structured_data: result.structured_data as unknown as Record<string, unknown>,
         extractionMode: result.extractionMode,
@@ -188,7 +219,7 @@ export class LocalKnowledgeOrchestrator {
       resumeSummary: structured ? {
         name: structured.name || structured.candidate_name,
         role: structured.role || structured.current_role || structured.experience?.[0]?.role,
-        totalExperienceYears: structured.total_years_experience || structured.experience?.length || 0,
+        totalExperienceYears: structured.total_years_experience ?? (Array.isArray(structured.experience) ? structured.experience.length : 0),
       } : undefined,
     };
   }
@@ -204,8 +235,11 @@ export class LocalKnowledgeOrchestrator {
       role: structured.role || structured.current_role || structured.experience?.[0]?.role || '',
       experience: structured.experience || [],
       skills: structured.skills || [],
+      skillsFlat: structured.skills_flat || [],
+      totalExperienceYears: structured.total_years_experience ?? (Array.isArray(structured.experience) ? structured.experience.length : 0),
       projects: structured.projects || [],
       education: structured.education || [],
+      extractionMode: structured._extraction_mode || 'heuristic',
       rawResumeText: resume?.text || '',
       hasActiveJD: Boolean(jd),
       activeJD: jd ? {
@@ -216,7 +250,9 @@ export class LocalKnowledgeOrchestrator {
     };
   }
 
-  setGenerateContentFn(_fn: any): void {}
+  setGenerateContentFn(fn: any): void {
+    this.generateContentFn = fn;
+  }
   setLiveCoachingContentFn(_fn: any): void {}
   setSearchProviderResolver(_fn: any): void {}
   setEmbedFn(_fn: any): void {}

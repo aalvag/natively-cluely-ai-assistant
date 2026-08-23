@@ -56,27 +56,29 @@ export interface CanonicalProfileFacts {
   skills?: Record<string, string[]>;
   /** Flattened skills. The readers prefer this when present. */
   skills_flat?: string[];
+  /** Total calculated years of experience. */
+  total_years_experience?: number;
   /** How this profile was produced, for diagnostics. */
   _extraction_mode?: string;
 }
 
 const MONTHS: Record<string, number> = {
-  jan: 1, january: 1,
-  feb: 2, february: 2,
-  mar: 3, march: 3,
-  apr: 4, april: 4,
-  may: 5,
-  jun: 6, june: 6,
-  jul: 7, july: 7,
-  aug: 8, august: 8,
-  sep: 9, sept: 9, september: 9,
-  oct: 10, october: 10,
-  nov: 11, november: 11,
-  dec: 12, december: 12,
+  jan: 1, january: 1, ene: 1, enero: 1,
+  feb: 2, february: 2, febrero: 2,
+  mar: 3, march: 3, marzo: 3,
+  apr: 4, april: 4, abr: 4, abril: 4,
+  may: 5, mayo: 5,
+  jun: 6, june: 6, junio: 6,
+  jul: 7, july: 7, julio: 7,
+  aug: 8, august: 8, ago: 8, agosto: 8,
+  sep: 9, sept: 9, september: 9, set: 9, setiembre: 9, septiembre: 9,
+  oct: 10, october: 10, octubre: 10,
+  nov: 11, november: 11, noviembre: 11,
+  dec: 12, december: 12, dic: 12, diciembre: 12,
 };
 
 /** Words a resume uses for a role that has not ended. */
-const ONGOING_WORDS = /^(present|current|now|ongoing|to date|till date|date)$/i;
+const ONGOING_WORDS = /^(present|current|now|ongoing|to date|till date|date|actualidad|presente|hoy|en curso|a la fecha)$/i;
 
 const asText = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
 
@@ -396,7 +398,12 @@ export function canonicalizeProfile(
     // falls back to name, and other readers reach for the top-level field.
     profile.name = identityName;
   }
-  if (experience.length) profile.experience = experience;
+  if (experience.length) {
+    profile.experience = experience;
+    profile.total_years_experience = computeTotalExperienceYears(experience, options.now);
+  } else {
+    profile.total_years_experience = 0;
+  }
   if (projects.length) profile.projects = projects;
   if (education.length) profile.education = education;
   if (skills) {
@@ -406,6 +413,48 @@ export function canonicalizeProfile(
   }
 
   return profile;
+}
+
+export function computeTotalExperienceYears(experience: CanonicalProfileExperience[], now: Date): number {
+  if (!experience || experience.length === 0) return 0;
+  const nowIndex = now.getFullYear() * 12 + now.getMonth();
+  const intervals: Array<[number, number]> = [];
+
+  for (const exp of experience) {
+    if (!exp.start_date) continue;
+    const startIdx = monthIndex(exp.start_date);
+    const endIdx = exp.end_date ? monthIndex(exp.end_date) : nowIndex;
+    if (endIdx >= startIdx) {
+      intervals.push([startIdx, endIdx]);
+    }
+  }
+
+  if (intervals.length === 0) {
+    return experience.length > 0 ? experience.length : 0;
+  }
+
+  // Merge overlapping intervals
+  intervals.sort((a, b) => a[0] - b[0]);
+  const merged: Array<[number, number]> = [];
+  let curr = intervals[0];
+
+  for (let i = 1; i < intervals.length; i++) {
+    const next = intervals[i];
+    if (next[0] <= curr[1]) {
+      curr[1] = Math.max(curr[1], next[1]);
+    } else {
+      merged.push(curr);
+      curr = next;
+    }
+  }
+  merged.push(curr);
+
+  let totalMonths = 0;
+  for (const [s, e] of merged) {
+    totalMonths += (e - s + 1);
+  }
+
+  return Number((totalMonths / 12).toFixed(1));
 }
 
 /** True when the profile carries enough to answer anything about the candidate. */

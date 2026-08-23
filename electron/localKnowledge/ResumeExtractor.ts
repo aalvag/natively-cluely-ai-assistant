@@ -22,9 +22,11 @@ import {
   type CanonicalProfileFacts,
 } from './profileNormalization';
 
-export type ExtractionMode = 'local_llm' | 'heuristic';
+export type ExtractionMode = 'local_llm' | 'llm' | 'heuristic';
 
 export interface ExtractProfileOptions {
+  /** Optional custom LLM generator (e.g. Gemini, OpenAI, Claude, Groq, DeepSeek). */
+  llmGenerateFn?: (system: string, user: string) => Promise<string>;
   /** Defaults to the address LLMHelper uses (electron/LLMHelper.ts:396). */
   ollamaUrl?: string;
   /** Ollama model tag. When absent, the first installed model is used. */
@@ -114,18 +116,6 @@ async function listInstalledModels(
     }));
 }
 
-/**
- * Choose a model that can actually hold a conversation.
- *
- * Taking the first installed model is wrong: an embedding model such as
- * nomic-embed-text is a normal thing to have installed, it sorts wherever
- * Ollama puts it, and sending it a chat request fails. Verified against a real
- * Ollama install, where the embedding model sat in the returned list alongside
- * four chat models.
- *
- * A model that reports no capabilities at all is still accepted, because older
- * Ollama versions omit the field and refusing those would be worse than trying.
- */
 function pickChatModel(models: InstalledModel[]): string | null {
   const usable = models.find(
     (model) =>
@@ -152,23 +142,13 @@ async function requestExtraction(
       { role: 'user', content: resumeText },
     ],
     stream: false,
-    // Ollama's JSON mode. It constrains the decoder, which matters far more
-    // for a small local model than the instruction text alone.
     format: 'json',
     options: {
-      // Extraction is a copying task, not a creative one. A fixed low
-      // temperature also makes re-ingesting the same resume reproducible.
       temperature: 0,
       top_p: 0.9,
     },
   };
 
-  // Reasoning models spend their whole budget thinking before emitting the
-  // object. Measured against a real install: gemma4:12b-mlx hit the 120s
-  // timeout on a 335-character resume with thinking left on. LLMHelper
-  // suppresses it the same way for the same reason (electron/LLMHelper.ts:1691).
-  // The field is only sent when the model reports the capability, because
-  // sending it to a model without thinking support is not universally accepted.
   if (suppressThinking) body.think = false;
 
   const response = await fetchImpl(`${ollamaUrl}/api/chat`, {
@@ -191,16 +171,16 @@ async function requestExtraction(
 // --- Deterministic fallback -------------------------------------------------
 
 const SECTION_PATTERNS: Array<{ key: string; test: RegExp }> = [
-  { key: 'experience', test: /^(work\s+)?(experience|employment|professional experience|work history)\b/i },
-  { key: 'education', test: /^education\b/i },
-  { key: 'skills', test: /^(technical\s+)?skills\b|^technologies\b/i },
-  { key: 'projects', test: /^(personal\s+)?projects\b/i },
+  { key: 'experience', test: /^(work\s+)?(experience|employment|professional experience|work history|career history|background|experiencia|experiencia laboral|experiencia profesional|historial laboral|trayectoria)\b/i },
+  { key: 'education', test: /^(education|academic background|studies|formaci[oó]n|educaci[oó]n|estudios|certificaciones)\b/i },
+  { key: 'skills', test: /^(technical\s+)?skills\b|^technologies\b|^tech stack\b|^habilidades\b|^competencias\b|^conocimientos\b|^tecnolog[ií]as\b|^herramientas\b/i },
+  { key: 'projects', test: /^(personal\s+)?projects\b|^proyectos\b/i },
 ];
 
 /** A heading is a short line that names a known section. */
 function sectionKeyFor(line: string): string | null {
   const text = line.trim().replace(/[:\-_]+$/, '');
-  if (!text || text.length > 40) return null;
+  if (!text || text.length > 50) return null;
   for (const { key, test } of SECTION_PATTERNS) {
     if (test.test(text)) return key;
   }
@@ -225,47 +205,33 @@ function splitIntoSections(content: string): Map<string, string[]> {
   return sections;
 }
 
-/**
- * A person's name, taken from the top of the document.
- *
- * Resumes put the name on the first substantive line. The checks reject the
- * lines that commonly sit there instead: contact details, addresses, and
- * headline titles.
- */
 function guessName(headerLines: string[]): string {
-  for (const line of headerLines.slice(0, 6)) {
+  for (const line of headerLines.slice(0, 8)) {
     const text = line.trim();
     if (!text || text.length > 60) continue;
     if (/[@|]|https?:|\d{3}/.test(text)) continue;
     const words = text.split(/\s+/);
-    if (words.length < 2 || words.length > 4) continue;
-    if (!/^[A-Za-z][A-Za-z'.\-]*$/.test(words[0])) continue;
-    // A line in all capitals is still a name on many resumes, so it is allowed.
+    if (words.length < 2 || words.length > 5) continue;
+    if (!/^[A-Za-z\u00C0-\u017F][A-Za-z\u00C0-\u017F'.\-]*$/.test(words[0])) continue;
     return text;
   }
   return '';
 }
 
-/** `Jun 2023 - Present`, `2021-03 to 2022-01`, and similar. */
+const MONTH_NAMES = 'jan(?:uary)?|ene(?:ro)?|feb(?:ruary|rero)?|mar(?:ch|zo)?|apr(?:il)?|abr(?:il)?|may(?:o)?|jun(?:e|io)?|jul(?:y|io)?|aug(?:ust)?|ago(?:sto)?|sep(?:t(?:ember)?)?|set(?:iembre)?|septiembre|oct(?:ober|ubre)?|nov(?:ember|iembre)?|dec(?:ember)?|dic(?:iembre)?';
+
 const DATE_RANGE = new RegExp(
-  '([A-Za-z]{3,9}\\.?\\s+\\d{4}|\\d{4}[-/]\\d{1,2}|\\d{1,2}[/-]\\d{4}|\\d{4})'
-  + '\\s*(?:-|to|until|through)\\s*'
-  + '([A-Za-z]{3,9}\\.?\\s+\\d{4}|\\d{4}[-/]\\d{1,2}|\\d{1,2}[/-]\\d{4}|\\d{4}|present|current|now)',
+  `((?:${MONTH_NAMES})\\.?\\s+\\d{4}|\\d{4}[-/]\\d{1,2}|\\d{1,2}[/-]\\d{4}|\\d{4})`
+  + '\\s*(?:[-–—\\u2013\\u2014]|to|until|through|a|hasta)\\s*'
+  + `((?:${MONTH_NAMES})\\.?\\s+\\d{4}|\\d{4}[-/]\\d{1,2}|\\d{1,2}[/-]\\d{4}|\\d{4}|present|current|now|actualidad|presente|hoy|en curso|a la fecha)`,
   'i',
 );
 
-/**
- * Parse experience entries without a model.
- *
- * Each entry starts at a line carrying a date range, which is the one reliable
- * structural signal across resume layouts. Role and company come from that same
- * line, split on the usual separators; bullets are the lines that follow until
- * the next dated line.
- */
 function heuristicExperience(lines: string[]): Array<Record<string, unknown>> {
   const entries: Array<Record<string, unknown>> = [];
   let current: Record<string, unknown> | null = null;
   let bullets: string[] = [];
+  let lastNonDateLine = '';
 
   const flush = () => {
     if (!current) return;
@@ -275,32 +241,49 @@ function heuristicExperience(lines: string[]): Array<Record<string, unknown>> {
     bullets = [];
   };
 
-  for (const rawLine of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
     const line = rawLine.trim();
     if (!line) continue;
 
     const range = line.match(DATE_RANGE);
     if (range) {
       flush();
-      // Removing the range leaves the punctuation that wrapped it. Verified on
-      // a real fixture: "Northwind Systems (2021-2026)" became "Northwind
-      // Systems ()" and was stored as the company name.
       const withoutDates = line
         .replace(range[0], '')
         .replace(/[|]/g, ',')
         .replace(/\(\s*\)|\[\s*\]|\{\s*\}/g, '')
-        .replace(/[\s,;:.\-]+$/, '')
+        .replace(/[\s,;:.\-–—\u2013\u2014]+$/, '')
         .trim();
-      const parts = withoutDates.split(/\s+[-]\s+|,\s*|\s+at\s+/i).map((p) => p.trim()).filter(Boolean);
+      const parts = withoutDates.split(/\s+[-–—\u2013\u2014]\s+|,\s*|\s+at\s+|\s+en\s+/i).map((p) => p.trim()).filter(Boolean);
       current = { start_date: range[1], end_date: range[2] };
       if (parts[0]) current.role = parts[0];
       if (parts[1]) current.company = parts[1];
+
+      // If company or role was not on the same line, check preceding line
+      if (!current.role || !current.company) {
+        if (lastNonDateLine && lastNonDateLine.length < 80 && !lastNonDateLine.startsWith('•') && !lastNonDateLine.startsWith('-')) {
+          const prevParts = lastNonDateLine.split(/\s+[-–—\u2013\u2014|]\s+|,\s*|\s+at\s+|\s+en\s+/i).map((p) => p.trim()).filter(Boolean);
+          if (!current.company && prevParts[0]) {
+            current.company = prevParts[0];
+          }
+          if (!current.role && prevParts[1]) {
+            current.role = prevParts[1];
+          } else if (!current.role && prevParts[0] && current.company !== prevParts[0]) {
+            current.role = prevParts[0];
+          }
+        }
+      }
       continue;
     }
 
-    if (!current) continue;
-    const bullet = line.replace(/^[•‣◦⁃∙*\-]\s*/, '').trim();
-    if (bullet) bullets.push(bullet);
+    if (!current) {
+      lastNonDateLine = line;
+      continue;
+    }
+    const bullet = line.replace(/^[•‣◦⁃∙*\-–—]\s*/, '').trim();
+    if (bullet && bullet.length > 5) bullets.push(bullet);
+    lastNonDateLine = line;
   }
 
   flush();
@@ -312,12 +295,14 @@ function heuristicSkills(lines: string[]): Record<string, string[]> {
   for (const rawLine of lines) {
     const line = rawLine.trim();
     if (!line) continue;
+    if (DATE_RANGE.test(line)) continue;
+    if (line.length > 90) continue;
 
     // `Languages: Python, Go` keeps its category; a bare list does not have one.
-    const labelled = line.match(/^([A-Za-z][A-Za-z\s/&+]{1,30}):\s*(.+)$/);
+    const labelled = line.match(/^([A-Za-z\u00C0-\u017F][A-Za-z\u00C0-\u017F\s/&+]{1,30}):\s*(.+)$/);
     const category = labelled ? labelled[1].trim().toLowerCase() : 'skills';
     const body = labelled ? labelled[2] : line;
-    const values = body.split(/[,;|]/).map((v) => v.trim()).filter((v) => v.length > 1 && v.length < 40);
+    const values = body.split(/[,;|•·]/).map((v) => v.trim()).filter((v) => v.length > 1 && v.length < 40 && !DATE_RANGE.test(v));
     if (!values.length) continue;
     skills[category] = [...(skills[category] ?? []), ...values];
   }
@@ -329,8 +314,8 @@ function heuristicEducation(lines: string[]): Array<Record<string, unknown>> {
   for (const rawLine of lines) {
     const line = rawLine.trim();
     if (!line || line.length < 6) continue;
-    const degreeMatch = line.match(/\b(B\.?S\.?|B\.?A\.?|M\.?S\.?|M\.?A\.?|Ph\.?D\.?|Bachelor[a-z']*|Master[a-z']*|Doctorate|Associate)\b[^,|]*/i);
-    const institutionMatch = line.match(/\b([A-Z][A-Za-z.'-]*(?:\s+(?:of|and|the))?(?:\s+[A-Z][A-Za-z.'-]*)*\s+(?:University|College|Institute|School))\b/);
+    const degreeMatch = line.match(/\b(B\.?S\.?|B\.?A\.?|M\.?S\.?|M\.?A\.?|Ph\.?D\.?|Bachelor[a-z']*|Master[a-z']*|Doctorate|Associate|Ingenier[ií]a|Licenciatura|T[eé]cnico|Diplomado|Grado)\b[^,|]*/i);
+    const institutionMatch = line.match(/\b([A-Z\u00C0-\u017F][A-Za-z\u00C0-\u017F.'-]*(?:\s+(?:of|and|the|de|y|la|el))?(?:\s+[A-Z\u00C0-\u017F][A-Za-z\u00C0-\u017F.'-]*)*\s+(?:University|College|Institute|School|Universidad|Instituto|Facultad))\b/i);
     if (!degreeMatch && !institutionMatch) continue;
     const entry: Record<string, unknown> = {};
     if (degreeMatch) entry.degree = degreeMatch[0].trim();
@@ -343,15 +328,22 @@ function heuristicEducation(lines: string[]): Array<Record<string, unknown>> {
 /** Structure a resume with no model available. Finds less, invents nothing. */
 export function heuristicExtract(content: string): Record<string, unknown> {
   const sections = splitIntoSections(content);
+  const allLines = content.split('\n');
   const out: Record<string, unknown> = {};
 
-  const name = guessName(sections.get('header') ?? []);
+  const name = guessName(sections.get('header') ?? allLines);
   if (name) out.name = name;
 
-  const experience = heuristicExperience(sections.get('experience') ?? []);
+  let experience = heuristicExperience(sections.get('experience') ?? []);
+  if (experience.length === 0) {
+    experience = heuristicExperience(allLines);
+  }
   if (experience.length) out.experience = experience;
 
-  const education = heuristicEducation(sections.get('education') ?? []);
+  let education = heuristicEducation(sections.get('education') ?? []);
+  if (education.length === 0) {
+    education = heuristicEducation(allLines);
+  }
   if (education.length) out.education = education;
 
   const skills = heuristicSkills(sections.get('skills') ?? []);
@@ -362,16 +354,6 @@ export function heuristicExtract(content: string): Record<string, unknown> {
 
 // --- Entry point ------------------------------------------------------------
 
-/**
- * Record roles that ended up with no usable dates.
- *
- * The common cause is a resume that writes a year-only range such as
- * "(2021-2026)". A year carries no month, so it cannot become the `YYYY-MM` the
- * readers parse, and the alternative of assuming January would answer "how long
- * were you there" with a number that is confidently wrong by up to a year. The
- * date is dropped instead, and this warning makes that visible rather than
- * silent, since the role itself is still stored and still answerable.
- */
 function warnDroppedDates(profile: CanonicalProfileFacts, warnings: string[]): void {
   const undated = (profile.experience ?? []).filter((entry) => !entry.start_date).length;
   if (undated > 0) {
@@ -383,11 +365,6 @@ function warnDroppedDates(profile: CanonicalProfileFacts, warnings: string[]): v
 
 /**
  * Build a structured profile from an ingested resume.
- *
- * Never throws and never returns nothing. A model failure degrades to
- * deterministic parsing, and a deterministic parse that finds nothing still
- * returns an empty profile with the reason recorded in `warnings`, so the
- * caller can tell "no model" apart from "unreadable resume".
  */
 export async function extractStructuredProfile(
   document: Pick<LocalIngestedDocument, 'content'>,
@@ -405,13 +382,29 @@ export async function extractStructuredProfile(
     warnings.push(`Resume text truncated to ${MAX_PROMPT_CHARS} characters for extraction.`);
   }
 
+  // 1. Try provided LLM function (e.g. Gemini, Claude, OpenAI, Groq, DeepSeek)
+  if (typeof options.llmGenerateFn === 'function') {
+    try {
+      const raw = await options.llmGenerateFn(EXTRACTION_INSTRUCTIONS, resumeText);
+      if (raw) {
+        const parsed = JSON.parse(extractJsonPayload(raw)) as unknown;
+        const profile = canonicalizeProfile(parsed, { now, extractionMode: 'llm' });
+        if (isUsableProfile(profile)) {
+          warnDroppedDates(profile, warnings);
+          return { structured_data: profile, extractionMode: 'llm', warnings };
+        }
+      }
+    } catch (e) {
+      console.warn('[ResumeExtractor] Custom LLM extraction failed, trying Ollama/fallback:', e);
+    }
+  }
+
+  // 2. Try Ollama local model
   if (fetchImpl) {
     try {
       const installed = await listInstalledModels(ollamaUrl, fetchImpl, timeoutMs).catch(() => []);
       const model = options.model ?? pickChatModel(installed);
-      if (!model) {
-        warnings.push('No local chat model is installed, so extraction used deterministic parsing.');
-      } else {
+      if (model) {
         const suppressThinking = installed
           .find((entry) => entry.name === model)
           ?.capabilities.includes('thinking') ?? false;
@@ -422,16 +415,14 @@ export async function extractStructuredProfile(
           warnDroppedDates(profile, warnings);
           return { structured_data: profile, extractionMode: 'local_llm', warnings };
         }
-        warnings.push('The local model returned no usable fields, so extraction used deterministic parsing.');
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       warnings.push(`Local model extraction failed (${message}), so extraction used deterministic parsing.`);
     }
-  } else {
-    warnings.push('No fetch implementation is available, so extraction used deterministic parsing.');
   }
 
+  // 3. Robust heuristic fallback
   const profile = canonicalizeProfile(heuristicExtract(resumeText), { now, extractionMode: 'heuristic' });
   if (!isUsableProfile(profile)) {
     warnings.push('No profile fields could be read from this document.');
