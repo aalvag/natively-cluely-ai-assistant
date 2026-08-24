@@ -43,6 +43,16 @@ export function createZeroCacheState(encoderSession: InferenceSession): Nemotron
   return state;
 }
 
+function cloneTensor(t: Tensor | undefined): Tensor | undefined {
+  if (!t) return t;
+  if (t.type === 'int64') {
+    const data = t.data as BigInt64Array;
+    return new Tensor('int64', new BigInt64Array(data), [...t.dims]);
+  }
+  const data = t.data as Float32Array;
+  return new Tensor('float32', new Float32Array(data), [...t.dims]);
+}
+
 // Note the asymmetry with createZeroCacheState: that function throws loudly
 // when a declared input is missing, but this one does a plain index lookup —
 // a renamed/missing `*_next` output here yields `undefined` silently. This
@@ -52,8 +62,8 @@ export function createZeroCacheState(encoderSession: InferenceSession): Nemotron
 // call site.
 export function nextCacheState(outputs: Record<string, Tensor>): NemotronCacheState {
   return {
-    cache_last_channel: outputs['cache_last_channel_next'],
-    cache_last_time: outputs['cache_last_time_next'],
-    cache_last_channel_len: outputs['cache_last_channel_len_next'],
+    cache_last_channel: cloneTensor(outputs['cache_last_channel_next'])!,
+    cache_last_time: cloneTensor(outputs['cache_last_time_next'])!,
+    cache_last_channel_len: cloneTensor(outputs['cache_last_channel_len_next'])!,
   };
 }

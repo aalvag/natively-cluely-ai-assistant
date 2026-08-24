@@ -306,7 +306,7 @@ export function createSmartTurnPredictor(log?: (line: string) => void): SmartTur
             const session = await InferenceSession.create(modelPath, { ...getBoundedOnnxSessionOptions('default'), executionProviders: ['cpu'] } as any);
             return {
                 run: async (features) => {
-                    const input = new Tensor('float32', features.data, features.dims);
+                    const input = new Tensor('float32', Float32Array.from(features.data), features.dims);
                     const out = await session.run({ input_features: input });
                     const first = out[Object.keys(out)[0]];
                     const value = (first?.data as Float32Array | undefined)?.[0];

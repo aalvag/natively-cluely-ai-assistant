@@ -338,9 +338,10 @@ export class NemotronEngine {
       // Float32Array with the joint's expected shape is correct and exact —
       // this would NOT hold if target_len were ever > 1 (multi-token decode
       // calls), which this engine's greedy single-token-per-call design never does.
+      const decoderOutData = decoderOut.decoder_output.data as Float32Array;
       const decoderOutForJoint = new Tensor(
         'float32',
-        decoderOut.decoder_output.data as Float32Array,
+        new Float32Array(decoderOutData),
         [1, 1, DECODER_HIDDEN],
       );
 
@@ -388,7 +389,8 @@ export class NemotronEngine {
     for (let t = 0; t < encFrames; t++) {
       // [1, 1, 1024] — one time-step, matching the joint's encoder_output
       // input shape [batch, time, 1024] with time=1 (Task 1's recording).
-      const frameData = fullEncoderData.subarray(t * encHidden, (t + 1) * encHidden);
+      // Use slice() instead of subarray() to guarantee a fresh non-detached buffer across ORT calls.
+      const frameData = fullEncoderData.slice(t * encHidden, (t + 1) * encHidden);
       const encoderFrame = new Tensor('float32', frameData, [1, 1, encHidden]);
 
       const { tokenIds, nextState } = await greedyDecodeFrame(
