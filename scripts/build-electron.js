@@ -151,7 +151,41 @@ const copyAssets = () => {
   }
 };
 
+const patchTransformers = () => {
+  const targets = [
+    'node_modules/@huggingface/transformers/dist/transformers.node.mjs',
+    'node_modules/@huggingface/transformers/dist/transformers.node.cjs',
+  ];
+  for (const target of targets) {
+    const full = path.resolve(rootDir, target);
+    if (!fs.existsSync(full)) continue;
+    let content = fs.readFileSync(full, 'utf8');
+    if (!content.includes("session.inputNames.includes('cache_position')")) {
+      const targetStr = "new_model_inputs.use_cache_branch = boolTensor(!!past_key_values);\n    }";
+      const patchStr = `new_model_inputs.use_cache_branch = boolTensor(!!past_key_values);\n    }
+    if (session.inputNames.includes('cache_position') && !new_model_inputs.cache_position) {
+        const cur_len = new_model_inputs.input_ids?.dims?.[1] ?? 1;
+        let past_len = 0;
+        if (past_key_values && past_key_values[0] && past_key_values[0][0]) {
+            past_len = past_key_values[0][0].dims[2] ?? 0;
+        }
+        const positions = new BigInt64Array(cur_len);
+        for (let i = 0; i < cur_len; i++) {
+            positions[i] = BigInt(past_len + i);
+        }
+        new_model_inputs.cache_position = new _utils_tensor_js__WEBPACK_IMPORTED_MODULE_9__.Tensor('int64', positions, [cur_len]);
+    }`;
+      if (content.includes(targetStr)) {
+        content = content.replace(targetStr, patchStr);
+        fs.writeFileSync(full, content, 'utf8');
+        console.log(`[build-electron] Patched cache_position in ${target}`);
+      }
+    }
+  }
+};
+
 if (WATCH) {
+  patchTransformers();
   context(buildOptions).then(async (ctx) => {
     await ctx.watch();
     copyAssets();
@@ -161,6 +195,7 @@ if (WATCH) {
     console.log('[build-electron] watching for changes...');
   }).catch(onFailure);
 } else {
+  patchTransformers();
   build(buildOptions).then(() => {
     copyAssets();
     console.log(`[build-electron] Done in ${Date.now() - start}ms`);
