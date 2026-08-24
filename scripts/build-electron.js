@@ -181,6 +181,25 @@ const patchTransformers = () => {
         console.log(`[build-electron] Patched cache_position in ${target}`);
       }
     }
+    if (!content.includes('// [natively-patch] detached arraybuffer guard')) {
+      const feedTarget = 'const ortFeed = Object.fromEntries(Object.entries(checkedInputs).map(([k, v]) => [k, v.ort_tensor]));';
+      const feedPatch = `// [natively-patch] detached arraybuffer guard
+        const ortFeed = Object.fromEntries(Object.entries(checkedInputs).map(([k, v]) => {
+            let ort = v?.ort_tensor;
+            if (!ort || !ort.data || ort.data.buffer?.detached || ort.data.byteLength === 0) {
+                try {
+                    v = v.clone();
+                    ort = v.ort_tensor;
+                } catch {}
+            }
+            return [k, ort];
+        }));`;
+      if (content.includes(feedTarget)) {
+        content = content.replace(feedTarget, feedPatch);
+        fs.writeFileSync(full, content, 'utf8');
+        console.log(`[build-electron] Patched sessionRun ortFeed safety in ${target}`);
+      }
+    }
   }
 };
 
