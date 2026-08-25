@@ -89,16 +89,17 @@ export const ModesSettings: React.FC<ModesSettingsProps> = ({
             if (!api?.modesGetAll) return;
 
             const res = await api.modesGetAll();
-            if (res?.modes) {
-                setModes(res.modes);
-                const active = res.modes.find((m: Mode) => m.isActive);
+            const modeList: Mode[] = Array.isArray(res) ? res : res?.modes || [];
+            if (modeList.length > 0 || Array.isArray(res)) {
+                setModes(modeList);
+                const active = modeList.find((m: Mode) => m.isActive);
                 if (active) {
                     setActiveModeId(active.id);
                     if (!selectedModeId) {
                         setSelectedModeId(active.id);
                     }
-                } else if (res.modes.length > 0 && !selectedModeId) {
-                    setSelectedModeId(res.modes[0].id);
+                } else if (modeList.length > 0 && !selectedModeId) {
+                    setSelectedModeId(modeList[0].id);
                 }
             }
         } catch (err) {
@@ -119,18 +120,15 @@ export const ModesSettings: React.FC<ModesSettingsProps> = ({
             setContextInput(selectedMode.customContext || '');
             loadReferenceFiles(selectedMode.id);
         }
-    }, [selectedModeId]);
+    }, [selectedModeId, selectedMode?.id]);
 
     const loadReferenceFiles = async (modeId: string) => {
         try {
             const api = (window as any).electronAPI;
             if (!api?.modesGetReferenceFiles) return;
             const res = await api.modesGetReferenceFiles(modeId);
-            if (res?.files) {
-                setReferenceFiles(res.files);
-            } else {
-                setReferenceFiles([]);
-            }
+            const files = Array.isArray(res) ? res : res?.files || [];
+            setReferenceFiles(files);
         } catch {
             setReferenceFiles([]);
         }
@@ -185,9 +183,10 @@ export const ModesSettings: React.FC<ModesSettingsProps> = ({
                 name: nameInput.trim(),
                 templateType: newTemplateType,
             });
-            if (res?.mode) {
-                setModes(prev => [...prev, res.mode]);
-                setSelectedModeId(res.mode.id);
+            const createdMode = res?.mode || (res?.id ? res : null);
+            if (createdMode) {
+                setModes(prev => [...prev, createdMode]);
+                setSelectedModeId(createdMode.id);
                 setIsCreatingNew(false);
             }
         } catch (err) {
