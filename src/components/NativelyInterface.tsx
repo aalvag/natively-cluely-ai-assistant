@@ -19,6 +19,7 @@ import {
   SlidersHorizontal,
   X,
   Zap,
+  Loader2,
 } from 'lucide-react';
 import {
   mergeRollingTranscriptFinal,
@@ -1105,6 +1106,11 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   >('awaiting-audio');
   const [sttInterviewerError, setSttInterviewerError] = useState<string>('');
   const [sttInterviewerProvider, setSttInterviewerProvider] = useState<string>('');
+  const [audioInitStatus, setAudioInitStatus] = useState<{
+    stage: 'idle' | 'initializing_capture' | 'loading_model' | 'downloading' | 'ready';
+    progress?: number;
+    message?: string;
+  }>({ stage: 'idle' });
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [conversationContext, setConversationContext] = useState<string>('');
@@ -3526,6 +3532,25 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         setSttInterviewerProvider(data.provider);
         if (data.error) setSttInterviewerError(data.error);
         if (data.state === 'connected') setSttInterviewerError('');
+      }
+    });
+  }, []);
+
+  // Audio Initialization Progress listener (e.g. Whisper model load / download / capture start)
+  useEffect(() => {
+    if (!window.electronAPI?.onAudioInitStatus) return;
+    return window.electronAPI.onAudioInitStatus((data: any) => {
+      if (data.stage === 'ready') {
+        setAudioInitStatus({ stage: 'ready', progress: 100, message: data.message || 'Listo • Escuchando' });
+        setTimeout(() => {
+          setAudioInitStatus({ stage: 'idle' });
+        }, 2000);
+      } else {
+        setAudioInitStatus({
+          stage: data.stage as any,
+          progress: typeof data.progress === 'number' ? data.progress : undefined,
+          message: data.message,
+        });
       }
     });
   }, []);
@@ -7920,7 +7945,7 @@ Provide only the answer, nothing else.`;
   // Suppressed: mode label pill is not required in the UI.
   // Suppressed: LLM privacy label pill is not required in the UI.
   // Suppressed: vision pill ("Vision: provider") is not required in the UI.
-  const hasStatusPill = shouldShowSttSummaryPill || !!pageContext || !!captureFallback;
+  const hasStatusPill = shouldShowSttSummaryPill || !!pageContext || !!captureFallback || audioInitStatus.stage !== 'idle';
   const statusPillBaseClass = `flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-medium shadow-sm backdrop-blur-xl ${isLightTheme ? 'bg-white/55 border-black/10' : 'bg-black/20 border-white/10'}`;
 
   // Suppress the shell's scale/translate entry animation until it has rendered
@@ -8082,6 +8107,20 @@ Provide only the answer, nothing else.`;
 
               {hasStatusPill && (
               <div className="relative no-drag flex flex-wrap items-center justify-center gap-1.5 px-4 pt-3 pb-1">
+                {audioInitStatus.stage !== 'idle' && (
+                  <div
+                    className={`${statusPillBaseClass} bg-sky-500/15 border-sky-400/30 text-sky-300 animate-pulse`}
+                    title={audioInitStatus.message}
+                  >
+                    <Loader2 className="h-3 w-3 animate-spin opacity-80" />
+                    <span>{audioInitStatus.message || t('Iniciando audio...')}</span>
+                    {typeof audioInitStatus.progress === 'number' && audioInitStatus.progress > 0 && (
+                      <span className="font-mono text-[9px] bg-sky-500/25 px-1.5 py-0.5 rounded-full text-sky-200">
+                        {audioInitStatus.progress}%
+                      </span>
+                    )}
+                  </div>
+                )}
                 {shouldShowSttSummaryPill && (
                   <div
                     className={`${statusPillBaseClass} ${getStatusToneClass(sttSummary.tone)}`}

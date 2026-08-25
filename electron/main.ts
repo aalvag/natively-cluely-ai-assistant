@@ -1226,6 +1226,7 @@ import { ElevenLabsStreamingSTT } from "./audio/ElevenLabsStreamingSTT"
 import { OpenAIStreamingSTT } from "./audio/OpenAIStreamingSTT"
 import { NativelyProSTT } from "./audio/NativelyProSTT"
 import { NvidiaNimStreamingSTT } from "./audio/NvidiaNimStreamingSTT"
+import { LocalWhisperSTT } from "./audio/LocalWhisperSTT"
 import { punctuationSourceFor } from "./llm/punctuationProvenance"
 import { ThemeManager } from "./ThemeManager"
 import { RAGManager } from "./rag/RAGManager"
@@ -1233,7 +1234,7 @@ import { DatabaseManager } from "./db/DatabaseManager"
 import { warmupIntentClassifier } from "./llm"
 
 /** Unified type for all STT providers with optional extended capabilities */
-type STTProvider = (GoogleSTT | RestSTT | DeepgramStreamingSTT | SonioxStreamingSTT | ElevenLabsStreamingSTT | OpenAIStreamingSTT | NativelyProSTT | NvidiaNimStreamingSTT) & {
+type STTProvider = (GoogleSTT | RestSTT | DeepgramStreamingSTT | SonioxStreamingSTT | ElevenLabsStreamingSTT | OpenAIStreamingSTT | NativelyProSTT | NvidiaNimStreamingSTT | LocalWhisperSTT) & {
   finalize?: () => void;
   setAudioChannelCount?: (count: number) => void;
   notifySpeechEnded?: () => void;
@@ -3445,7 +3446,6 @@ export class AppState {
         stt = new GoogleSTT(speaker);
       }
     } else if (sttProvider === 'local-whisper') {
-      const { LocalWhisperSTT } = require('./audio/LocalWhisperSTT');
       const sm = SettingsManager.getInstance();
       const globalModel = sm.get('localWhisperModel') ?? 'Xenova/whisper-tiny.en';
       // Per-channel override: when enabled the two STT instances may load
@@ -3463,7 +3463,7 @@ export class AppState {
       const lws = new LocalWhisperSTT(modelId);
       // Channel label disambiguates the two concurrent instances in latency logs.
       lws.setChannel(speaker === 'interviewer' ? 'system' : 'mic');
-      stt = lws as any;
+      stt = lws;
     } else {
       stt = new GoogleSTT(speaker);
     }
@@ -3483,6 +3483,7 @@ export class AppState {
       : stt instanceof ElevenLabsStreamingSTT ? 'elevenlabs'
       : stt instanceof NativelyProSTT ? 'natively'
       : stt instanceof GoogleSTT ? 'google'
+      : stt instanceof LocalWhisperSTT ? 'local-whisper'
       : sttProvider;
 
     // Auto Answer V3 provider endpoints (Deepgram speech_final / UtteranceEnd,
@@ -3493,6 +3494,27 @@ export class AppState {
       (stt as any).on?.('endpoint', (ev: { type: 'speech_final' | 'utterance_end'; confidence?: number }) => {
         if (!this._autoAnswerEnabled) return;
         this.autoAnswerController.onProviderEndpoint({ type: ev.type, timestamp: Date.now(), confidence: ev.confidence });
+      });
+    }
+
+    if (stt instanceof LocalWhisperSTT) {
+      stt.on('progress', (ev: { modelId: string; progress: number }) => {
+        this.broadcast('audio-init-status', {
+          stage: 'downloading',
+          progress: ev.progress,
+          modelId: ev.modelId,
+          message: `Descargando modelo de voz (${ev.progress}%)...`,
+        });
+        this.broadcast('local-whisper-download-progress', { modelId: ev.modelId, progress: ev.progress });
+      });
+      stt.on('ready', (ev: { modelId: string }) => {
+        this.broadcast('audio-init-status', {
+          stage: 'ready',
+          progress: 100,
+          modelId: ev.modelId,
+          message: 'Modelo de voz listo',
+        });
+        this.broadcast('local-whisper-download-complete', { modelId: ev.modelId });
       });
     }
 
@@ -6164,6 +6186,12 @@ export class AppState {
           console.warn('[Main] Meeting starting WITHOUT audio capture — Ambient AI Chat is ON (Settings > General). Transcript, summary and usage will be empty for this meeting.');
         }
         if (!this._ambientChatEnabled) {
+          this.broadcast('audio-init-status', {
+            stage: 'initializing_capture',
+            progress: 30,
+            message: 'Iniciando captura de audio...',
+          });
+
           // Check for audio configuration preference
           if (metadata?.audio) {
             await this.reconfigureAudio(metadata.audio.inputDeviceId, metadata.audio.outputDeviceId);
@@ -6179,6 +6207,11 @@ export class AppState {
           }
 
           // LAZY INIT: Ensure pipeline is ready (if not reconfigured above)
+          this.broadcast('audio-init-status', {
+            stage: 'loading_model',
+            progress: 60,
+            message: 'Cargando motor de transcripción...',
+          });
           await this.setupSystemAudioPipeline();
           if (!isCurrentMeeting()) {
             abortStaleAudioInit();
@@ -6227,6 +6260,11 @@ export class AppState {
           console.log(`[Main][debug] Audio pipeline: input=${requestedInput} output=${requestedOutput} backend=${backend} sysRate=${sysRate}Hz micRate=${micRate}Hz`);
         }
         console.log('[Main] Audio pipeline started successfully.');
+        this.broadcast('audio-init-status', {
+          stage: 'ready',
+          progress: 100,
+          message: 'Listo • Escuchando',
+        });
       } catch (err) {
         // An endMeeting()-driven abort (or a generation change) is expected — it is
         // NOT a real audio failure, so we must not surface a "pipeline failed" banner

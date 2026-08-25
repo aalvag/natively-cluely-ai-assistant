@@ -1114,9 +1114,18 @@ export class LocalWhisperSTT extends EventEmitter {
                     return;
                 }
             }
+            if (msg.type === 'progress') {
+                this.emit('progress', {
+                    modelId: (msg as any).modelId || this.modelId,
+                    progress: (msg as any).progress,
+                    channelId: (msg as any).channelId,
+                });
+                return;
+            }
             if (msg.type === 'ready') {
                 clearLoadSentinel(this.modelId);
                 this.workerReady = true;
+                this.emit('ready', { modelId: this.modelId });
                 this.flushPending();
                 return;
             }

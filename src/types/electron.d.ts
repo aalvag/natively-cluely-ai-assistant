@@ -294,6 +294,10 @@ export interface ElectronAPI {
 
   // STT Status Events
   onSttStatusChanged: (callback: (data: { state: 'connected' | 'reconnecting' | 'failed' | 'awaiting-audio'; provider: string; error?: string; channel: 'user' | 'interviewer'; reconnectAttempts?: number }) => void) => () => void
+  onAudioInitStatus: (callback: (data: { stage: string; progress?: number; message?: string; modelId?: string }) => void) => () => void
+  onLocalWhisperDownloadProgress: (callback: (data: { modelId: string; progress: number }) => void) => () => void
+  onLocalWhisperDownloadComplete: (callback: (data: { modelId: string }) => void) => () => void
+  onLocalWhisperDownloadError: (callback: (data: { modelId: string; error: string }) => void) => () => void
 
   getNativeAudioStatus: () => Promise<{ connected: boolean }>
 

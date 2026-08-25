@@ -306,6 +306,9 @@ interface ElectronAPI {
   onLocalWhisperDownloadError: (
     callback: (data: { modelId: string; error: string }) => void,
   ) => () => void;
+  onAudioInitStatus: (
+    callback: (data: { stage: string; progress?: number; message?: string; modelId?: string }) => void,
+  ) => () => void;
   localWhisperPreload: (
     modelId?: string,
   ) => Promise<{ success: boolean; reason?: string; error?: string }>;
@@ -1596,6 +1599,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const listener = (_: any, data: any) => cb(data);
     ipcRenderer.on('local-whisper-download-error', listener);
     return () => ipcRenderer.removeListener('local-whisper-download-error', listener);
+  },
+  onAudioInitStatus: (cb: (data: { stage: string; progress?: number; message?: string; modelId?: string }) => void) => {
+    const listener = (_: any, data: any) => cb(data);
+    ipcRenderer.on('audio-init-status', listener);
+    return () => ipcRenderer.removeListener('audio-init-status', listener);
   },
   localWhisperPreload: (modelId?: string) => ipcRenderer.invoke('local-whisper-preload', modelId),
   localWhisperGetHardware: () => ipcRenderer.invoke('local-whisper-get-hardware'),
