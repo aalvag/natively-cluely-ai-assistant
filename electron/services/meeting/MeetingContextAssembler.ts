@@ -12,6 +12,7 @@ import { generateBuiltInRecipes } from './MeetingRecipes';
 import { FollowUpDraftGenerator } from './FollowUpDraftGenerator';
 import { SummaryPolisher } from './SummaryPolisher';
 import type { FollowUpTone } from './MeetingSummaryV3';
+import { cleanUserNotes, cleanVocabulary, userNoteHeadings, type NotesPromptContext } from './meetingNotesContext';
 
 export interface AssembleSummaryResult {
   summary: MeetingSummaryV3 | null;
@@ -30,13 +31,60 @@ export interface AssembleSummaryParams {
   startedAtIso?: string;
   startedAtMs?: number;
   // When true, generate an LLM-based follow-up draft (Phase 8). Gated by the caller on the
-  // followUpDraftV2 flag + post_call_summary scope.
+  // followUpDraftV2 flag + post_call_summary scope. Only a notes Regenerate on a meeting
+  // that already has a draft sets it — the draft is otherwise written on demand.
   generateFollowUpDraft?: boolean;
   followUpTone?: FollowUpTone;
+  // The user's own name for the draft's sign-off (Google account behind Calendar sync).
+  followUpSenderName?: string;
   // When true, run the constrained LLM Summary polish (#1). Gated by the caller on the
   // meetingSummaryLlmPolish flag + post_call_summary scope. Always falls back to the
   // deterministic summary, so it can never make the summary worse or block completion.
   polishSummary?: boolean;
+  // ── What the notes know besides the transcript (2026-10-15). All optional; with
+  // none of them the prompts are what they were. ──
+  /** meetingNotesContext.formatMeetingPeopleBlock: invite, people, date, the user. */
+  meetingContextBlock?: string;
+  /** recurringMeetings.formatLastTimeBlock: the previous meeting of the series. */
+  lastTimeBlock?: string;
+  /** The user's own notes typed during the meeting. The notes are built around them. */
+  userNotes?: string;
+  /** The user's spelling list for names and terms. */
+  vocabulary?: string[];
+  /** screenShareNotes.formatSharedScreensBlock: what others shared on screen. */
+  sharedScreensBlock?: string;
+}
+
+/** The NotesPromptContext for these params, or null when they carry none. */
+export function notesContextFromParams(params: Pick<AssembleSummaryParams, 'meetingContextBlock' | 'lastTimeBlock' | 'userNotes' | 'vocabulary' | 'sharedScreensBlock'>): NotesPromptContext | null {
+  const ctx: NotesPromptContext = {
+    ...(params.meetingContextBlock?.trim() ? { meetingContextBlock: params.meetingContextBlock.trim() } : {}),
+    ...(params.lastTimeBlock?.trim() ? { lastTimeBlock: params.lastTimeBlock.trim() } : {}),
+    ...(params.sharedScreensBlock?.trim() ? { sharedScreensBlock: params.sharedScreensBlock.trim() } : {}),
+  };
+  const notes = cleanUserNotes(params.userNotes);
+  if (notes) ctx.userNotes = notes;
+  const vocabulary = cleanVocabulary(params.vocabulary);
+  if (vocabulary.length) ctx.vocabulary = vocabulary;
+  return Object.keys(ctx).length > 0 ? ctx : null;
+}
+
+/**
+ * The note sections with the user's own headings first. A heading the user typed
+ * ("# Pricing") becomes a section the notes fill, so their structure survives;
+ * one that matches a mode section by name is that section, not a second one.
+ */
+export function sectionsWithUserHeadings(modeSections: MeetingModeSectionInput[], userNotes?: string): MeetingModeSectionInput[] {
+  const headings = userNoteHeadings(userNotes);
+  if (headings.length === 0) return modeSections;
+  const existing = new Set(modeSections.map(s => s.title.trim().toLowerCase()));
+  const fromUser = headings
+    .filter(h => !existing.has(h.toLowerCase()))
+    .map(h => ({
+      title: h,
+      description: `The user's own heading from their notes. Expand the points they wrote under "${h}" with the detail the transcript gives, and add other findings that belong under it. Nothing the transcript does not support.`,
+    }));
+  return [...fromUser, ...modeSections];
 }
 
 export class MeetingContextAssembler {
@@ -72,6 +120,9 @@ export class MeetingContextAssembler {
       // (documented in meeting-notes-v3-design.md §4).
       this.strategySelector.select(normalized);
 
+      const notesContext = notesContextFromParams(params);
+      const noteSections = sectionsWithUserHeadings(params.modeNoteSections || [], notesContext?.userNotes);
+
       const chunks = this.chunker.chunk(normalized);
       chunkCount = chunks.length;
       strategy = chunks.length > 1 ? 'map_reduce' : 'direct';
@@ -81,8 +132,10 @@ export class MeetingContextAssembler {
         chunk,
         totalChunks: chunks.length,
         modeTemplateType: params.modeTemplateType,
-        modeNoteSections: params.modeNoteSections,
+        modeNoteSections: noteSections,
         modeContextBlock: params.modeContextBlock,
+        notesContext,
+        meetingTotalChars: normalized.totalChars,
       }));
       const validAtoms = atoms.filter((atom): atom is ChunkMeetingAtoms => atom !== null);
       const droppedChunks = chunks.length - validAtoms.length;
@@ -100,7 +153,7 @@ export class MeetingContextAssembler {
         atoms: validAtoms,
         normalizedTranscript: normalized,
         modeTemplateType: params.modeTemplateType,
-        modeNoteSections: params.modeNoteSections,
+        modeNoteSections: noteSections,
         transcriptCoverage: normalized.totalChars > 0 ? Math.min(1, chunks.reduce((sum, chunk) => sum + chunk.charCount, 0) / normalized.totalChars) : 0,
         mode: params.modeMeta,
         generation: {
@@ -138,7 +191,7 @@ export class MeetingContextAssembler {
           const topics = summary.topics || [];
           const [polished, polishedOverview] = await Promise.all([
             summary.tldr.length > 0 ? polisher.polish(baseInputs) : Promise.resolve(null),
-            polisher.polishOverview({ ...baseInputs, briefs, topics, totalTokensEstimate: normalized.totalTokensEstimate }),
+            polisher.polishOverview({ ...baseInputs, briefs, topics, totalTokensEstimate: normalized.totalTokensEstimate, notesContext }),
           ]);
           if (polished && polished.length > 0) summary.tldr = polished;
           if (polishedOverview) summary.overview = polishedOverview;
@@ -154,6 +207,7 @@ export class MeetingContextAssembler {
             summary,
             mode: params.modeTemplateType,
             tone: params.followUpTone,
+            senderName: params.followUpSenderName,
           });
           summary.followUpDraft = draft;
         } catch (e) {

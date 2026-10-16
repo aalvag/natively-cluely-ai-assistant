@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
-import { AlertCircle, Check, ChevronDown, Download, ExternalLink, Filter, FolderOpen, HardDrive, KeyRound, Loader2, Monitor, RefreshCw, Search, Server, ShieldAlert, Trash2, X } from 'lucide-react';
+import { AlertCircle, Check, ChevronDown, Download, ExternalLink, FileCheck, Filter, FolderOpen, HardDrive, KeyRound, Loader2, Monitor, RefreshCw, Search, Server, ShieldAlert, Trash2, X } from 'lucide-react';
 import { useT } from '../../i18n';
 import { useResolvedTheme } from '../../hooks/useResolvedTheme';
-import { AIP_ACTIVE_SELECT_CONTAINER, AIP_CSS, AipBadge, AipModelList, AipProviderMark, AipSelect, AipSwitch, type AipSelectOption, type AipTone } from './AIProvidersSettings';
+import { AIP_ACTIVE_SELECT_CONTAINER, AIP_CSS, AipBadge, AipModelList, AipProviderMark, AipSaveLabel, AipSelect, AipSwitch, AipTestLabel, type AipSelectOption, type AipTone } from './AIProvidersSettings';
+import { Presence, RETRIEVAL_HERO_PICKER_ATTR, RETRIEVAL_HERO_PICKER_MIN_WIDTH, capPickerLabel, useMotionReadyAfter } from './SettingsRow';
 import { isMac, isWindows } from '../../utils/platformUtils';
 import { candidateControlApplies, candidateControlRationale } from '../../lib/rerankCandidateControl.mjs';
 
@@ -368,6 +369,8 @@ const RerankerModelSelect: React.FC<FloatingSelectProps> = ({
         || (selectedOption ? (selectedOption.triggerName || selectedOption.name) : null)
         || (value && value.includes('::') ? bareModelName(value.split('::').slice(1).join('::')) : null)
         || (placeholder || t('Select reranker'));
+    const shownLabel = capPickerLabel(resolvedLabel);
+    const fullLabelHint = shownLabel !== resolvedLabel ? resolvedLabel : undefined;
 
     return (
         <div className={containerClassName} ref={containerRef}>
@@ -377,7 +380,7 @@ const RerankerModelSelect: React.FC<FloatingSelectProps> = ({
                 aria-expanded={isOpen}
                 aria-haspopup="listbox"
                 aria-label={ariaLabel}
-                title={disabled ? disabledHint || title : title}
+                title={disabled ? disabledHint || title : title ?? fullLabelHint}
                 disabled={disabled}
                 className={`aip-select-trigger cursor-pointer flex items-center justify-between w-full ${disabled ? 'opacity-50 cursor-not-allowed' : ''} ${className}`}
             >
@@ -390,14 +393,14 @@ const RerankerModelSelect: React.FC<FloatingSelectProps> = ({
                     LIGHT theme the label stayed pure white on a light button
                     and was invisible (measured: embedding flipped to
                     rgb(55,65,81), this stayed rgb(255,255,255)). */}
-                <span className="truncate pr-2 text-xs">{resolvedLabel}</span>
+                <span className="truncate pr-2 text-xs">{shownLabel}</span>
                 <ChevronDown size={14} strokeWidth={1.75} className={`aip-select-chevron transition-transform duration-150 shrink-0 ${isOpen ? 'rotate-180' : ''}`} aria-hidden="true" />
             </button>
 
             {isOpen && (
                 <div
                     role="listbox"
-                    className="aip-float aip-scroll-y aip-panel-fade absolute top-full right-0 mt-1.5 w-full min-w-[180px] z-50 max-h-64 p-1 custom-scrollbar shadow-2xl rounded-md border border-white/10 bg-[#161618]"
+                    className={`aip-float aip-scroll-y aip-panel-fade absolute top-full right-0 mt-1.5 w-full z-50 max-h-64 p-1 custom-scrollbar shadow-2xl rounded-md border border-white/10 bg-[#161618]`}
                 >
                     {options.map((option) => (
                         <button
@@ -412,6 +415,9 @@ const RerankerModelSelect: React.FC<FloatingSelectProps> = ({
                                 setIsOpen(false);
                             }}
                             className={`aip-select-option flex items-center justify-between w-full text-left px-3 py-2 rounded-md text-xs cursor-pointer transition-colors hover:bg-white/10 ${value === option.id ? 'aip-text font-medium bg-white/5' : ''}`}
+                            // The menu is exactly as wide as its button, so a long
+                            // name truncates; hover shows it whole.
+                            title={option.name}
                         >
                             <span className="truncate flex-1">{option.name}</span>
                             {value === option.id && (
@@ -587,9 +593,18 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
     const [loadError, setLoadError] = useState<string | null>(null);
     const [catalogModels, setCatalogModels] = useState<LocalCatalogModel[]>([]);
     const [builtInSelected, setBuiltInSelected] = useState(true);
-    const [modelProgress, setModelProgress] = useState<Record<string, { fraction: number; file: string }>>({});
+    const [modelProgress, setModelProgress] = useState<Record<string, { fraction: number; file: string; phase?: 'checking' | 'downloading' }>>({});
+    /** The model whose files are being checked: its row is busy, but it is not being activated. */
+    const [checkingFilesId, setCheckingFilesId] = useState<string | null>(null);
+    /** What the last "Check files" found, per model. Shown on the row until the next check. */
+    const [fileCheckNotes, setFileCheckNotes] = useState<Record<string, string>>({});
     const [busyCatalogId, setBusyCatalogId] = useState<string | null>(null);
     const [catalogError, setCatalogError] = useState<string | null>(null);
+    /* A failure from a row's own button (Download, Use, Check files, Remove). Shown
+       above the list, where the Embedding panel shows its own: `catalogError` sits
+       in the Active Reranker card at the top of the page, which is off-screen from
+       the row that was clicked. */
+    const [catalogListError, setCatalogListError] = useState<string | null>(null);
     const [hostedProviders, setHostedProviders] = useState<Array<{
         id: 'natively' | 'openrouter' | 'jina' | 'voyage'; name: string; keyUrl: string; keyPlaceholder: string;
         staticCatalogue: boolean; hasApiKey: boolean;
@@ -598,6 +613,9 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
 
     // Model Library UI Optimization States
     const [filterTab, setFilterTab] = useState<'all' | 'installed' | 'recommended'>('all');
+    // The hosted cards mount with their key state already known; a key saved
+    // or removed after that animates its trash button in and out.
+    const hostedMotionReady = useMotionReadyAfter(hostedProviders.length > 0);
     const [modelQuery, setModelQuery] = useState('');
     const [expandedNotes, setExpandedNotes] = useState<Record<string, boolean>>({});
     const [expandedFileDrawers, setExpandedFileDrawers] = useState<Record<string, boolean>>({});
@@ -701,8 +719,8 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
     }, []);
 
     useEffect(() => {
-        const off = window.electronAPI.onLocalRerankerModelProgress?.(({ id, fraction, currentFile }) => {
-            setModelProgress(prev => ({ ...prev, [id]: { fraction, file: currentFile } }));
+        const off = window.electronAPI.onLocalRerankerModelProgress?.(({ id, fraction, currentFile, phase }) => {
+            setModelProgress(prev => ({ ...prev, [id]: { fraction, file: currentFile, phase } }));
         });
         return () => { off?.(); };
     }, []);
@@ -856,6 +874,7 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
         const id = rest.join('::');
         setBusyCatalogId(optionId);
         setCatalogError(null);
+        setCatalogListError(null);
         try {
             if (kind === 'natively') {
                 // Its own arm, not the trailing `else`. Without one, picking the
@@ -883,13 +902,16 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                     await window.electronAPI.setExtensionEnabled?.(ext.id, false);
                 }
                 const res = await window.electronAPI.useLocalRerankerModel?.(id === 'built-in' ? null : id);
-                if (res && !res.success) {
-                    setCatalogError(res.message || res.error || t('Could not activate this reranker.'));
+                // A cancelled file repair is the user's own doing, not a failure.
+                if (res && !res.success && res.error !== 'cancelled') {
+                    setCatalogError(res.message || t('Could not activate this reranker.'));
                 }
             }
             await Promise.all([refreshStatus(), loadCatalogModels(), loadExtensions(), loadHostedProviders(), loadCustomModels()]);
         } finally {
             setBusyCatalogId(null);
+            // Activating a local model checks its files and reports that as progress on its row.
+            if (kind === 'local') setModelProgress(prev => { const next = { ...prev }; delete next[id]; return next; });
         }
     }, [extensions, refreshStatus, loadCatalogModels, loadExtensions, loadHostedProviders, loadCustomModels, t]);
 
@@ -994,11 +1016,13 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
 
     const installCatalogModel = useCallback(async (id: string) => {
         setBusyCatalogId(id);
+        setCatalogListError(null);
         setCatalogError(null);
+        setFileCheckNotes(prev => { const next = { ...prev }; delete next[id]; return next; });
         try {
             const res = await window.electronAPI.installLocalRerankerModel?.(id);
-            if (res && !res.success) {
-                setCatalogError(res.message || res.error || t('Download failed.'));
+            if (res && !res.success && res.error !== 'cancelled') {
+                setCatalogListError(res.message || t('Download failed.'));
             }
             await loadCatalogModels();
         } finally {
@@ -1009,22 +1033,54 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
 
     const useCatalogModel = useCallback(async (id: string | null) => {
         setBusyCatalogId(id ?? 'built-in');
+        setCatalogListError(null);
         setCatalogError(null);
         try {
             const res = await window.electronAPI.useLocalRerankerModel?.(id);
-            if (res && !res.success) setCatalogError(res.message || res.error || t('Could not activate this reranker.'));
+            if (res && !res.success && res.error !== 'cancelled') setCatalogListError(res.message || t('Could not activate this reranker.'));
             await Promise.all([loadCatalogModels(), refreshStatus()]);
         } finally {
             setBusyCatalogId(null);
+            // Activation checks the files first and reports that as progress.
+            if (id) setModelProgress(prev => { const next = { ...prev }; delete next[id]; return next; });
         }
     }, [loadCatalogModels, refreshStatus, t]);
 
+    /* The list only knows each file's length. This hashes them, and fetches
+       again whatever turns out to be damaged. */
+    const checkCatalogModelFiles = useCallback(async (id: string) => {
+        setBusyCatalogId(id);
+        setCheckingFilesId(id);
+        setCatalogListError(null);
+        setCatalogError(null);
+        setFileCheckNotes(prev => { const next = { ...prev }; delete next[id]; return next; });
+        try {
+            const res = await window.electronAPI.verifyLocalRerankerModel?.(id);
+            if (res && !res.success) {
+                if (res.error !== 'cancelled') setCatalogListError(res.message || t('Could not check this model\'s files.'));
+            } else if (res) {
+                const repaired = res.repaired?.length ?? 0;
+                setFileCheckNotes(prev => ({
+                    ...prev,
+                    [id]: repaired === 0 ? t('Files are intact') : repaired === 1 ? t('Repaired 1 damaged file') : `${t('Repaired damaged files')}: ${repaired}`,
+                }));
+            }
+            await loadCatalogModels();
+        } finally {
+            setBusyCatalogId(null);
+            setCheckingFilesId(null);
+            setModelProgress(prev => { const next = { ...prev }; delete next[id]; return next; });
+        }
+    }, [loadCatalogModels, t]);
+
     const removeCatalogModel = useCallback(async (id: string) => {
         setBusyCatalogId(id);
+        setCatalogListError(null);
         setCatalogError(null);
+        setFileCheckNotes(prev => { const next = { ...prev }; delete next[id]; return next; });
         try {
             const res = await window.electronAPI.removeLocalRerankerModel?.(id);
-            if (res && !res.success) setCatalogError(res.message || res.error || t('Could not remove this model.'));
+            if (res && !res.success) setCatalogListError(res.message || t('Could not remove this model.'));
             await loadCatalogModels();
         } finally {
             setBusyCatalogId(null);
@@ -1167,7 +1223,9 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
 
     const renderCatalogModelRow = (m: LocalCatalogModel) => {
         const prog = modelProgress[m.id];
-        const busy = busyCatalogId === m.id;
+        // Busy wherever the action on this model was started: its own buttons, or
+        // the Active Reranker picker (which activates it as `local::<id>`).
+        const busy = busyCatalogId === m.id || busyCatalogId === `local::${m.id}`;
         const installed = m.state === 'installed';
         // Only an entry that actually names an extension needs one. GGUF runs
         // in Core now; this used to fire on every GGUF model and disable its
@@ -1223,6 +1281,19 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                                 </button>
                             )
                         )}
+                        {/* A repair fetching a damaged file again can be gigabytes. The
+                            row still reads as installed, so offer the way out here. */}
+                        {installed && busy && prog?.phase === 'downloading' && (
+                            <button
+                                type="button"
+                                className="aip-btn"
+                                data-size="sm"
+                                onClick={() => void window.electronAPI.cancelLocalRerankerModel?.(m.id)}
+                            >
+                                <X size={12} strokeWidth={1.75} aria-hidden="true" />
+                                <span>{t('Cancel')}</span>
+                            </button>
+                        )}
                         {installed && m.activatable && !m.selected && (
                             <button
                                 type="button"
@@ -1231,8 +1302,23 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                                 disabled={busyCatalogId !== null}
                                 onClick={() => void useCatalogModel(m.id)}
                             >
-                                {busy ? <Loader2 size={12} className="aip-spinner" aria-hidden="true" /> : null}
+                                {busy && checkingFilesId !== m.id ? <Loader2 size={12} className="aip-spinner" aria-hidden="true" /> : null}
                                 <span>{t('Use')}</span>
+                            </button>
+                        )}
+                        {installed && (
+                            <button
+                                type="button"
+                                className="aip-btn"
+                                data-size="sm"
+                                disabled={busyCatalogId !== null}
+                                onClick={() => void checkCatalogModelFiles(m.id)}
+                                title={t('Check files for damage and repair them')}
+                                aria-label={t('Check files for damage and repair them')}
+                            >
+                                {checkingFilesId === m.id
+                                    ? <Loader2 size={12} className="aip-spinner" aria-hidden="true" />
+                                    : <FileCheck size={12} strokeWidth={1.75} aria-hidden="true" />}
                             </button>
                         )}
                         {installed && !m.selected && (
@@ -1256,6 +1342,9 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                         {[m.params, humanBytes(m.bytes), m.license.spdx, m.license.commercialUseRestricted ? t('non-commercial') : null]
                             .filter(Boolean).join(' · ')}
                     </span>
+                    {fileCheckNotes[m.id] && installed && !busy && (
+                        <span className="aip-panel-fade text-[var(--aip-secondary)]" role="status">{fileCheckNotes[m.id]}</span>
+                    )}
                 </div>
 
                 {m.note && (
@@ -1265,7 +1354,7 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                 )}
 
                 {!m.supported && m.unsupportedReason && (
-                    <div className="aip-inline-warn flex items-start gap-2 ml-3.5 mt-1" role="status">
+                    <div className="aip-inline-warn flex items-start gap-2 ml-3.5 !mt-2.5" role="status">
                         <AlertCircle size={12} strokeWidth={1.75} className="shrink-0 mt-0.5" aria-hidden="true" />
                         <span className="min-w-0">{m.unsupportedReason}</span>
                     </div>
@@ -1283,32 +1372,20 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                         <div className="h-1 w-full bg-[var(--aip-item-active)] rounded-full overflow-hidden">
                             <div className="h-full w-full origin-left bg-[var(--aip-accent)] transition-transform duration-150 ease-linear" style={{ transform: `scaleX(${Math.min(1, Math.max(0, prog.fraction))})` }} />
                         </div>
+                        {/* Hashing a file that is already here is not a download: no byte counter. */}
                         <div className="text-[10px] aip-muted flex justify-between">
-                            <span>{`${Math.round(prog.fraction * 100)}% · ${prog.file}`}</span>
-                            <span>{`${humanBytes(Math.round(prog.fraction * m.bytes))} / ${humanBytes(m.bytes)}`}</span>
+                            <span>{prog.phase === 'checking'
+                                ? `${t('Checking files')} · ${prog.file}`
+                                : `${Math.round(prog.fraction * 100)}% · ${prog.file}`}</span>
+                            {prog.phase !== 'checking' && (
+                                <span>{`${humanBytes(Math.round(prog.fraction * m.bytes))} / ${humanBytes(m.bytes)}`}</span>
+                            )}
                         </div>
                     </div>
                 )}
             </div>
         );
     };
-
-    /**
-     * Who the hosted fallback actually covers.
-     *
-     * The switch is wired to RerankerRegistry.resolveHostedPort, which wraps
-     * WHICHEVER hosted provider is selected — so the old label ("if OpenRouter
-     * is unavailable") was wrong the moment Jina shipped: a failed Jina rerank
-     * took the same branch while the UI said nothing about it. Built from the
-     * live provider list rather than a hardcoded pair, so a third hosted
-     * provider needs no copy change.
-     */
-    const hostedFallbackSubject = useMemo(() => {
-        const names = hostedProviders.map(p => p.name).filter(Boolean);
-        if (names.length === 0) return t('a hosted reranker');
-        if (names.length === 1) return names[0];
-        return `${names.slice(0, -1).join(', ')} ${t('or')} ${names[names.length - 1]}`;
-    }, [hostedProviders, t]);
 
     /* Active Reranker and the hosted-fallback toggle. On the combined Retrieval
        page this sits above the Embedding/Reranker switcher. */
@@ -1350,7 +1427,7 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                         </p>
                     </div>
 
-                    <div className="shrink-0 relative">
+                    <div className="shrink-0 relative" {...{ [RETRIEVAL_HERO_PICKER_ATTR]: '' }} style={{ minWidth: RETRIEVAL_HERO_PICKER_MIN_WIDTH }}>
                         <RerankerModelSelect
                             ariaLabel={t('Active Reranker Model')}
                             value={activeOptionId}
@@ -1365,14 +1442,14 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                 </div>
 
                 {catalogError && (
-                    <div className="aip-inline-warn flex items-start gap-2 pt-3" role="status">
+                    <div className="aip-inline-warn flex items-start gap-2 mt-3" role="status">
                         <AlertCircle size={12} strokeWidth={1.75} className="shrink-0 mt-0.5" aria-hidden="true" />
                         <span className="min-w-0">{catalogError}</span>
                     </div>
                 )}
 
                 {status.provider === 'openrouter' && !status.eligible && (
-                    <div className="aip-inline-warn flex items-start gap-2 pt-3" role="status">
+                    <div className="aip-inline-warn flex items-start gap-2 mt-3" role="status">
                         <AlertCircle size={12} strokeWidth={1.75} className="shrink-0 mt-0.5" aria-hidden="true" />
                         <span className="min-w-0">
                             {status.ineligibleMessage}{' '}
@@ -1393,8 +1470,14 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                         <span className="block text-xs font-medium uppercase tracking-wide aip-hero">
                             {t('Fall back to the local reranker')}
                         </span>
+                        {/* One line (404px of 472 in the 574px column). The switch
+                            is wired to RerankerRegistry.resolveHostedPort, which
+                            wraps WHICHEVER hosted provider is selected, so "a hosted
+                            reranker" covers them all. Naming each one ("If Natively,
+                            OpenRouter, Jina AI or Voyage AI fails…") wrapped to two
+                            lines and grew with every provider added. */}
                         <p className="text-[10px] aip-muted">
-                            {`${t('Off by default. If')} ${hostedFallbackSubject} ${t('fails, rerank locally instead of keeping the original order.')}`}
+                            {t('If a hosted reranker fails, rerank on this device instead of keeping the original order.')}
                         </p>
                     </div>
                     <div className="shrink-0">
@@ -1526,14 +1609,10 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                                         className="aip-btn-seg aip-field-seg"
                                         data-tone={saved ? 'ok' : undefined}
                                     >
-                                        {saving
-                                            ? <><Loader2 size={12} strokeWidth={1.75} className="aip-spinner" /> {t('Saving...')}</>
-                                            : saved
-                                                ? <><Check size={12} strokeWidth={2} className="aip-check" /> {t('Saved')}</>
-                                                : t('Save')}
+                                        <AipSaveLabel saving={!!(saving)} saved={!!(saved)} dots />
                                     </button>
                                 </div>
-                                {hasKey && (
+                                <Presence kind="control" id={hasKey ? 'remove' : null} ready={hostedMotionReady} className="shrink-0">
                                     <button
                                         type="button"
                                         onClick={() => void removeKey(p.id, p.staticCatalogue)}
@@ -1544,7 +1623,7 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                                     >
                                         <Trash2 size={14} strokeWidth={1.75} />
                                     </button>
-                                )}
+                                </Presence>
                             </div>
                         </div>
                         )}
@@ -1563,13 +1642,7 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                                             ? t('Pick a model from this provider first — testing sends a real request through whichever provider is selected.')
                                             : (testResult?.message || t('Test Connection'))}
                                     >
-                                        {testing && isSelected
-                                            ? <><Loader2 size={12} strokeWidth={1.75} className="aip-spinner" /> {t('Testing...')}</>
-                                            : isSelected && testResult?.success
-                                                ? <><Check size={12} strokeWidth={2} className="aip-check" /> {t('Passed')}</>
-                                                : isSelected && testResult
-                                                    ? <><AlertCircle size={12} strokeWidth={1.75} /> {t('Error')}</>
-                                                    : <>{t('Test Connection')}</>}
+                                        <AipTestLabel status={testing && isSelected ? 'testing' : isSelected && testResult?.success ? 'success' : isSelected && testResult ? 'error' : 'idle'} />
                                     </button>
                                 )}
 
@@ -1732,6 +1805,13 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                     )}
                 </div>
 
+                {catalogListError && (
+                    <div className="aip-inline-warn flex items-start gap-2" role="status">
+                        <AlertCircle size={12} strokeWidth={1.75} className="shrink-0 mt-0.5" aria-hidden="true" />
+                        <span className="min-w-0">{catalogListError}</span>
+                    </div>
+                )}
+
                 {/* Scrollable Model Library Container */}
                 <div className="aip-well aip-scroll-y p-2.5 space-y-3.5" style={{ maxHeight: 380 }}>
                     {/* Section 1: Bundled Models */}
@@ -1862,11 +1942,7 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                                 className="aip-field-seg"
                                 data-tone={customSaved ? 'ok' : undefined}
                             >
-                                {customSaving
-                                    ? <><Loader2 size={12} strokeWidth={1.75} className="aip-spinner" /> {t('Saving...')}</>
-                                    : customSaved
-                                        ? <><Check size={12} strokeWidth={2} className="aip-check" /> {t('Saved')}</>
-                                        : t('Save')}
+                                <AipSaveLabel saving={!!(customSaving)} saved={!!(customSaved)} dots />
                             </button>
                         </div>
                     </div>
@@ -1898,11 +1974,7 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                                 className="aip-btn-seg aip-field-seg"
                                 data-tone={customSaved ? 'ok' : undefined}
                             >
-                                {customSaving
-                                    ? <><Loader2 size={12} strokeWidth={1.75} className="aip-spinner" /> {t('Saving...')}</>
-                                    : customSaved
-                                        ? <><Check size={12} strokeWidth={2} className="aip-check" /> {t('Saved')}</>
-                                        : t('Save')}
+                                <AipSaveLabel saving={!!(customSaving)} saved={!!(customSaved)} dots />
                             </button>
                         </div>
                     </div>
@@ -1924,13 +1996,7 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
                             data-tone={testResult?.success ? 'ok' : testResult ? 'danger' : undefined}
                             title={t('Test Connection')}
                         >
-                            {testing
-                                ? <><Loader2 size={12} strokeWidth={1.75} className="aip-spinner" /> {t('Testing...')}</>
-                                : testResult?.success
-                                    ? <><Check size={12} strokeWidth={2} className="aip-check" /> {t('Passed')}</>
-                                    : testResult
-                                        ? <><AlertCircle size={12} strokeWidth={1.75} /> {t('Error')}</>
-                                        : <>{t('Test Connection')}</>}
+                            <AipTestLabel status={testing ? 'testing' : testResult?.success ? 'success' : testResult ? 'error' : 'idle'} />
                         </button>
 
                         {customModels.length > 0 && (
@@ -2187,7 +2253,7 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
 
                                                 {/* Verification Failure Warning */}
                                                 {group.anyFailed && (
-                                                    <div className="aip-inline-warn flex items-start gap-2 mt-1" role="status">
+                                                    <div className="aip-inline-warn flex items-start gap-2 !mt-2.5" role="status">
                                                         <AlertCircle size={12} strokeWidth={1.75} className="shrink-0 mt-0.5" aria-hidden="true" />
                                                         <span className="min-w-0">
                                                             {group.files.find(f => f.reason)?.reason ?? t('The downloaded file did not match its expected checksum.')}
@@ -2197,7 +2263,7 @@ export const RerankerSettings: React.FC<RerankerSettingsProps> = ({ renderParts 
 
                                                 {/* License Acceptance Banner */}
                                                 {group.unacknowledgedLicense && (
-                                                    <div className="space-y-1.5 p-2 rounded bg-[var(--aip-btn-bg)] border border-[var(--aip-divider)] mt-1">
+                                                    <div className="space-y-1.5 p-2 rounded-[var(--aip-r-md)] bg-[var(--aip-btn-bg)] border border-[var(--aip-divider)] !mt-2.5">
                                                         <p className="text-[10px] aip-muted">
                                                             {t('This model requires licence acceptance')} ({group.unacknowledgedLicense.spdx})
                                                             {group.unacknowledgedLicense.commercialUseRestricted ? ` — ${t('non-commercial use only')}` : ''}.

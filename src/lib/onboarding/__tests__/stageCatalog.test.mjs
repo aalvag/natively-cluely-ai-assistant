@@ -62,7 +62,7 @@ const DEFAULT_USER_STATE = {
   extensionConnected: false,
   extensionSupported: true,
   permsShown: false,
-  macTCCBlocked: false,
+  permissionsNeedAttention: false,
   seenProfileOnboarding: false,
   seenModesOnboarding: false,
   activeModeSet: false,
@@ -100,21 +100,41 @@ test('permissions: fires on first launch when perms not yet shown', () => {
   assert.equal(show('permissions', makeCtx({ homepageMountedFor: 3_000 })), true);
 });
 
-test('permissions: skipped when perms shown AND no TCC block', () => {
+test('permissions: stays quiet once shown while every permission is fine', () => {
   const ctx = makeCtx({
-    userState: { ...DEFAULT_USER_STATE, permsShown: true, macTCCBlocked: false },
+    userState: { ...DEFAULT_USER_STATE, permsShown: true, permissionsNeedAttention: false },
     homepageMountedFor: 3_000,
   });
   assert.equal(show('permissions', ctx), false);
 });
 
-test('permissions: re-fires when mac TCC is blocked (returning user)', () => {
+test('permissions: comes back for a returning user when a permission needs attention', () => {
   const ctx = makeCtx({
-    userState: { ...DEFAULT_USER_STATE, permsShown: true, macTCCBlocked: true },
+    userState: { ...DEFAULT_USER_STATE, permsShown: true, permissionsNeedAttention: true },
     homepageMountedFor: 3_000,
   });
   assert.equal(show('permissions', ctx), true);
 });
+
+// The permissions rule, checked on BOTH twins: the .ts catalog the app ships
+// and the .mjs one the decision-engine tests above run. Hand-written truth
+// table: first launch always shows; afterwards only a permission that needs
+// attention brings the card back.
+for (const [label, stages] of [['stageCatalog.mjs', STAGES], ['stageCatalog.ts', STAGES_TS]]) {
+  const perms = stages.find((s) => s.id === 'permissions');
+  for (const [permsShown, permissionsNeedAttention, wantSkip] of [
+    [false, false, false],
+    [false, true, false],
+    [true, false, true],
+    [true, true, false],
+  ]) {
+    test(`${label} permissions: shown=${permsShown} needsAttention=${permissionsNeedAttention} → ${wantSkip ? 'quiet' : 'eligible'}`, () => {
+      const userState = { ...DEFAULT_USER_STATE, permsShown, permissionsNeedAttention };
+      assert.equal(perms.skipWhen(userState), wantSkip);
+      assert.equal(perms.reEligibility(userState, {}), permissionsNeedAttention);
+    });
+  }
+}
 
 test('permissions: blocked by homepage duration < 2s', () => {
   assert.equal(show('permissions', makeCtx({ homepageMountedFor: 1_500 })), false);
@@ -145,11 +165,13 @@ test('browser_extension: blocked by permissions prerequisite', () => {
   assert.equal(show('browser_extension', ctx), false);
 });
 
-test('browser_extension: fires after permissions + 5s homepage + connected=false', () => {
+test('browser_extension: waits for permissions + 6s homepage + connected=false', () => {
   const ctx = makeCtx({
     completed: { permissions: 1 },
-    homepageMountedFor: 6_000,
+    homepageMountedFor: 5_000,
   });
+  assert.equal(show('browser_extension', ctx), false);
+  ctx.homepageMountedFor = 6_000;
   assert.equal(show('browser_extension', ctx), true);
 });
 
@@ -209,59 +231,21 @@ test('modes_manager: skipped when activeModeSet', () => {
   assert.equal(show('modes_manager', ctx), false);
 });
 
-// ─── Trial promo ──────────────────────────────────────────────────
+// ─── Trial ────────────────────────────────────────────────────────
+// Not a card any more: it starts by itself with a meeting
+// (src/lib/trial/autoTrial.mjs). The catalog must not bring the card back.
 
-test('trial_promo: skipped when hasNativelyKey', () => {
-  const ctx = makeCtx({
-    userState: { ...DEFAULT_USER_STATE, hasNativelyKey: true },
-    completed: { permissions: 1, browser_extension: 2, profile_intelligence: 3, modes_manager: 4 },
-    homepageMountedFor: 7_000,
-  });
-  assert.equal(show('trial_promo', ctx), false);
-});
-
-test('trial_promo: skipped when hasTrialToken', () => {
-  const ctx = makeCtx({
-    userState: { ...DEFAULT_USER_STATE, hasTrialToken: true },
-    completed: { permissions: 1, browser_extension: 2, profile_intelligence: 3, modes_manager: 4 },
-    homepageMountedFor: 7_000,
-  });
-  assert.equal(show('trial_promo', ctx), false);
-});
-
-test('trial_promo: skipped when isPremium', () => {
-  const ctx = makeCtx({
-    userState: { ...DEFAULT_USER_STATE, isPremium: true },
-    completed: { permissions: 1, browser_extension: 2, profile_intelligence: 3, modes_manager: 4 },
-    homepageMountedFor: 7_000,
-  });
-  assert.equal(show('trial_promo', ctx), false);
+test('trial_promo is not a stage', () => {
+  assert.equal(STAGES.find((s) => s.id === 'trial_promo'), undefined);
+  assert.equal(STAGES_TS.find((s) => s.id === 'trial_promo'), undefined);
 });
 
 // ─── Support ──────────────────────────────────────────────────────
-
-test('support: skipped when !donationShouldShow', () => {
-  const ctx = makeCtx({
-    completed: { quiet_window: 1 },
-    turnCount: 15,
-    homepageMountedFor: 11_000,
-  });
-  assert.equal(show('support', ctx), false);
-});
 
 test('support: skipped when isPremium', () => {
   const ctx = makeCtx({
     userState: { ...DEFAULT_USER_STATE, isPremium: true, donationShouldShow: true },
     completed: { quiet_window: 1 },
-    turnCount: 15,
-    homepageMountedFor: 11_000,
-  });
-  assert.equal(show('support', ctx), false);
-});
-
-test('support: requires quiet_window prerequisite', () => {
-  const ctx = makeCtx({
-    userState: { ...DEFAULT_USER_STATE, donationShouldShow: true },
     turnCount: 15,
     homepageMountedFor: 11_000,
   });
@@ -289,33 +273,6 @@ test('support: fires with quiet_window + 10 turns + 10s homepage', () => {
 });
 
 // ─── Ads ──────────────────────────────────────────────────────────
-
-test('ads: requires startupCount >= 4', () => {
-  const ctx = makeCtx({
-    completed: { support: 1 },
-    startupCount: 3,
-    homepageMountedFor: 11_000,
-  });
-  assert.equal(show('ads', ctx), false);
-});
-
-test('ads: requires support prerequisite', () => {
-  const ctx = makeCtx({
-    startupCount: 5,
-    homepageMountedFor: 11_000,
-  });
-  assert.equal(show('ads', ctx), false);
-});
-
-test('ads: skipped when isPremium', () => {
-  const ctx = makeCtx({
-    userState: { ...DEFAULT_USER_STATE, isPremium: true },
-    completed: { support: 1 },
-    startupCount: 5,
-    homepageMountedFor: 11_000,
-  });
-  assert.equal(show('ads', ctx), false);
-});
 
 // ─── Review prompt ────────────────────────────────────────────────
 
@@ -356,12 +313,11 @@ test('review_prompt: withheld until at least one engagement gate is met', () => 
 });
 
 test('review_prompt: engagement does not bypass the other triggers', () => {
-  // Fully engaged, but the ads stage has not completed — order still holds.
+  // Fully engaged, but not yet 10 s on the home screen.
   const ctx = makeCtx({
-    completed: {},
     startupCount: 99,
     totalUsageMs: 99 * 60 * 1000,
-    homepageMountedFor: 11_000,
+    homepageMountedFor: 5_000,
   });
   assert.equal(show('review_prompt', ctx), false);
 });
@@ -387,22 +343,15 @@ test('any stage with requiresForeground: blocked when !appInForeground', () => {
 
 // ─── Cooldown ─────────────────────────────────────────────────────
 
+// The generic cooldown mechanism (card stages now wait via the card ledger).
+const COOLDOWN_STAGE = { id: 'cooldown_probe', order: 1, triggers: {}, cooldownMs: () => 7 * 24 * 60 * 60 * 1000 };
+
 test('cooldown blocks re-fire within cooldown window', () => {
-  const config = stageById['browser_extension'];
-  const ctx = makeCtx({
-    completed: { permissions: 1 },
-    homepageMountedFor: 6_000,
-    lastShownTimes: { browser_extension: Date.now() - 1000 }, // 1s ago
-  });
-  assert.equal(show('browser_extension', ctx), false);
+  const ctx = makeCtx({ lastShownTimes: { cooldown_probe: Date.now() - 1000 } }); // 1s ago
+  assert.equal(shouldShowToaster(COOLDOWN_STAGE, ctx), false);
 });
 
 test('cooldown allows re-fire after window elapses', () => {
-  const config = stageById['browser_extension'];
-  const ctx = makeCtx({
-    completed: { permissions: 1 },
-    homepageMountedFor: 6_000,
-    lastShownTimes: { browser_extension: Date.now() - 8 * 24 * 60 * 60 * 1000 }, // 8 days ago
-  });
-  assert.equal(show('browser_extension', ctx), true);
+  const ctx = makeCtx({ lastShownTimes: { cooldown_probe: Date.now() - 8 * 24 * 60 * 60 * 1000 } }); // 8 days ago
+  assert.equal(shouldShowToaster(COOLDOWN_STAGE, ctx), true);
 });

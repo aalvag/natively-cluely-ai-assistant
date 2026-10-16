@@ -18,10 +18,18 @@ export type QueryIntent =
 
 export interface RetrievalOptions {
     meetingId?: string;           // For meeting-scoped queries
+    /** Global search limited to these meetings (a folder). Empty finds nothing. */
+    meetingIds?: string[];
     maxTokens?: number;           // Context token budget (default: 1500)
     topK?: number;                // Initial retrieval count (default: 8)
     recencyWeight?: number;       // 0-1, how much to weight recent (default: 0.3)
     intent?: QueryIntent;         // Override detected intent
+    /**
+     * The caller's budget for embedding the query (EmbeddingPipeline
+     * retryBudgetMs): attempt 1 runs, retries only when they still fit. A live
+     * answer passes its retrieval budget; absent = the full 3-attempt ladder.
+     */
+    queryEmbedRetryBudgetMs?: number;
 }
 
 export interface RetrievedContext {
@@ -51,6 +59,15 @@ export class RAGRetriever {
         this.embeddingPipeline = embeddingPipeline;
     }
 
+    /** When each selected chunk's meeting began, so its header can show time into the meeting. */
+    private meetingStartTimes(chunks: ScoredChunk[]): Map<string, number> {
+        try {
+            return this.vectorStore.getMeetingStartTimes([...new Set(chunks.map(c => c.meetingId))]);
+        } catch {
+            return new Map();
+        }
+    }
+
     /**
      * Retrieve relevant context for a query
      */
@@ -72,7 +89,10 @@ export class RAGRetriever {
         // 1. Embed the query
         let queryEmbedding: number[];
         try {
-            queryEmbedding = await this.embeddingPipeline.getEmbeddingForQuery(query);
+            queryEmbedding = await this.embeddingPipeline.getEmbeddingForQuery(
+                query,
+                typeof options.queryEmbedRetryBudgetMs === 'number' ? { retryBudgetMs: options.queryEmbedRetryBudgetMs } : undefined,
+            );
         } catch (error) {
             console.error('[RAGRetriever] Failed to embed query:', error);
             // Return empty context on embedding failure
@@ -135,8 +155,9 @@ export class RAGRetriever {
         selected.sort((a, b) => a.startMs - b.startMs);
 
         // 6. Format context
+        const starts = this.meetingStartTimes(selected);
         const formattedContext = selected
-            .map(chunk => formatChunkForContext(chunk))
+            .map(chunk => formatChunkForContext(chunk, starts.get(chunk.meetingId)))
             .join('\n\n');
 
         return {
@@ -169,7 +190,10 @@ export class RAGRetriever {
         // Embed query
         let queryEmbedding: number[];
         try {
-            queryEmbedding = await this.embeddingPipeline.getEmbeddingForQuery(query);
+            queryEmbedding = await this.embeddingPipeline.getEmbeddingForQuery(
+                query,
+                typeof options.queryEmbedRetryBudgetMs === 'number' ? { retryBudgetMs: options.queryEmbedRetryBudgetMs } : undefined,
+            );
         } catch (error) {
             console.error('[RAGRetriever] Failed to embed query:', error);
             return {
@@ -186,10 +210,11 @@ export class RAGRetriever {
         const chunkResults = await this.vectorStore.searchSimilar(queryEmbedding, {
             limit: topK * 2,
             minSimilarity: resolveMinSimilarity(spaceKey),
-            spaceKey
+            spaceKey,
+            ...(options.meetingIds ? { meetingIds: options.meetingIds } : {}),
         });
 
-        const summaryResults = await this.vectorStore.searchSummaries(queryEmbedding, 5, spaceKey);
+        const summaryResults = await this.vectorStore.searchSummaries(queryEmbedding, 5, spaceKey, options.meetingIds);
 
         // Get meeting IDs from top summaries
         const relevantMeetingIds = new Set(summaryResults.map(s => s.meetingId));
@@ -238,10 +263,11 @@ export class RAGRetriever {
 
         // Format with meeting grouping
         const contextParts: string[] = [];
+        const starts = this.meetingStartTimes(selected);
         for (const [meetingId, chunks] of byMeeting) {
             // Sort chunks within meeting by timestamp
             chunks.sort((a, b) => a.startMs - b.startMs);
-            const chunkTexts = chunks.map(c => formatChunkForContext(c)).join('\n');
+            const chunkTexts = chunks.map(c => formatChunkForContext(c, starts.get(meetingId))).join('\n');
             contextParts.push(`--- Meeting ${meetingId} ---\n${chunkTexts}`);
         }
 

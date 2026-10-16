@@ -38,7 +38,7 @@ import { isRetrievalFixEnabled } from '../contracts/retrieval-flags';
 // `(c as Record<string, unknown>)`, so this loosens only the declared shape,
 // not what the port actually trusts at runtime.
 export interface MeetingRetrieverLike {
-  retrieve?: (query: string, options: { meetingId?: string; topK?: number; maxTokens?: number }) => Promise<{
+  retrieve?: (query: string, options: { meetingId?: string; topK?: number; maxTokens?: number; queryEmbedRetryBudgetMs?: number }) => Promise<{
     chunks?: ReadonlyArray<object>;
   } | null | undefined>;
 }
@@ -56,6 +56,12 @@ export interface MeetingPortInput {
    * own MIN_COMBINED_SCORE exists to prevent.
    */
   minSimilarity?: number;
+  /**
+   * Chunks that started before this time are left out: the reset shortcut
+   * during a meeting makes the assistant forget what came before, and the live
+   * index keeps those chunks (2026-10-16). 0 or absent: no limit.
+   */
+  notBeforeMs?: number;
 }
 
 export const MEETING_MIN_SIMILARITY = 0.3;
@@ -80,9 +86,13 @@ export function createMeetingRetrievalPort(input: MeetingPortInput): RetrievalPo
 
   return createLegacyRetrievalPort({
     registry: { sourceTypes, activeVersions, chunkVersions, sourceScopes },
-    retrieve: async (query: string, opts: { topK: number }) => {
+    retrieve: async (query: string, opts: { topK: number; timeoutMs?: number }) => {
       if (!input.retriever.retrieve) return [];
       const res = await input.retriever.retrieve(query, {
+        // The turn's retrieval budget bounds the query embedding. Without it a
+        // stalled embed endpoint retried 3 times with backoff: live 2026-09-27
+        // (looking for work), one answer waited 11 s on meeting retrieval.
+        ...(typeof opts.timeoutMs === 'number' ? { queryEmbedRetryBudgetMs: opts.timeoutMs } : {}),
         // Scoping the QUERY to the live meeting as well is belt-and-braces: the
         // scope filter would reject a foreign chunk anyway, but not fetching it
         // is cheaper and keeps the candidate pool honest.
@@ -99,6 +109,8 @@ export function createMeetingRetrievalPort(input: MeetingPortInput): RetrievalPo
 
         const similarity = Number((c as Record<string, unknown>).similarity ?? 0);
         if (!Number.isFinite(similarity) || similarity < floor) continue;
+        const startMs = Number((c as Record<string, unknown>).startMs);
+        if (input.notBeforeMs && Number.isFinite(startMs) && startMs < input.notBeforeMs) continue;
 
         // One source per MEETING. Declaring per chunk would make every chunk its
         // own source and defeat any future version comparison.

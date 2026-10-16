@@ -43,6 +43,11 @@ export const DEFAULT_KEYBINDS: KeybindConfig[] = [
     { id: 'chat:answer', label: 'Answer / Record', accelerator: 'CommandOrControl+5', isGlobal: true, defaultAccelerator: 'CommandOrControl+5' },
     { id: 'chat:codeHint', label: 'Get Code Hint', accelerator: 'CommandOrControl+6', isGlobal: true, defaultAccelerator: 'CommandOrControl+6' },
     { id: 'chat:brainstorm', label: 'Brainstorm Approaches', accelerator: 'CommandOrControl+7', isGlobal: true, defaultAccelerator: 'CommandOrControl+7' },
+    // Accepts the overlay's suggestion card (DynamicActionBar). Global like the
+    // rest of this family: the overlay never takes keyboard focus during a
+    // meeting (a no-activate panel), so an in-page key (the old Tab) never
+    // reached it while Zoom or Meet had focus.
+    { id: 'chat:acceptSuggestion', label: 'Use Suggestion', accelerator: 'CommandOrControl+8', isGlobal: true, defaultAccelerator: 'CommandOrControl+8' },
     // Scroll shortcuts are global so they work in stealth mode without the user
     // having to click the Natively window first (regression fix for issue #233).
     // Each press kicks an inertial scroll loop in the renderer: a single tap
@@ -69,6 +74,11 @@ export const DEFAULT_KEYBINDS: KeybindConfig[] = [
     { id: 'window:move-down', label: 'Move Window Down', accelerator: 'CommandOrControl+Shift+Down', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+Down' },
     { id: 'window:move-left', label: 'Move Window Left', accelerator: 'CommandOrControl+Shift+Left', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+Left' },
     { id: 'window:move-right', label: 'Move Window Right', accelerator: 'CommandOrControl+Shift+Right', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+Right' },
+
+    // Dictation (services/dictation): press to record the mic, press again to
+    // copy the tidied text to the clipboard. Registered only while Settings ›
+    // Audio › Dictation is on (shouldRegister), so by default it takes no key.
+    { id: 'dictation:toggle', label: 'Dictate to Clipboard', accelerator: 'CommandOrControl+Shift+D', isGlobal: true, defaultAccelerator: 'CommandOrControl+Shift+D' },
 ];
 
 export class KeybindManager {
@@ -106,6 +116,16 @@ export class KeybindManager {
         this.notifyChordsChanged();
     }
 
+    /**
+     * A setting that decides whether some shortcut is registered changed
+     * (Settings › Audio › Dictation): re-register and re-arm the Windows guard.
+     */
+    public refreshRegistrations(): void {
+        this.registerGlobalShortcuts();
+        this.notifyChordsChanged();
+        this.broadcastUpdate();
+    }
+
     public getGlobalShortcutsEnabled(): boolean {
         return SettingsManager.getInstance().get('globalShortcutsEnabled') !== false;
     }
@@ -124,6 +144,9 @@ export class KeybindManager {
         // OS-wide. Without it a hidden stealth window (no Dock/taskbar icon)
         // has no way back short of the tray or a relaunch.
         if (!this.getGlobalShortcutsEnabled()) return actionId === 'general:toggle-visibility';
+        // Dictation's key is taken from other apps only while dictation is on,
+        // in both modes (in a meeting a press says why it is refused).
+        if (actionId === 'dictation:toggle') return SettingsManager.getInstance().get('dictationEnabled') === true;
         if (this.activeMode === 'overlay') return true;
 
         // In launcher mode, register visibility shortcuts. window:move-* is NOT
@@ -133,17 +156,23 @@ export class KeybindManager {
         if (actionId === 'general:toggle-visibility') return true;
         if (actionId === 'general:toggle-mouse-passthrough') return true;
 
-        // Screenshot & screen-analyze shortcuts must work globally in BOTH modes.
-        // Without these, Cmd+H / Cmd+Shift+H / Cmd+Shift+Enter do nothing in
-        // launcher mode because globalShortcut.register() is never called for them.
-        // Also fixes the silent rebind failure: re-registration after setKeybind()
-        // hit the same gate and dropped the newly bound accelerator too.
-        if (actionId === 'general:take-screenshot') return true;
-        if (actionId === 'general:selective-screenshot') return true;
-        if (actionId === 'general:capture-and-process') return true;
-        // Browser/page capture must work globally in both modes (same rationale
-        // as the screenshot shortcuts — it's a global capture trigger).
-        if (actionId === 'general:capture-dom') return true;
+        // Take Screenshot and Selective Screenshot are NOT global here
+        // (2026-10-10). Main hands both to the meeting overlay's renderer, the
+        // only listener, and outside a meeting the press went to the launcher
+        // and did nothing: no screenshot, no cropper. All the registration did
+        // was take Cmd+H (Hide) on macOS and Ctrl+H on Windows away from every
+        // other app. The first-launch tour still gets its Take Screenshot press,
+        // as a keydown in its own window (ShortcutTour.tsx).
+        //
+        // Capture Screen & Ask AI and Capture Page are not global here either
+        // (2026-10-10). Both end in the same overlay listener. Pressed for real
+        // outside a meeting, Cmd+Shift+Enter hid the launcher, took a picture
+        // of the screen, put the launcher back and stopped: nothing was shown
+        // and nothing was asked, and the picture stayed in the queue for the
+        // next meeting to pick up. Cmd+Y asks the browser extension for the
+        // page and delivers it to the overlay, or falls back to that same
+        // screenshot. Registered, they also kept Ctrl+Y (Redo) and
+        // Cmd+Y (History) from every other app.
 
         return false;
     }
@@ -401,15 +430,22 @@ export class KeybindManager {
         // the current mode. In launcher mode that excludes all of chat:*, whose
         // recorded conflicts must survive — Settings is opened from the
         // launcher, so that is precisely when the renderer reads the snapshot.
+        const failingBefore = this.registrationFailures;
         this.registrationFailures = beginFullRegistrationPass(
             this.registrationFailures,
             (id) => {
                 const kb = this.keybinds.get(id);
                 if (!kb) return true; // unknown id: nothing to preserve it for
                 if (!kb.isGlobal || !kb.accelerator || kb.accelerator.trim() === '') return true;
+                // A verdict about an accelerator the id no longer has says
+                // nothing about its new one. Without this, a shortcut rebound
+                // from Settings (launcher mode, where most ids are not
+                // attempted) kept its old "in use" badge until the next meeting.
+                if (this.registrationFailures[id] !== kb.accelerator.trim()) return true;
                 return this.shouldRegister(id);
             },
         );
+        const keptForThisPass = this.registrationFailures;
 
         this.keybinds.forEach(kb => {
             if (kb.isGlobal && kb.accelerator && kb.accelerator.trim() !== '') {
@@ -451,11 +487,69 @@ export class KeybindManager {
             }
         });
 
+        this.probeMeetingOnlyShortcuts();
+
+        // A verdict this pass dropped before re-testing, and did not find
+        // again, was never announced as cleared: markRegistration only speaks
+        // on a change, and by then the entry was already gone. A window that
+        // learns of conflicts from the pushes alone (the overlay's banner) kept
+        // showing one for a shortcut that now works.
+        // (One the pass kept and then cleared was announced by markRegistration.)
+        for (const id of Object.keys(failingBefore)) {
+            if (id in keptForThisPass || id in this.registrationFailures) continue;
+            BrowserWindow.getAllWindows().forEach(win => {
+                if (!win.isDestroyed()) {
+                    win.webContents.send('keybinds:registration-succeeded', { id, accelerator: failingBefore[id] });
+                }
+            });
+        }
+
         this.updateMenu();
 
         // (Re-)start the health-check loop so it always reflects the current
         // registered set after any full re-registration.
         this.startHealthCheck();
+    }
+
+    /**
+     * Asks the OS, outside a meeting, whether each meeting-only shortcut could
+     * be taken, and gives it straight back.
+     *
+     * Outside a meeting most shortcuts are not registered (shouldRegister), so
+     * one held by another app was only found when a meeting started: the first
+     * the user heard of it was a key that did nothing in the meeting, and
+     * Settings, which is opened from the launcher, had no badge to show before
+     * that. The answer does not depend on the mode, so it is asked here too.
+     *
+     * Register and unregister run back to back with no turn of the event loop
+     * between them, so no key press can reach the empty handler, and nothing
+     * stays registered: the other app keeps its key. Same call on macOS and
+     * Windows (globalShortcut), and the Windows chord table never sees these
+     * ids, since it is built from shouldRegister alone.
+     */
+    private probeMeetingOnlyShortcuts(): void {
+        if (this.activeMode !== 'launcher' || !this.getGlobalShortcutsEnabled()) return;
+        this.keybinds.forEach(kb => {
+            if (!kb.isGlobal || !kb.accelerator || kb.accelerator.trim() === '') return;
+            if (this.shouldRegister(kb.id)) return;
+            const acc = kb.accelerator.trim();
+            if (!isRegisterableAccelerator(acc)) {
+                this.markRegistration(kb.id, acc, false);
+                return;
+            }
+            try {
+                // Held by one of this app's own shortcuts (two actions bound to
+                // one key): unregistering it here would drop the real one.
+                if (globalShortcut.isRegistered(acc)) return;
+                globalShortcut.register(acc, () => { /* released before any key can arrive */ });
+                const free = globalShortcut.isRegistered(acc);
+                if (free) globalShortcut.unregister(acc);
+                this.markRegistration(kb.id, acc, free);
+            } catch (e) {
+                // A probe that throws says nothing: the last verdict stands.
+                console.warn(`[KeybindManager] Could not probe ${acc} (${kb.id}):`, e);
+            }
+        });
     }
 
     /**
@@ -602,7 +696,7 @@ export class KeybindManager {
                         click: () => {
                             // Require AppState dynamically to avoid circular dependencies
                             const { AppState } = require('../main');
-                            AppState.getInstance().toggleMainWindow();
+                            AppState.getInstance().toggleMainWindow(true);
                         }
                     },
                     { type: 'separator' },

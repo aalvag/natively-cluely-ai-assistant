@@ -19,10 +19,14 @@ import {
   interpolateBounds,
 } from './utils/launcherResizeAnimation';
 import { attachNoActivate, isNoActivateManaged, restoreFocusableOffTaskbar } from './utils/windowsFocusPolicy';
+import { raiseAboveOverlay } from './utils/overlayStackOrder';
+import { HOVER_PROBE_INTERVAL_MS, hoverProbePoint, shouldProbeHover } from './utils/overlayHoverProbe';
 import { setVisibleOnAllWorkspacesKeepingDock } from './utils/macDockPolicy';
+import { clearStaleHover } from './utils/overlayAuxHover';
 import { resizeEnvelopeFor, OVERLAY_PANEL_INSET } from '../src/lib/overlayCustomSize.mjs';
 import { decideLauncherClose } from '../src/lib/launcherCloseDecision.mjs';
 import { DEV_SERVER_URL } from './devServerUrl';
+import { shortcutRestoreBounds, shortcutRestoreDisplay } from './utils/shortcutRestore';
 
 const isEnvDev = process.env.NODE_ENV === 'development';
 const isPackaged = app.isPackaged;
@@ -160,8 +164,10 @@ export class WindowHelper {
   // streamed by the renderer as the width spring runs so the toggle window
   // rides the panel's top-right corner frame-by-frame (the pre-aux-window
   // behavior, where a MotionValue did the riding inside one window). Default
-  // = collapsed panel right edge inside the fixed window: (732 + 600) / 2.
-  private togglePanelRight = 666;
+  // = collapsed panel right edge inside the fixed window: (732 + 604) / 2
+  // (defaultCollapsedPanelWidth in src/lib/overlayCustomSize.mjs). Only used
+  // until the renderer's first stream.
+  private togglePanelRight = 668;
   // The panel's LIVE left edge, streamed alongside the right one. Together
   // they are the panel's true extent inside the window — which the window's
   // own width stops describing while a resize drag renders inside a wider
@@ -172,6 +178,10 @@ export class WindowHelper {
   // state): true (default, safe) = window interactive; false = pointer is
   // over a transparent margin → click-through. See syncOverlayInteractionPolicy.
   private overlayHoverInteractive = true;
+  // Runs only while the hover gate has the overlay click-through: asks the
+  // overlay's page where the pointer is, in case the forwarded mouse moves
+  // that normally reopen the gate have stopped (utils/overlayHoverProbe.ts).
+  private hoverProbeTimer: NodeJS.Timeout | null = null;
   // ── Overlay popover (settings / model-selector dropdown) coordination ───
   // Which overlay-anchored popovers are currently open. Non-empty → the
   // click-catcher window is shown so a click ANYWHERE outside Natively's
@@ -184,8 +194,8 @@ export class WindowHelper {
   // painted windows) dismisses the popovers — standard menu semantics (the
   // dismissing click is consumed). Lazily created.
   private popoverCatcher: BrowserWindow | null = null;
-  // Last UI state broadcast by the overlay renderer, replayed to an aux
-  // window when it (re)loads after the broadcast happened.
+  // Last UI state broadcast by the overlay renderer, handed to an aux window
+  // that (re)loads after the broadcast happened and asks for it.
   private lastOverlayUiState: unknown = null;
   // Track current window mode (persists even when overlay is hidden via Cmd+B)
   private currentWindowMode: 'launcher' | 'overlay' = 'launcher';
@@ -1019,6 +1029,8 @@ export class WindowHelper {
    *                            screen with no other trace).
    */
   private attachRendererDiagnostics(win: BrowserWindow, tag: string): void {
+    // A page that loaded without its preload bridge is dead until reloaded.
+    require('./preloadBridgeGuard').attachPreloadBridgeGuard(win, tag);
     try {
       const wc = win.webContents;
 
@@ -1124,6 +1136,7 @@ export class WindowHelper {
     this.launcherWindow.on('move', () => {
       if (this.launcherAnimating) return;
       if (this.launcherWindow) {
+        this.refreshLauncherMinimum(screen.getDisplayMatching(this.launcherWindow.getBounds()).workArea);
         const bounds = this.launcherWindow.getBounds();
         this.launcherPosition = { x: bounds.x, y: bounds.y };
         this.appState.settingsWindowHelper.reposition(bounds);
@@ -1308,7 +1321,12 @@ export class WindowHelper {
           if (!this.overlayWindow || this.overlayWindow.isDestroyed()) return;
           if (!this.overlayWindow.isVisible()) return;
           this.overlayWindow.setAlwaysOnTop(true, 'screen-saver');
+          this.raiseOverlayAuxWindows();
         });
+        // Without the no-activate policy (no stealth hook) a click or focus()
+        // activates the overlay, and Windows brings an activated window to the
+        // front of its band, over the pill and toggle.
+        this.overlayWindow.on('focus', () => this.raiseOverlayAuxWindows());
       }
 
       this.overlayWindow.on('close', (e) => {
@@ -1496,14 +1514,61 @@ export class WindowHelper {
         `[WindowHelper] Overlay interaction policy: passthrough=${passthrough} hoverInteractive=${this.overlayHoverInteractive}`,
       );
     }
+    this.syncHoverProbe();
+  }
+
+  // Starts or stops the hover-gate probe to match the gate. The tick calls
+  // this too, so a hidden or closed overlay ends the timer without every hide
+  // path having to remember it.
+  private syncHoverProbe(): void {
+    const overlay = this.overlayWindow;
+    const want = shouldProbeHover({
+      visible: !!overlay && !overlay.isDestroyed() && overlay.isVisible(),
+      passthrough: this.appState.getOverlayMousePassthrough(),
+      hoverInteractive: this.overlayHoverInteractive,
+      forwardSupported: process.platform !== 'linux',
+    });
+    if (!want) {
+      if (this.hoverProbeTimer) clearInterval(this.hoverProbeTimer);
+      this.hoverProbeTimer = null;
+      return;
+    }
+    if (this.hoverProbeTimer) return;
+    this.hoverProbeTimer = setInterval(() => this.probeOverlayHover(), HOVER_PROBE_INTERVAL_MS);
+    // A pointer check must never be what keeps the process alive at quit.
+    this.hoverProbeTimer.unref?.();
+  }
+
+  private probeOverlayHover(): void {
+    this.syncHoverProbe();
+    const overlay = this.overlayWindow;
+    if (!this.hoverProbeTimer || !overlay || overlay.isDestroyed()) return;
+    const point = hoverProbePoint(screen.getCursorScreenPoint(), overlay.getBounds());
+    if (!point) return;
+    try {
+      overlay.webContents.send('overlay-hover-probe', point);
+    } catch {
+      // Renderer gone or reloading: did-finish-load reopens the gate itself.
+    }
   }
 
   // Renderer hover hit-test → margins click-through. Called on every
   // interactive↔margin boundary crossing (state changes only, not per
   // mousemove), so `quiet` keeps the log usable.
-  public setOverlayHoverInteractive(interactive: boolean): void {
+  public setOverlayHoverInteractive(interactive: boolean, source?: 'probe', idleMs?: number): void {
     if (this.overlayHoverInteractive === interactive) return;
     this.overlayHoverInteractive = interactive;
+    if (source === 'probe') {
+      // The pointer was over the panel and no mouse move had said so: the
+      // panel moved or grew under a resting pointer, or mouse moves are not
+      // reaching the overlay at all. The idle time tells the two apart in a
+      // user's log (a resting pointer has a recent last move; a dead feed has
+      // an old one, again and again).
+      const idle = typeof idleMs === 'number' && Number.isFinite(idleMs) ? `${Math.round(idleMs)}ms` : 'unknown';
+      console.warn(
+        `[WindowHelper] Hover gate reopened by the pointer probe (pointer over the panel, last mouse move seen ${idle} ago)`,
+      );
+    }
     this.syncOverlayInteractionPolicy(true);
   }
 
@@ -1791,13 +1856,9 @@ export class WindowHelper {
         console.error(`[WindowHelper] Failed to load ${name} URL:`, e);
       });
       this.attachRendererDiagnostics(win, name);
-      // Replay the last UI-state broadcast once the aux renderer is live — it
-      // may finish loading after the overlay's first broadcast.
-      win.webContents.on('did-finish-load', () => {
-        if (this.lastOverlayUiState !== null && !win.isDestroyed()) {
-          win.webContents.send('overlay-ui-state', this.lastOverlayUiState);
-        }
-      });
+      // No replay of the last UI-state broadcast on (re)load: the aux renderer
+      // asks for it once it is subscribed (getOverlayUiState). A push from
+      // did-finish-load arrived before the page was listening and was dropped.
       win.on('closed', () => {
         if (this.pillWindow === win) this.pillWindow = null;
         if (this.toggleWindow === win) this.toggleWindow = null;
@@ -1834,6 +1895,15 @@ export class WindowHelper {
       this.overlayHoverInteractive = true;
       this.syncOverlayInteractionPolicy(true);
       this.syncOverlayAuxVisibility();
+      // The page keeps its own copy of the verdict and only reports changes.
+      // Left at "margin" from before the hide, it would report nothing for a
+      // pointer still over a margin, and the margin would swallow clicks until
+      // the pointer happened to cross the panel. Reset it with ours.
+      try {
+        this.overlayWindow?.webContents.send('overlay-hover-reset');
+      } catch {
+        // Renderer gone or reloading: a fresh page starts at "interactive".
+      }
     });
     this.overlayWindow.on('hide', () => {
       this.syncOverlayAuxVisibility();
@@ -2199,11 +2269,22 @@ export class WindowHelper {
     if (want) this.positionOverlayAuxWindows();
     const apply = (win: BrowserWindow | null, show: boolean) => {
       if (!win || win.isDestroyed()) return;
-      if (show && !win.isVisible()) win.showInactive();
-      else if (!show && win.isVisible()) win.hide();
+      if (show) {
+        if (!win.isVisible()) win.showInactive();
+        return;
+      }
+      if (win.isVisible()) win.hide();
+      // Stop is clicked with the cursor on it, then the pill is hidden from
+      // under the cursor: without this the next meeting opens with Stop still
+      // drawn hovered (red). Unconditional — a welded pill may already have
+      // been ordered out by its parent. See clearStaleHover.
+      clearStaleHover(win);
     };
     apply(this.pillWindow, want);
     apply(this.toggleWindow, want && this.toggleHasContent);
+    // Windows: every show path raises the overlay first, and showInactive()
+    // leaves these two in whatever z-order slot they had while hidden.
+    if (want) this.raiseOverlayAuxWindows();
     // Re-assert exact geometry AFTER the show, not just before it.
     //
     // Measured: macOS constrains a window's frame back onto the screen when it
@@ -2220,6 +2301,14 @@ export class WindowHelper {
     // the parent and fires no parent 'move' event (measured), so this cannot
     // feed back.
     if (want) this.positionOverlayAuxWindows();
+  }
+
+  // Windows only (a no-op elsewhere): put the pill and toggle back in front of
+  // the overlay after anything that raised the overlay. The toggle overlaps the
+  // overlay's corner, so behind it part of the button takes no clicks. The
+  // overlay's dropdowns are owned by it and follow it; these two are not.
+  private raiseOverlayAuxWindows(): void {
+    raiseAboveOverlay([this.pillWindow, this.toggleWindow]);
   }
 
   // Mirror overlay visibility onto the aux windows (derives `want` from the
@@ -2258,8 +2347,14 @@ export class WindowHelper {
     this.syncOverlayAuxVisibility();
   }
 
-  // Aux windows → overlay renderer: user actions (toggle-width, end-meeting,
-  // toggle-expand).
+  // An aux window asking for the last broadcast, once it is subscribed.
+  public getOverlayUiState(): unknown {
+    return this.lastOverlayUiState;
+  }
+
+  // Aux windows → overlay renderer: user actions (toggle-width, toggle-expand)
+  // and the meeting-ended notice. Stop itself is handled in main — see
+  // routeOverlayUiAction.
   public forwardOverlayUiAction(action: unknown): void {
     const overlay = this.overlayWindow;
     if (overlay && !overlay.isDestroyed()) {
@@ -2395,15 +2490,94 @@ export class WindowHelper {
     }
   }
 
-  public toggleMainWindow(): void {
+  public toggleMainWindow(onCurrentDisplay = false): void {
     if (this.isWindowVisible) {
       this.hideMainWindow();
     } else {
       // Always show without stealing focus — Natively is a ghost overlay.
       // The user is in another app; show the window on top but leave OS focus alone.
       // They can click the window to focus it if they need to type.
+      if (onCurrentDisplay) this.prepareShortcutRestore();
       this.showMainWindow(true);
     }
+  }
+
+  /** Keep the minimum appropriate to the display, including ordinary window drags. */
+  private refreshLauncherMinimum(workArea: Electron.Rectangle): { width: number; height: number } {
+    const minimum = clampSizeToAspectRatio(
+      Math.min(LAUNCHER_MIN_WIDTH, workArea.width),
+      Math.min(LAUNCHER_MIN_HEIGHT, workArea.height),
+    );
+    const win = this.launcherWindow;
+    if (win && !win.isDestroyed()) {
+      const [width, height] = win.getMinimumSize();
+      if (width !== minimum.width || height !== minimum.height) {
+        win.setMinimumSize(minimum.width, minimum.height);
+      }
+    }
+    return minimum;
+  }
+
+  /** Position before show/expand, synchronously on Electron's main process. */
+  public prepareShortcutRestore(): void {
+    const win = this.getMainWindow();
+    if (!win || win.isDestroyed()) return;
+    const bounds = win.getBounds();
+    const display = shortcutRestoreDisplay(screen, BrowserWindow.getFocusedWindow(), bounds);
+    const launcher = this.currentWindowMode === 'launcher';
+    let restoreBounds = bounds;
+    if (launcher) {
+      const minimum = this.refreshLauncherMinimum(display.workArea);
+      // Account for native minimum-size enforcement before computing the center.
+      restoreBounds = {
+        ...bounds,
+        width: Math.max(bounds.width, minimum.width),
+        height: Math.max(bounds.height, minimum.height),
+      };
+    } else {
+      // Use the final dimensions switchToOverlay will apply when showing.
+      restoreBounds = {
+        ...bounds,
+        width: Math.min(bounds.width, Math.floor(display.workArea.width * 0.9)),
+        height: Math.min(
+          bounds.height > WindowHelper.OVERLAY_BIRTH_HEIGHT ? bounds.height : WindowHelper.OVERLAY_MIN_HEIGHT,
+          Math.floor(display.workArea.height * 0.9),
+        ),
+      };
+    }
+    const changingDisplay = screen.getDisplayMatching(bounds).id !== display.id;
+    let target = shortcutRestoreBounds(
+      restoreBounds,
+      display.workArea,
+      changingDisplay,
+      {
+        launcher: launcher && !this.launcherFilled,
+        // Keep the separate pill above the overlay clear of the menu bar too.
+        topInset: launcher ? 0 : Math.max(0, this.pillSize.height + WindowHelper.PILL_GAP - OVERLAY_PANEL_INSET),
+      },
+    );
+    if (launcher && changingDisplay && (this.launcherFilled || this.launcherZoomed)) {
+      // A filled or zoomed launcher fills the new display as well. Its restore
+      // box moves with it, so un-maximizing does not jump back to the old one.
+      target = this.launcherFilled ? { ...display.workArea } : zoomedLauncherBounds(display.workArea);
+      if (this.launcherNormalBounds) {
+        this.launcherNormalBounds = shortcutRestoreBounds(this.launcherNormalBounds, display.workArea, true, { launcher: true });
+      }
+    }
+    win.setBounds(target, false);
+    const actual = win.getBounds();
+    if (launcher) {
+      this.launcherPosition = { x: actual.x, y: actual.y };
+      this.launcherSize = { width: actual.width, height: actual.height };
+    } else {
+      this.overlayBounds = actual;
+      this.positionOverlayAuxWindows();
+      this.repositionOverlayPopovers();
+    }
+  }
+
+  public isOverlayExpanded(): boolean {
+    return (this.lastOverlayUiState as { expanded?: boolean } | null)?.expanded !== false;
   }
 
   public toggleOverlayWindow(): void {
@@ -2543,6 +2717,8 @@ export class WindowHelper {
             // Re-assert z-order on Windows — DWM can silently demote the HWND after hide/show
             this.overlayWindow.setAlwaysOnTop(true, 'screen-saver');
             if (!inactive) this.overlayWindow.focus();
+            // The aux windows were shown and raised before this timer ran.
+            this.raiseOverlayAuxWindows();
           }
         }, 60);
       } else {
@@ -2840,6 +3016,7 @@ export class WindowHelper {
     const overlay = this.overlayWindow;
     if (overlay && !overlay.isDestroyed() && overlay.isVisible()) {
       overlay.setAlwaysOnTop(true, 'screen-saver');
+      this.raiseOverlayAuxWindows();
     }
   }
 

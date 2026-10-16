@@ -3,6 +3,9 @@ import fs from 'fs';
 import path from 'path';
 
 export interface AppSettings {
+    /** The Calendar account name whose full-name mentions in saved notes were carried
+     *  to the first name (calendarNameMigration); set once per name. */
+    calendarFirstNameMigratedFor?: string;
     // Only boot-critical or non-encrypted settings should live here.
     // In the future, other non-secret data like 'language' or 'theme'
     // can be moved here from CredentialsManager to allow early boot access.
@@ -37,6 +40,49 @@ export interface AppSettings {
     // produced only by the What-to-Answer hotkey, exactly as before. The
     // trigger itself lives in AppState.scheduleAutoAnswer().
     autoAnswerEnabled?: boolean;
+    // Meeting detection (2026-09-27): Natively reads which meeting the user is in
+    // (the Companion extension's meeting tabs, later the meeting apps' windows and
+    // microphone use) to link a session to its calendar event exactly and to
+    // offer to start one. Local only. Unset = on.
+    meetingDetectionEnabled?: boolean;
+    // Start automatically (2026-10-15, Settings › Calendar under Detect
+    // meetings): a detected call starts Natively after a 10 s countdown on the
+    // "meeting detected" offer unless Not now is pressed. Unset = off.
+    meetingAutoStartEnabled?: boolean;
+    // Calendar reminder lead time in minutes (2026-10-15, Settings › Calendar):
+    // 1, 2 or 5. Unset = 2, the reminder's time before it was configurable.
+    calendarReminderMinutes?: number;
+    // End meetings automatically when the call ends (2026-10-15,
+    // services/meeting/MeetingEndDetector.ts): the call's app lets go of the
+    // microphone, its browser tab closes, or nothing is said for
+    // meetingInactivityStopMinutes (a notice comes a minute before). Unset = on.
+    meetingAutoStopEnabled?: boolean;
+    // Minutes of silence before the inactivity stop. No UI yet. Unset = 15.
+    meetingInactivityStopMinutes?: number;
+    // The catch-up after back-to-back meetings (2026-10-15,
+    // services/assist/backToBack.ts): decisions and the user's action items
+    // across meetings with short gaps, as one launcher card. Unset = on.
+    assistCatchUpEnabled?: boolean;
+    // The longest gap (minutes) between two meetings of one block. No UI. Unset = 15.
+    assistCatchUpGapMinutes?: number;
+    // Follow the meeting app's mute (2026-10-15, Settings › Audio): while the
+    // user is muted in Zoom / Teams / Meet (read from the app, never changed),
+    // the mic channel carries silence of the same length. Unset = on.
+    followMeetingMute?: boolean;
+    // Dictation (2026-10-15, Settings › Audio; services/dictation): its
+    // shortcut (Keybinds › Dictate to Clipboard) records the mic and puts the
+    // tidied text on the clipboard. The shortcut is registered only while on.
+    // Unset = off.
+    dictationEnabled?: boolean;
+    // Snapshot shared screens (2026-10-15, Settings › Calendar): while someone
+    // else shares a screen in a Zoom / Teams call, a picture every 10 s, kept
+    // when it changed, described by the user's vision model for the notes.
+    // Never while the user presents. Unset = off.
+    screenShareSnapshots?: boolean;
+    // The notes window (`?window=notes`, 2026-10-15): where it was and how big,
+    // and whether it was open when last used, so a meeting starting reopens it
+    // (without taking focus) for someone who keeps it open.
+    notesWindowState?: { x: number; y: number; width: number; height: number; open: boolean };
     // Direct Assist is the opt-in, single-provider answer path. It deliberately
     // bypasses meeting retrieval and the legacy answer-orchestration pipeline.
     // Keep the persisted default OFF during rollout; the operator kill switch
@@ -53,7 +99,6 @@ export interface AppSettings {
     codexCliEnabled?: boolean;
     codexCliPath?: string;
     codexCliModel?: string;
-    codexCliFastModel?: string;
     codexCliTimeoutMs?: number;
     codexCliSandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
     codexCliServiceTier?: 'default' | 'fast' | 'flex';
@@ -118,6 +163,9 @@ export interface AppSettings {
     // coding-only / high-confidence-only gate, never the sensitive floor.
     browserExperimentalFullPageCapture?: boolean; // default false (experimental)
     localWhisperModel?: string;
+    /** The user's dictionary: names and words the transcript should spell
+     *  right (audio/userDictionary.ts). At most 100, cleaned on save. */
+    userDictionary?: string[];
     // Per-channel model overrides for local Whisper. When
     // localWhisperPerChannelEnabled is true, the two LocalWhisperSTT instances
     // pick their own model (mic / system) instead of sharing localWhisperModel.
@@ -126,6 +174,10 @@ export interface AppSettings {
     localWhisperPerChannelEnabled?: boolean;
     localWhisperModelMic?: string;
     localWhisperModelSystem?: string;
+    /** Tell apart people sharing the microphone (a room): diarize the mic
+     *  channel and split its voices at save (meeting/roomSpeakers.ts). Off by
+     *  default; needs a provider with diarization (Deepgram). */
+    roomSpeakersEnabled?: boolean;
     // Phase 6 — TelemetryService toggle. Defaults to true (local-only JSONL).
     // When false, no telemetry is written to disk and no sinks fire.
     telemetryEnabled?: boolean;
@@ -244,6 +296,13 @@ export interface AppSettings {
     seenProfileOnboarding?: boolean;
     seenModesOnboarding?: boolean;
     permsShown?: boolean;
+    // The trialStartedAt of the free trial whose profile data the expiry wipe
+    // already removed, so the wipe runs once per trial however many windows or
+    // launches notice the expiry (ipcHandlers.ts settleExpiredTrial).
+    trialExpiryWipedFor?: string;
+    // The trial campaign (src/lib/trialCampaign.mjs) this install has already been
+    // through. Written only after every reset step persisted, so a failed one retries.
+    trialCampaignReset?: string;
     // Live SessionMemory rollout controls (release 2026-06-07c). Env vars take
     // precedence; these let the rollout be driven from settings without a redeploy.
     enableLiveSessionMemory?: boolean;

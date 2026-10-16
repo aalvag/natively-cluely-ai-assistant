@@ -23,6 +23,25 @@ pub mod speaker;
 #[cfg(target_os = "macos")]
 pub mod stealth_window;
 
+// Undetectable mode: keeps file pickers, message boxes, tooltips and popups
+// (every non-BrowserWindow window of the process) out of screen capture.
+// macOS and Windows implementations live side by side in the module.
+pub mod capture_exclusion;
+
+// Meeting detection: which processes hold a microphone, and the visible windows
+// (owner + title). macOS and Windows implementations side by side.
+pub mod meeting_signals;
+
+// Who speaks in a desktop call: the meeting app's (Zoom, Teams) accessibility
+// tree, flattened for the JS solvers. macOS AX and Windows UI Automation side
+// by side; read on a worker thread.
+pub mod call_tree;
+
+// Apple Calendar for Natively's calendar sources: EventKit's permission and the
+// events of every calendar the Calendar app shows, read on a worker thread.
+// macOS only; every other OS answers "unsupported" / null with the same exports.
+pub mod calendar_events;
+
 #[cfg(target_os = "macos")]
 pub mod keyboard_tap;
 

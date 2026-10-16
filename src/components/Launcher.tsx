@@ -1,11 +1,15 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useT } from '../i18n';
-import { ToggleLeft, ToggleRight, Search, Calendar, ArrowRight, ArrowLeft, MoreHorizontal, Globe, Clock, ChevronRight, Settings, LayoutGrid, RefreshCw, Eye, EyeOff, Ghost, Plus, Mail, Link as LinkIcon, ChevronDown, Trash2, Bell, Download, DownloadCloud, CheckCircle, AlertCircle, User, UserSearch, Sparkles, ArrowUpRight, Loader2 } from 'lucide-react';
+import { ToggleLeft, ToggleRight, Search, Calendar, ArrowRight, ArrowLeft, MoreHorizontal, Globe, Clock, ChevronRight, Settings, LayoutGrid, RefreshCw, Eye, EyeOff, Ghost, Plus, Mail, Link as LinkIcon, ChevronDown, Trash2, Folder, Bell, Download, DownloadCloud, CheckCircle, AlertCircle, User, UserSearch, Sparkles, ArrowUpRight, Loader2 } from 'lucide-react';
 import { generateMeetingPDF } from '../utils/pdfGenerator';
 import icon from "./icon.png";
 import mainui from "../UI_comp/mainui.png";
 import UpcomingCalendarCard from './ui/UpcomingCalendarCard';
+import AssistToday from './assist/AssistToday';
+import type { AssistEvent } from '../types/assist';
 import { useToggleInit } from './settings/useToggleInit';
+import { noteUpcomingEvents, warmCalendarSnapshot } from '../lib/calendarSnapshot.mjs';
+import { plainMeetingTitle } from '../lib/codingAnswer.mjs';
 import MeetingDetails from './MeetingDetails';
 import TopSearchPill from './TopSearchPill';
 import GlobalChatOverlay from './GlobalChatOverlay';
@@ -20,6 +24,13 @@ import { APP_FEATURE_VERSION } from '../utils/appVersion';
 import WindowControls from './WindowControls';
 import { LiquidGlassBadge } from '../ui-components/LiquidGlassBadge';
 import { emitOrchestratorEvent, setUserState as setOrchestratorUserState } from './onboarding/OrchestratedToasterHost';
+import { OrganiseBar, type LauncherView, type MeetingFilter } from './organise/OrganiseBar';
+import { FolderDialog } from './organise/FolderDialog';
+import { FolderPickList } from './organise/MeetingOrganiseMenu';
+import { PeopleList, CompaniesList } from './organise/OrganiseLists';
+import { PersonPage } from './organise/PersonPage';
+import { CompanyPage } from './organise/CompanyPage';
+import type { OrganiseFolder, OrganiseTag } from '../types/electron';
 
 interface Meeting {
     id: string;
@@ -47,7 +58,19 @@ interface Meeting {
     time?: string; // Optional for compatibility
 }
 
+/**
+ * Something outside the Launcher asking it to open its search bar or a meeting
+ * (Settings › About). A new `seq` is a new request, so asking twice works.
+ */
+export type LauncherRequest =
+    | { kind: 'search'; seq: number }
+    | { kind: 'meeting'; id: string; seq: number }
+    // The calendar reminder's "Running late" (main: assist/reminderDraftWindow):
+    // back to the list, with that event's draft open.
+    | { kind: 'reminder-draft'; event: AssistEvent; draftKind: 'running_late' | 'no_show' | 'reschedule'; seq: number };
+
 interface LauncherProps {
+    request?: LauncherRequest | null;
     onStartMeeting: () => void;
     onOpenSettings: (tab?: string) => void;
     onOpenProfile?: () => void;
@@ -83,7 +106,7 @@ const formatTime = (dateStr: string) => {
     return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }).toLowerCase();
 };
 
-const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onOpenProfile, onOpenModes, onPageChange, ollamaPullStatus = 'idle', ollamaPullPercent = 0, ollamaPullMessage = '' }) => {
+const Launcher: React.FC<LauncherProps> = ({ request, onStartMeeting, onOpenSettings, onOpenProfile, onOpenModes, onPageChange, ollamaPullStatus = 'idle', ollamaPullPercent = 0, ollamaPullMessage = '' }) => {
     const t = useT();
     const [meetings, setMeetings] = useState<Meeting[]>([]);
     const [isDetectable, setIsDetectable] = useState(false);
@@ -93,6 +116,9 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
     // panel's z-index below.
     const [meetingChatOpen, setMeetingChatOpen] = useState(false);
     const [upcomingEvents, setUpcomingEvents] = useState<any[]>([]);
+    // The first calendar fetch has answered. Until then the calendar card shows
+    // skeletons, not "No upcoming events", which would flash on every launch.
+    const [eventsLoaded, setEventsLoaded] = useState(false);
     const [isCalendarConnected, setIsCalendarConnected] = useState(false);
     const [isRefreshing, setIsRefreshing] = useState(false);
     const [showNotification, setShowNotification] = useState(false);
@@ -113,15 +139,48 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
     // intentionally double-invokes effects to surface this class of bug.
     const mountedOnceRef = useRef<boolean>(false);
 
+    // Folders, tags, People and Companies (components/organise). The filter is
+    // read through a ref: fetchMeetings is captured once by the meetings-updated
+    // listener, and must still see the folder the user is looking at now.
+    const [view, setView] = useState<LauncherView>('meetings');
+    const [filter, setFilter] = useState<MeetingFilter>(null);
+    const filterRef = useRef<MeetingFilter>(null);
+    filterRef.current = filter;
+    const [folders, setFolders] = useState<OrganiseFolder[]>([]);
+    const [tags, setTags] = useState<OrganiseTag[]>([]);
+    const [filteredMeetings, setFilteredMeetings] = useState<Meeting[] | null>(null);
+    const [orgPage, setOrgPage] = useState<{ kind: 'person'; id: string } | { kind: 'company'; domain: string } | null>(null);
+    const [folderDialog, setFolderDialog] = useState<{ open: boolean; folder: OrganiseFolder | null }>({ open: false, folder: null });
+    // The row whose menu shows its folders instead of Export / Delete.
+    const [folderMenuFor, setFolderMenuFor] = useState<string | null>(null);
+    // The folder an Ask was sent from (only its meetings are searched).
+    const [globalScope, setGlobalScope] = useState<{ folderId: string; name: string } | null>(null);
+
+    const fetchOrganise = () => {
+        const api = window.electronAPI?.organise;
+        if (!api) return;
+        api.listFolders().then(setFolders).catch(() => {});
+        api.listTags().then(setTags).catch(() => {});
+        const f = filterRef.current;
+        if (!f) { setFilteredMeetings(null); return; }
+        api.listMeetings(f.kind === 'folder' ? { folderId: f.id } : { tag: f.name })
+            .then((rows) => setFilteredMeetings(rows as Meeting[]))
+            .catch(() => setFilteredMeetings([]));
+    };
+
     const fetchMeetings = () => {
         if (window.electronAPI && window.electronAPI.getRecentMeetings) {
             window.electronAPI.getRecentMeetings().then(setMeetings).catch(err => console.error("Failed to fetch meetings:", err));
         }
+        fetchOrganise();
     };
 
     const fetchEvents = () => {
         if (window.electronAPI && window.electronAPI.getUpcomingEvents) {
-            window.electronAPI.getUpcomingEvents().then(setUpcomingEvents).catch(err => console.error("Failed to fetch events:", err));
+            window.electronAPI.getUpcomingEvents()
+                .then((list) => { setUpcomingEvents(list); noteUpcomingEvents(list); })
+                .catch(err => console.error("Failed to fetch events:", err))
+                .finally(() => setEventsLoaded(true));
         }
     }
 
@@ -189,7 +248,10 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
         // Sync initial undetectable state
         if (window.electronAPI?.getUndetectable) {
             window.electronAPI.getUndetectable().then((undetectable) => {
-                if (mounted) setIsDetectable(!undetectable);
+                if (mounted) {
+                    setIsDetectable(!undetectable);
+                    analytics.setUndetectable(undetectable);
+                }
             });
         }
 
@@ -197,7 +259,10 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
         let removeUndetectableListener: (() => void) | undefined;
         if (window.electronAPI?.onUndetectableChanged) {
             removeUndetectableListener = window.electronAPI.onUndetectableChanged((undetectable) => {
-                setIsDetectable(!undetectable);
+                if (mounted) {
+                    setIsDetectable(!undetectable);
+                    analytics.setUndetectable(undetectable);
+                }
             });
         }
 
@@ -226,8 +291,8 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
             fetchMeetings();
         });
 
-        // Simple polling for events every minute
-        const interval = setInterval(fetchEvents, 60000);
+        // Simple polling for events every minute (stealth-gated: no calendar egress while undetectable)
+        const interval = setInterval(() => { if (isDetectable) fetchEvents(); }, 60000);
 
         // Orchestrator: foreground/background tracking via window blur/focus.
         // On macOS Cmd+H and Cmd+Tab the BrowserWindow fires 'blur'/'focus'
@@ -322,6 +387,24 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []); // Mount-only: stable setup that must run exactly once
 
+    // The card follows the connection wherever it changes: a disconnect in
+    // Settings › Calendar puts "Link your calendar" back, a connect there shows
+    // the linked card. Its meetings go with a disconnect at once.
+    useEffect(() => window.electronAPI?.onCalendarConnectionChanged?.((connected) => {
+        setIsCalendarConnected(connected);
+        if (connected) fetchEvents(); else setUpcomingEvents([]);
+        void warmCalendarSnapshot(window.electronAPI);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }), []);
+
+    // Settings › Calendar opens from calendarSnapshot instead of fetching: fill
+    // it in the background once startup has settled (the minute poll above then
+    // keeps its meetings current).
+    useEffect(() => {
+        const timer = window.setTimeout(() => { void warmCalendarSnapshot(window.electronAPI); }, 2000);
+        return () => window.clearTimeout(timer);
+    }, []);
+
     // Separate effect for keyboard listener — re-registers when isShortcutPressed changes
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
@@ -368,8 +451,9 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
         analytics.trackModeSelected(newState ? 'launcher' : 'undetectable'); // If visible (detectable), mode is normal/launcher. If not detectable, mode is undetectable.
     };
 
-    // Group meetings
-    const groupedMeetings = meetings.reduce((acc, meeting) => {
+    // Group meetings (a folder or tag filter lists all of its meetings, not just the latest 50)
+    const listedMeetings = filter ? (filteredMeetings ?? []) : meetings;
+    const groupedMeetings = listedMeetings.reduce((acc, meeting) => {
         const label = getGroupLabel(meeting.date);
         if (!acc[label]) acc[label] = [];
         acc[label].push(meeting);
@@ -398,6 +482,7 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
 
     useEffect(() => {
         setMenuEntered(false);
+        setFolderMenuFor(null);
     }, [activeMenuId]);
 
     // Global click listener to close menu
@@ -409,8 +494,21 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
 
     // Notify parent if we are on the main launcher list view; also feed the
     // orchestrator's homepage-mounted clock.
+    // A new filter lists its meetings.
     useEffect(() => {
-        const isMain = !selectedMeeting && !isGlobalChatOpen;
+        fetchOrganise();
+        // fetchOrganise reads the filter through its ref.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [filter]);
+
+    // Search and Ask from the top bar look only at the folder being viewed.
+    const viewedFolder = view === 'meetings' && filter?.kind === 'folder' ? folders.find((f) => f.id === filter.id) : undefined;
+    const literalSearchFilters = view === 'meetings' && filter
+        ? (filter.kind === 'folder' ? { folderId: filter.id } : { tag: filter.name })
+        : undefined;
+
+    useEffect(() => {
+        const isMain = !selectedMeeting && !orgPage && !isGlobalChatOpen;
         if (onPageChange) onPageChange(isMain);
         if (isMain) {
             emitOrchestratorEvent({ type: 'launcher:mounted' });
@@ -419,7 +517,7 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
         }
         // Cleanup on unmount: ensure unmount is fired
         return () => emitOrchestratorEvent({ type: 'launcher:unmounted' });
-    }, [selectedMeeting, isGlobalChatOpen, onPageChange]);
+    }, [selectedMeeting, orgPage, isGlobalChatOpen, onPageChange]);
 
     const handleOpenMeeting = async (meeting: Meeting) => {
         setSelectedMomentMs(null);
@@ -456,6 +554,11 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
         setSelectedMeeting(null);
         setSelectedMomentMs(null);
     }, [isGlobalChatOpen]);
+    // A person or company page goes back to the list (a meeting opened from it goes back to it).
+    const handleOrgBack = useCallback(() => {
+        if (isGlobalChatOpen) return;
+        setOrgPage(null);
+    }, [isGlobalChatOpen]);
 
     // Open a search hit BY ID at the moment it was said. The hit may be older than
     // the 50 meetings this list holds, so it is fetched directly rather than looked
@@ -471,6 +574,27 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
             return false;
         }
     };
+
+    // Requests from outside (Settings › About). A meeting is fetched by id, as a
+    // search hit is; one that no longer exists (the demo meeting deleted, say)
+    // leaves the Launcher where it is.
+    const [searchOpenRequest, setSearchOpenRequest] = useState(0);
+    const [reminderDraftRequest, setReminderDraftRequest] = useState<{ event: AssistEvent; kind: 'running_late' | 'no_show' | 'reschedule'; seq: number } | null>(null);
+    const handledRequest = useRef(request?.seq ?? 0);
+    useEffect(() => {
+        if (!request || request.seq === handledRequest.current) return;
+        handledRequest.current = request.seq;
+        if (request.kind === 'search') setSearchOpenRequest(request.seq);
+        else if (request.kind === 'reminder-draft') {
+            setSelectedMeeting(null);
+            setSelectedMomentMs(null);
+            setIsGlobalChatOpen(false);
+            setReminderDraftRequest({ event: request.event, kind: request.draftKind, seq: request.seq });
+        }
+        else void openMeetingAtMoment(request.id);
+        // openMeetingAtMoment only reads setters and the IPC bridge.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [request]);
 
     // Helper to format duration to mm:ss or mmm:ss
     // Helper to format duration to mm:ss or mmm:ss
@@ -633,9 +757,11 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                 {/* Center: Spotlight-style Search Pill */}
                 <TopSearchPill
                     meetings={meetings}
+                    openRequest={searchOpenRequest}
                     onAIQuery={(query) => {
                         analytics.trackCommandExecuted('ai_query_search');
                         emitOrchestratorEvent({ type: 'turn:done', surface: 'chat' });
+                        if (!isGlobalChatOpen) setGlobalScope(viewedFolder ? { folderId: viewedFolder.id, name: viewedFolder.name } : null);
                         setSubmittedGlobalQuery(query);
                         setIsGlobalChatOpen(true);
                     }}
@@ -651,12 +777,13 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                         // runs in an inner IIFE so we never return a floating Promise to the
                         // event-handler prop.
                         const runFallback = () => {
+                            if (!isGlobalChatOpen) setGlobalScope(viewedFolder ? { folderId: viewedFolder.id, name: viewedFolder.name } : null);
                             setSubmittedGlobalQuery(query);
                             setIsGlobalChatOpen(true);
                         };
                         void (async () => {
                             try {
-                                const resp = await window.electronAPI.searchGlobalMeetings?.(query);
+                                const resp = await window.electronAPI.searchGlobalMeetings?.(query, literalSearchFilters);
                                 if (resp?.enabled && Array.isArray(resp.results)) {
                                     // Best hit that is a real meeting (long-term-memory hits
                                     // carry a synthetic id), opened at the matching line.
@@ -959,6 +1086,36 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                 />
                             </motion.div>
                         </motion.div>
+                    ) : orgPage ? (
+                        // A person or company: the same cover/uncover as the notes.
+                        <motion.div
+                            key={orgPage.kind === 'person' ? `person-${orgPage.id}` : `company-${orgPage.domain}`}
+                            data-page={orgPage.kind}
+                            className="absolute inset-0 overflow-hidden z-20"
+                            variants={panelVariants}
+                            initial="hidden"
+                            animate="shown"
+                            exit="gone"
+                        >
+                            <motion.div data-layer="veil" className={`absolute inset-0 ${NOTES_SURFACE}`} variants={veilVariants} />
+                            <motion.div data-layer="content" className="relative h-full w-full" variants={contentVariants}>
+                                {orgPage.kind === 'person' ? (
+                                    <PersonPage
+                                        personId={orgPage.id}
+                                        onBack={handleOrgBack}
+                                        onOpenMeeting={(id) => { void openMeetingAtMoment(id); }}
+                                        onOpenCompany={(domain) => setOrgPage({ kind: 'company', domain })}
+                                    />
+                                ) : (
+                                    <CompanyPage
+                                        domain={orgPage.domain}
+                                        onBack={handleOrgBack}
+                                        onOpenMeeting={(id) => { void openMeetingAtMoment(id); }}
+                                        onOpenPerson={(id) => setOrgPage({ kind: 'person', id })}
+                                    />
+                                )}
+                            </motion.div>
+                        </motion.div>
                     ) : (
                         <motion.div
                             key="launcher"
@@ -1217,9 +1374,12 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                         <UpcomingCalendarCard
                                             className="md:col-span-1"
                                             isConnected={isCalendarConnected}
-                                            onConnect={() => setIsCalendarConnected(true)}
+                                            // Re-fetch: the events loaded at mount were fetched before the
+                                            // connection existed, so the card would stay empty until a Refresh.
+                                            onConnect={(info) => { setIsCalendarConnected(true); if (info.fresh) setEventsLoaded(false); fetchEvents(); void warmCalendarSnapshot(window.electronAPI); }}
                                             meetings={visibleMeetings}
                                             totalCount={upcomingMeetings.length}
+                                            loading={!eventsLoaded}
                                         />
                                     </div>
                                 </div>
@@ -1230,8 +1390,33 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                 <section className="px-8 py-8 min-h-full">
                                     <div className="max-w-4xl mx-auto space-y-8">
 
+                                        {/* Coming up today (Brief me, reminder drafts), You owe, and
+                                            the catch-up after back-to-back meetings (assist/AssistToday). */}
+                                        <AssistToday
+                                            events={upcomingEvents}
+                                            isLight={isLight}
+                                            isMeetingActive={isMeetingActive}
+                                            onOpenMeeting={(id) => { void handleOpenMeeting({ id } as Meeting); }}
+                                            draftRequest={reminderDraftRequest}
+                                        />
+
+                                        {/* Meetings / People / Companies, and the folder and tag filters. */}
+                                        <OrganiseBar
+                                            isLight={isLight}
+                                            view={view}
+                                            onView={setView}
+                                            folders={folders}
+                                            tags={tags}
+                                            filter={filter}
+                                            onFilter={setFilter}
+                                            onEditFolder={(folder) => setFolderDialog({ open: true, folder })}
+                                        />
+
+                                        {view === 'people' && <PeopleList onOpen={(id) => setOrgPage({ kind: 'person', id })} />}
+                                        {view === 'companies' && <CompaniesList onOpen={(domain) => setOrgPage({ kind: 'company', domain })} />}
+
                                         {/* Iterating Date Groups */}
-                                        {sortedGroups.map((label) => (
+                                        {view === 'meetings' && sortedGroups.map((label) => (
                                             <section key={label}>
                                                 <h3 className="text-[13px] font-medium text-text-secondary mb-3 pl-1">{label}</h3>
                                                 <div className="space-y-1">
@@ -1243,7 +1428,7 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                                             onClick={() => handleOpenMeeting(m)}
                                                         >
                                                             <div className={`font-medium text-[14px] max-w-[60%] truncate ${m.title === 'Processing...' ? 'text-blue-400 italic animate-pulse' : 'text-text-primary'}`}>
-                                                                {m.title}
+                                                                {plainMeetingTitle(m.title)}
                                                             </div>
 
                                                             {/* Time & Duration Section */}
@@ -1289,14 +1474,26 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                                                         animate={{ opacity: 1, scale: 1, y: 0 }}
                                                                         exit={{ opacity: 0, scale: 0.95, y: 5 }}
                                                                         transition={{ duration: 0.1 }}
-                                                                        className={`absolute right-0 top-full mt-1 w-[90px] backdrop-blur-xl rounded-lg shadow-2xl z-50 overflow-hidden border ${isLight ? 'bg-bg-elevated border-border-muted shadow-[0_8px_24px_rgba(0,0,0,0.12)]' : 'bg-[#1E1E1E]/80 border-white/10'}`}
+                                                                        className={`absolute right-0 top-full mt-1 ${folderMenuFor === m.id ? 'w-[220px]' : 'w-[140px]'} backdrop-blur-xl rounded-lg shadow-2xl z-50 overflow-hidden border ${isLight ? 'bg-bg-elevated border-border-muted shadow-[0_8px_24px_rgba(0,0,0,0.12)]' : 'bg-[#1E1E1E]/80 border-white/10'}`}
                                                                         onClick={(e) => e.stopPropagation()}
                                                                         onMouseEnter={() => setMenuEntered(true)}
                                                                         onMouseLeave={() => {
                                                                             if (menuEntered) setActiveMenuId(null);
                                                                         }}
                                                                     >
+                                                                        {folderMenuFor === m.id ? (
+                                                                            <div className="p-1">
+                                                                                <FolderPickList meetingId={m.id} isLight={isLight} autoFocus onChanged={() => fetchOrganise()} />
+                                                                            </div>
+                                                                        ) : (
                                                                         <div className="p-1 flex flex-col gap-0.5">
+                                                                            <button
+                                                                                className={`w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-text-primary rounded-lg transition-colors text-left ${isLight ? 'hover:bg-bg-item-surface' : 'hover:bg-white/10'}`}
+                                                                                onClick={() => setFolderMenuFor(m.id)}
+                                                                            >
+                                                                                <Folder size={13} />
+                                                                                {t('Move to folder')}
+                                                                            </button>
                                                                             <button
                                                                                 className={`w-full flex items-center gap-2 px-3 py-1.5 text-[12px] text-text-primary rounded-lg transition-colors text-left ${isLight ? 'hover:bg-bg-item-surface' : 'hover:bg-white/10'}`}
                                                                                 onClick={async () => {
@@ -1332,6 +1529,7 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                                                                         if (success) {
                                                                                             // Optimistic update or refetch
                                                                                             setMeetings(prev => prev.filter(meeting => meeting.id !== m.id));
+                                                                                            fetchOrganise();
                                                                                         }
                                                                                     }
                                                                                     setActiveMenuId(null);
@@ -1341,6 +1539,7 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                                                                 {t('Delete')}
                                                                             </button>
                                                                         </div>
+                                                                        )}
                                                                     </motion.div>
                                                                 )}
                                                             </AnimatePresence>
@@ -1350,8 +1549,15 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                             </section>
                                         ))}
 
-                                        {meetings.length === 0 && (
+                                        {view === 'meetings' && !filter && meetings.length === 0 && (
                                             <div className="p-4 text-text-tertiary text-sm">{t('No recent meetings.')}</div>
+                                        )}
+                                        {view === 'meetings' && filter && filteredMeetings !== null && filteredMeetings.length === 0 && (
+                                            <div className="p-4 text-text-tertiary text-sm">
+                                                {filter.kind === 'folder'
+                                                    ? t('No meetings in this folder yet. Move one here from its menu, or add a rule in Folder settings.')
+                                                    : t('No meetings with this tag.')}
+                                            </div>
                                         )}
 
                                     </div>
@@ -1369,10 +1575,19 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                 {showNotification && (
                     <motion.div
                         key="refresh-toast"
-                        initial={{ x: 300, opacity: 0, scale: 0.9 }}
-                        animate={{ x: 0, opacity: 1, scale: 1 }}
-                        exit={{ x: 300, opacity: 0, scale: 0.95 }}
-                        transition={{ type: "spring", stiffness: 350, damping: 30, mass: 1 }}
+                        // The corner notices' slide (genieMotion.mjs SLIDE, where the
+                        // numbers are explained): in from past the right edge, seen
+                        // travelling; out as a swipe that is fastest at the edge.
+                        // The travel is the toast's own width plus its 40px inset, so
+                        // a long translation still starts and ends past the edge.
+                        // Reduced motion: the plain fade, in place.
+                        initial={prefersReducedMotion ? { opacity: 0 } : { x: 'calc(100% + 40px)', opacity: 0, filter: 'blur(2px)' }}
+                        animate={prefersReducedMotion
+                            ? { opacity: 1, transition: { duration: 0.15, ease: 'linear' } }
+                            : { x: 'calc(0% + 0px)', opacity: 1, filter: 'blur(0px)', transition: { x: { duration: 0.5, ease: [0.33, 1, 0.68, 1] }, opacity: { duration: 0.25, ease: [0.33, 1, 0.68, 1] }, filter: { duration: 0.35, ease: [0.33, 1, 0.68, 1] } } }}
+                        exit={prefersReducedMotion
+                            ? { opacity: 0, transition: { duration: 0.15, ease: 'linear' } }
+                            : { x: 'calc(100% + 40px)', opacity: 0, filter: 'blur(2px)', transition: { x: { duration: 0.4, ease: [0.4, 0.2, 1, 0.8] }, opacity: { duration: 0.4, ease: [0.7, 0, 1, 1] }, filter: { duration: 0.4, ease: [0.7, 0, 1, 1] } } }}
                         className={`fixed bottom-10 right-10 z-[2000] flex items-center gap-4 pl-4 pr-6 py-3.5 rounded-[18px] backdrop-blur-xl saturate-[180%] ring-1 ring-black/10 ${isLight ? 'bg-bg-elevated/90 border border-border-muted shadow-[0_8px_32px_rgba(0,0,0,0.15),inset_0_1px_0_rgba(255,255,255,0.9)]' : 'bg-[#2A2A2E]/40 border border-white/10 shadow-[0_40px_80px_-20px_rgba(0,0,0,0.6),inset_0_1px_0_rgba(255,255,255,0.3),inset_0_-1px_0_rgba(255,255,255,0.05)]'}`}
                     >
                         {/* Liquid Icon Orb */}
@@ -1401,6 +1616,23 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                     setSubmittedGlobalQuery('');
                 }}
                 initialQuery={submittedGlobalQuery}
+                scope={globalScope}
+            />
+
+            {/* A folder's name and rules (components/organise/FolderDialog). */}
+            <FolderDialog
+                open={folderDialog.open}
+                folder={folderDialog.folder}
+                onOpenChange={(open) => setFolderDialog((d) => ({ ...d, open }))}
+                onChanged={(folder) => {
+                    if (folder) {
+                        setFolderDialog((d) => ({ ...d, folder }));
+                        if (!folderDialog.folder) setFilter({ kind: 'folder', id: folder.id });
+                    } else if (filter?.kind === 'folder' && filter.id === folderDialog.folder?.id) {
+                        setFilter(null);
+                    }
+                    fetchOrganise();
+                }}
             />
         </div >
     );

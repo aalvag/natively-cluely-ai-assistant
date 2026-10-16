@@ -83,6 +83,8 @@ export class IntelligenceManager extends EventEmitter {
             'refined_answer', 'refined_answer_token',
             'recap', 'recap_token', 'clarify', 'clarify_token',
             'follow_up_questions_update', 'follow_up_questions_token',
+            // The live helpers: What did I miss?, Define, Sound smart.
+            'live_helper', 'live_helper_token',
             'manual_answer_started', 'manual_answer_result',
             'mode_changed', 'error',
             // Sprint 7: dedicated channel for negotiation coaching payloads.
@@ -126,6 +128,15 @@ export class IntelligenceManager extends EventEmitter {
         this.session.setMeetingMetadata(metadata);
     }
 
+    /**
+     * The running session's metadata (title, calendarEvent, callKey…), or null.
+     * Read by the automatic stop (main: meetingAutoStop) for the calendar end,
+     * the call's tab and the speakers' names.
+     */
+    liveMeetingMetadata(): any {
+        return this.session.getMeetingMetadata();
+    }
+
     addTranscript(segment: import('./SessionTracker').TranscriptSegment, skipRefinementCheck: boolean = false): void {
         if (skipRefinementCheck) {
             // Direct add without refinement detection
@@ -134,11 +145,12 @@ export class IntelligenceManager extends EventEmitter {
             // Let the engine handle transcript + refinement detection
             this.engine.handleTranscript(segment, false);
         }
+        if (segment?.final) this.persistence.noteLiveChange(true);
     }
 
     addAssistantMessage(
         text: string,
-        writeDecision?: { policy?: 'store_conversational_only' | 'store_non_authoritative' | 'do_not_store'; reason?: string; blockedFromSessionTracker?: boolean },
+        writeDecision?: { policy?: 'store_conversational_only' | 'store_non_authoritative' | 'do_not_store'; reason?: string; blockedFromSessionTracker?: boolean; answersSpokenQuestion?: boolean },
         surface?: ConversationSurface,
         identity?: TurnIdentity,
     ): boolean {
@@ -153,6 +165,21 @@ export class IntelligenceManager extends EventEmitter {
         return this.session.getLastAssistantMessage(surface);
     }
 
+    /** The system design currently on the table (shared across surfaces), or null. */
+    getActiveDesign() {
+        return this.session.getActiveDesign();
+    }
+
+    /** A fresh design turn is starting; remember what it asked (a hint only). */
+    noteDesignQuestion(question: string | null | undefined): void {
+        this.session.noteDesignQuestion(question);
+    }
+
+    /** Record a renderer-validated Mermaid repair wherever the broken block was stored. */
+    applyDiagramRepair(originalSource: string, repairedSource: string): boolean {
+        return this.session.applyDiagramRepair(originalSource, repairedSource);
+    }
+
     getContextEpoch(): number {
         return this.session.getContextEpoch();
     }
@@ -161,20 +188,43 @@ export class IntelligenceManager extends EventEmitter {
         return this.session.getFormattedContext(lastSeconds);
     }
 
+    /** What people said in the last `lastSeconds`, from the durable transcript (see SessionTracker). */
+    getFormattedSpeech(lastSeconds: number = 600): string {
+        return this.session.getFormattedSpeech(lastSeconds);
+    }
+
     getLastInterviewerTurn(): string | null {
         return this.session.getLastInterviewerTurn();
     }
 
-    /** Current meeting's full finalized transcript (for in-meeting search, Phase 10). */
-    getCurrentMeetingTranscript(): Array<{ speaker: string; text: string; timestamp: number; origin?: string }> {
+    /** Date.now() of the last mid-meeting reset, else 0 (SessionTracker.getAssistantViewStartedAt). */
+    getAssistantViewStartedAt(): number {
+        return this.session.getAssistantViewStartedAt();
+    }
+
+    /** The rolling recap of the meeting so far (SessionTracker.getMeetingRecaps). */
+    getMeetingRecaps(): ReadonlyArray<{ fromTs: number; toTs: number; lines: number; text: string }> {
+        return this.session.getMeetingRecaps();
+    }
+
+    /** Current meeting's finalized transcript as the assistant reads it (retrieval). */
+    // `tailLines`: only the newest that many (a caller that reads the last few seconds).
+    getCurrentMeetingTranscript(tailLines?: number): Array<{ speaker: string; text: string; timestamp: number; origin?: string }> {
         // `origin` rides along so the live-transcript evidence can tell a line
         // the user SAID from one they TYPED into the overlay (typed chat is
         // echoed into the transcript as speaker 'user', origin 'manual_chat').
-        return this.session.getFullTranscript().map(s => ({ speaker: s.speaker, text: s.text, timestamp: s.timestamp, ...(s.origin ? { origin: s.origin } : {}) }));
+        const lines = this.session.getRetrievalTranscript();
+        return (tailLines !== undefined && lines.length > tailLines ? lines.slice(-tailLines) : lines).map(s => ({ speaker: s.speaker, text: s.text, timestamp: s.timestamp, ...(s.origin ? { origin: s.origin } : {}) }));
     }
 
-    logUsage(type: string, question: string, answer: string): void {
-        this.session.logUsage(type, question, answer);
+    /** The running meeting's whole transcript (kept across the reset shortcut), for in-meeting search. */
+    getCurrentMeetingFullTranscript(): Array<{ speaker: string; text: string; timestamp: number }> {
+        return this.session.getPersistableTranscript().map(s => ({ speaker: s.speaker, text: s.text, timestamp: s.timestamp }));
+    }
+
+    /** `imagePaths`: the screenshots the answer used; the Usage tab shows previews of them. */
+    logUsage(type: string, question: string, answer: string, imagePaths?: readonly string[]): void {
+        this.session.logUsage(type, question, answer, imagePaths);
     }
 
     /**
@@ -200,6 +250,18 @@ export class IntelligenceManager extends EventEmitter {
 
     handleTranscript(segment: import('./SessionTracker').TranscriptSegment): void {
         this.engine.handleTranscript(segment);
+        // The live copy on disk follows finished lines (LiveMeetingJournal: a
+        // timer, never a write on this path).
+        if (segment?.final) this.persistence.noteLiveChange(true);
+    }
+
+    /** A line recovered after a transcription outage, at its original time (SessionTracker.insertRecoveredTranscript). */
+    insertRecoveredTranscript(segment: import('./SessionTracker').TranscriptSegment): boolean {
+        const inserted = this.session.insertRecoveredTranscript(segment);
+        // Recovered words reach the live journal like any final line, or a crash
+        // in a quiet stretch afterwards would lose them a second time.
+        if (inserted) this.persistence.noteLiveChange(true);
+        return inserted;
     }
 
     async handleSuggestionTrigger(trigger: import('./SessionTracker').SuggestionTrigger): Promise<void> {
@@ -228,6 +290,14 @@ export class IntelligenceManager extends EventEmitter {
     noteAutoAnswerCandidate(questionId: string, candidateGeneration: number): void {
         this.engine.noteAutoAnswerCandidate(questionId, candidateGeneration);
     }
+    /**
+     * How many answers the session log holds. A count only: the funnel reports
+     * how many answers a meeting produced, never what they were.
+     */
+    getAnswerCount(): number {
+        try { return this.session.getFullUsage().length; } catch { return 0; }
+    }
+
     getSpeculativeSnapshot(): { questionId: string | null; text: string | null } {
         return this.engine.getSpeculativeSnapshot();
     }
@@ -294,6 +364,11 @@ export class IntelligenceManager extends EventEmitter {
         return this.engine.runFollowUpQuestions();
     }
 
+    /** What did I miss?, Define, Sound smart (llm/liveHelpers.ts). */
+    async runLiveHelper(action: import('./llm/liveHelpers').LiveHelperAction, opts?: { sinceMs?: number }): Promise<string | null> {
+        return this.engine.runLiveHelper(action, opts);
+    }
+
     async runManualAnswer(question: string): Promise<string | null> {
         return this.engine.runManualAnswer(question);
     }
@@ -349,6 +424,29 @@ export class IntelligenceManager extends EventEmitter {
 
     async recoverUnprocessedMeetings(): Promise<void> {
         return this.persistence.recoverUnprocessedMeetings();
+    }
+
+    /** The notes window's text for the running (or next) meeting; Stop passes it to the notes. */
+    setLiveUserNotes(text: string): void {
+        this.persistence.setLiveUserNotes(text);
+    }
+
+    /** A meeting started: its transcript is kept on disk as it grows (LiveMeetingJournal). */
+    beginLiveMeeting(startedAt?: number): string {
+        return this.persistence.beginLiveMeeting(startedAt);
+    }
+
+    /**
+     * Write the running meeting now, synchronously, for the next launch to
+     * recover (quit, the OS ending the session). No notes are written here.
+     */
+    flushLiveMeeting(endedBy: 'quit' | 'os_session_end'): boolean {
+        return this.persistence.flushLiveMeeting(endedBy);
+    }
+
+    /** Called with the meeting id each time a meeting's notes are saved or regenerated. */
+    setMeetingNotesSavedListener(listener: ((meetingId: string) => void) | null): void {
+        this.persistence.setNotesSavedListener(listener);
     }
 
     /** Regenerate V3 notes for a saved meeting (optionally with a different mode/tone). */
@@ -430,7 +528,7 @@ export class IntelligenceManager extends EventEmitter {
     }
 
     reset(): void {
-        this.session.reset();
+        this.session.reset({ keepMeetingRecord: this.persistence.liveMeetingId !== null });
         this.engine.reset();
         this.engine.clearWtaDiversityHistory();
         // V3 conversation state (referents, active topic, previous source ids)

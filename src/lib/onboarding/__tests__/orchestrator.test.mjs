@@ -18,7 +18,7 @@ const DEFAULT_USER_STATE = {
   extensionConnected: false,
   extensionSupported: true,
   permsShown: false,
-  macTCCBlocked: false,
+  permissionsNeedAttention: false,
   seenProfileOnboarding: false,
   seenModesOnboarding: false,
   activeModeSet: false,
@@ -65,9 +65,9 @@ test('queue sequencing: after permissions done + no TCC re-block, browser_extens
   const ctx = makeCtx({
     completed: { permissions: 1 },
     homepageMountedFor: 6_000,
-    // macTCCBlocked=false so permissions won't re-fire
+    // permissionsNeedAttention=false so permissions won't re-fire
   });
-  // permissions has onceEver:false + reEligibility only on macTCCBlocked,
+  // permissions has onceEver:false + reEligibility only on permissionsNeedAttention,
   // so it CAN re-fire in theory but we set userState such that it doesn't.
   assert.equal(shouldShowToaster(stageById['browser_extension'], ctx), true);
   assert.equal(shouldShowToaster(stageById['profile_intelligence'], ctx), false);
@@ -98,9 +98,9 @@ test('full happy-path sequence progresses through prereqs', () => {
   assert.equal(shouldShowToaster(stageById['modes_manager'], ctx), true);
   completedSet('modes_manager');
 
-  // Stage 5: trial_promo
-  ctx = makeCtx({ completed, skipped: skippedSet, homepageMountedFor: 7_000 });
-  assert.equal(shouldShowToaster(stageById['trial_promo'], ctx), true);
+  // There is no trial card after these: the trial starts by itself with a
+  // meeting (src/lib/trial/autoTrial.mjs).
+  assert.equal(stageById['trial_promo'], undefined);
 });
 
 test('premium user skips trial/ads/support but still gets profile/modes/perms/extension', () => {
@@ -138,11 +138,13 @@ test('linux user: browser_extension skipped, profile_intelligence downstream sta
   assert.equal(shouldShowToaster(stageById['profile_intelligence'], ctxProfile), true);
 });
 
-test('skipped prerequisite: trial_promo fires even if browser_extension was skipped', () => {
+test('skipped prerequisite: natively_api_new fires even if browser_extension was skipped', () => {
   const completed = { permissions: 1, profile_intelligence: 3, modes_manager: 4 };
   const skippedSet = new Set(['browser_extension']);
-  const ctx = makeCtx({ completed, skipped: skippedSet, homepageMountedFor: 7_000 });
-  assert.equal(shouldShowToaster(stageById['trial_promo'], ctx), true);
+  // Someone whose trial is used and who still has no AI of their own.
+  const userState = { ...DEFAULT_USER_STATE, trialClaimed: true, adsAvailable: true };
+  const ctx = makeCtx({ completed, skipped: skippedSet, userState, homepageMountedFor: 7_000 });
+  assert.equal(shouldShowToaster(stageById['natively_api_new'], ctx), true);
 });
 
 test('homepageMountedFor only matters when homepageCurrentlyMounted', () => {

@@ -5,13 +5,17 @@
 
 import axios from 'axios';
 import { DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_PRO_MODEL, isDeepseekModelId } from '../llm/deepseekModels';
+import { isOpenAiModelId } from '../llm/openaiModels';
+import { AGENTROUTER_MODELS_URL, agentRouterCatalogue, agentRouterHttpHeaders } from '../llm/agentRouter';
+import { getVisionCapabilityStore } from '../llm/visionCapabilityStore';
+import { parseOpenRouterVision } from '../llm/providerVisionData';
 
 export interface ProviderModel {
     id: string;
     label: string;
 }
 
-type Provider = 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion';
+type Provider = 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'agentrouter';
 
 /**
  * Fetch available models from a provider's API.
@@ -38,6 +42,8 @@ export async function fetchProviderModels(
             return fetchOpenRouterModels(apiKey);
         case 'fluxion':
             return fetchFluxionModels(apiKey);
+        case 'agentrouter':
+            return fetchAgentRouterModels(apiKey);
         default:
             throw new Error(`Unknown provider: ${provider}`);
     }
@@ -68,6 +74,10 @@ async function fetchOpenRouterModels(apiKey: string): Promise<ProviderModel[]> {
     const response = await axios.get('https://openrouter.ai/api/v1/models', {
         headers: { Authorization: `Bearer ${apiKey}` }, timeout: 15000,
     });
+    // The same response says which models read images (2026-10-01): Refresh in
+    // Settings updates the saved answers too.
+    const vision = parseOpenRouterVision(response.data);
+    if (vision.size > 0) getVisionCapabilityStore().replaceProviderAnswers('openrouter', '', vision);
     return (response.data?.data || [])
         .filter((m: any) => m?.id && !String(m.id).endsWith(':batch'))
         // `openrouter/` is Natively's own routing prefix and is NOT optional:
@@ -120,6 +130,31 @@ async function fetchFluxionModels(apiKey: string): Promise<ProviderModel[]> {
         .filter((m: any) => m?.id && !FLUXION_NON_CHAT_MODEL_IDS.has(String(m.id)))
         .map((m: any) => ({ id: `fluxion/${m.id}`, label: String(m.id) }))
         .sort((a: ProviderModel, b: ProviderModel) => a.label.localeCompare(b.label));
+}
+
+/**
+ * AgentRouter's catalogue: GET /v1/models, key-scoped (401 `无效的令牌` on a
+ * bad key), carrying `supported_endpoint_types` per model. Returned 4 ids on
+ * 2026-09-30 — claude-opus-4-8, claude-opus-5, deepseek-v4-flash, gpt-6-astra —
+ * while the docs still list gpt-5.6-sol and glm-5.3, which would 503 "no
+ * available channel". So this list, not the docs, is the source.
+ *
+ * Needs the client-identity header like every AgentRouter route (see
+ * AGENTROUTER_CLIENT_HEADERS); without it this is a 401
+ * `unauthorized_client_error` whatever the key.
+ *
+ * The `agentrouter/` prefix is load-bearing for Fluxion's reason: these are
+ * the vendors' own ids, so unprefixed they would be classified — and billed —
+ * as the user's own Anthropic/OpenAI/DeepSeek models.
+ *
+ * The ORDER is load-bearing (unrationed default first) — see
+ * agentRouterCatalogue for why.
+ */
+async function fetchAgentRouterModels(apiKey: string): Promise<ProviderModel[]> {
+    const response = await axios.get(AGENTROUTER_MODELS_URL, {
+        headers: agentRouterHttpHeaders(apiKey), timeout: 15000,
+    });
+    return agentRouterCatalogue((response.data?.data || []).map((m: any) => m?.id));
 }
 
 /**
@@ -206,24 +241,31 @@ async function fetchNvidiaNimModels(apiKey: string): Promise<ProviderModel[]> {
 
 // ─── OpenAI ──────────────────────────────────────────────────────────────────
 
-async function fetchOpenAIModels(apiKey: string): Promise<ProviderModel[]> {
-    const response = await axios.get('https://api.openai.com/v1/models', {
-        headers: { Authorization: `Bearer ${apiKey}` },
-        timeout: 15000,
-    });
-
-    const models: any[] = response.data?.data || [];
-
-    // Only include: gpt-4o series, gpt-5.x+, o1, o3, o4 series
-    const filtered = models.filter((m: any) => {
-        const id = (m.id || '').toLowerCase();
-        // Include gpt-4o variants
-        if (id.includes('gpt-4o')) return true;
-        // Include gpt-5 and above
-        if (/gpt-[5-9]/.test(id)) return true;
-        // Include o1/o3/o4 reasoning models (but not audio/realtime variants)
-        if (/^o[134]/.test(id) && !id.includes('audio') && !id.includes('realtime')) return true;
-        return false;
+export function filterOpenAIModels(models: any[]): ProviderModel[] {
+    // /v1/models lists everything the key can reach, and most of it cannot
+    // answer a chat completion: image, speech, transcription, search and
+    // moderation models, plus the Responses-only family (`*-pro`, `*-codex`,
+    // `*-deep-research`), which 400 on /chat/completions. Each one listed here
+    // would sit in the picker and fail the turn it is picked for.
+    const excludePatterns = [
+        'embedding', 'whisper', 'tts', 'dall-e', 'realtime', 'audio', 'transcribe',
+        'image', 'search', 'deep-research', 'codex', 'computer-use',
+        'babbage', 'davinci', 'moderation', 'canary', 'instruct',
+    ];
+    const ids = new Set((models || []).map((m: any) => (m?.id || '').toLowerCase()));
+    const filtered = (models || []).filter((m: any) => {
+        const id = (m?.id || '').toLowerCase();
+        if (!isOpenAiModelId(id)) return false;
+        if (excludePatterns.some(p => id.includes(p))) return false;
+        if (/-pro(?:-|$)/.test(id)) return false;
+        // Floor: gpt-4o and newer. gpt-3.5 and the original gpt-4 / gpt-4-turbo
+        // are still listed but superseded by everything above them.
+        if (/^gpt-(?:3|4(?:-|$))/.test(id)) return false;
+        // `gpt-4o-2024-11-20` is a pinned copy of `gpt-4o`; when the alias is in
+        // the list the snapshot only doubles the row.
+        const snapshot = id.match(/^(.*)-\d{4}-\d{2}-\d{2}$/);
+        if (snapshot && ids.has(snapshot[1])) return false;
+        return true;
     });
 
     return filtered
@@ -231,7 +273,33 @@ async function fetchOpenAIModels(apiKey: string): Promise<ProviderModel[]> {
         .sort((a, b) => a.label.localeCompare(b.label));
 }
 
+async function fetchOpenAIModels(apiKey: string): Promise<ProviderModel[]> {
+    const response = await axios.get('https://api.openai.com/v1/models', {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        timeout: 15000,
+    });
+
+    return filterOpenAIModels(response.data?.data || []);
+}
+
 // ─── Groq ────────────────────────────────────────────────────────────────────
+
+export function filterGroqModels(models: any[]): ProviderModel[] {
+    const excludePatterns = [
+        'whisper', 'distil', 'guard', 'tool-use',
+        'vision-preview', 'tts', 'playai', 'speech', 'embedding',
+    ];
+
+    const filtered = (models || []).filter((m: any) => {
+        const id = (m?.id || '').toLowerCase();
+        if (!id) return false;
+        return !excludePatterns.some(p => id.includes(p));
+    });
+
+    return filtered
+        .map((m: any) => ({ id: m.id, label: m.id }))
+        .sort((a, b) => a.label.localeCompare(b.label));
+}
 
 async function fetchGroqModels(apiKey: string): Promise<ProviderModel[]> {
     const response = await axios.get('https://api.groq.com/openai/v1/models', {
@@ -239,22 +307,7 @@ async function fetchGroqModels(apiKey: string): Promise<ProviderModel[]> {
         timeout: 15000,
     });
 
-    const models: any[] = response.data?.data || [];
-
-    // Only include text/chat models — exclude everything non-chat
-    const excludePatterns = [
-        'whisper', 'distil', 'guard', 'tool-use',
-        'vision-preview', 'tts', 'playai', 'speech',
-    ];
-
-    const filtered = models.filter((m: any) => {
-        const id = (m.id || '').toLowerCase();
-        return !excludePatterns.some(p => id.includes(p));
-    });
-
-    return filtered
-        .map((m: any) => ({ id: m.id, label: m.id }))
-        .sort((a, b) => a.label.localeCompare(b.label));
+    return filterGroqModels(response.data?.data || []);
 }
 
 // ─── Anthropic ───────────────────────────────────────────────────────────────
@@ -446,33 +499,24 @@ async function fetchDeepSeekModels(apiKey: string): Promise<ProviderModel[]> {
 
 // ─── Gemini ──────────────────────────────────────────────────────────────────
 
-async function fetchGeminiModels(apiKey: string): Promise<ProviderModel[]> {
-    const response = await axios.get(
-        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`,
-        {
-            timeout: 15000,
-        }
-    );
+export function filterGeminiModels(models: any[]): ProviderModel[] {
+    const excludePatterns = ['nano', 'custom', 'computer-use', 'banana', 'tts', 'embedding', 'aqa', 'vision', 'image'];
 
-    const models: any[] = response.data?.models || [];
-
-    // Only include Gemini 2.5+ models (gemini-2.5-*, gemini-3-*, etc.)
-    // Must support generateContent
-    const excludePatterns = ['nano', 'custom', 'computer-use', 'banana', 'tts', 'embedding', 'aqa', 'vision'];
-
-    const filtered = models.filter((m: any) => {
-        const name = (m.name || '').toLowerCase();
-        const displayName = (m.displayName || '').toLowerCase();
+    const filtered = (models || []).filter((m: any) => {
+        const name = (m?.name || '').toLowerCase();
+        const displayName = (m?.displayName || '').toLowerCase();
         const combined = name + ' ' + displayName;
 
         // Must support generateContent
-        const supportsChat = m.supportedGenerationMethods?.includes('generateContent');
+        const supportsChat = m?.supportedGenerationMethods?.includes('generateContent');
         if (!supportsChat) return false;
 
         // Must NOT match any exclude patterns
         if (excludePatterns.some(p => combined.includes(p))) return false;
 
-        // Match gemini-2.5, gemini-3, gemini-4, etc. (version 2.5 and above)
+        // Gemini 2.5 and above (gemini-2.5-*, gemini-3-*, ...). 1.5 is retired and
+        // 2.0 is the experimental and image-generation generation; both were
+        // left out on purpose before this list was fetched automatically.
         return /gemini-([3-9]|2\.5)/.test(combined);
     });
 
@@ -482,4 +526,15 @@ async function fetchGeminiModels(apiKey: string): Promise<ProviderModel[]> {
             return { id, label: m.displayName || id };
         })
         .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+async function fetchGeminiModels(apiKey: string): Promise<ProviderModel[]> {
+    const response = await axios.get(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`,
+        {
+            timeout: 15000,
+        }
+    );
+
+    return filterGeminiModels(response.data?.models || []);
 }

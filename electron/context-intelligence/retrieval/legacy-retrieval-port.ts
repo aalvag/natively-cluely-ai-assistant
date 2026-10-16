@@ -33,7 +33,20 @@ export interface LegacyRetrieveFn {
      *  retrieval query. A port whose POLICY (intent boosts, inventory admission)
      *  depends on what was asked must read this, never `query` (2026-09-20). */
     intentQuery?: string;
-  }): Promise<LegacyChunk[]>;
+  }): Promise<LegacyChunk[] | LegacyRetrieveResult>;
+}
+
+/**
+ * A retriever may return its chunks WITH a note that the pass was degraded
+ * (2026-09-30): the mode retriever's lexical-only fallbacks used to be
+ * discarded at the port seam, so a turn whose query embed hard-failed looked,
+ * in the [V3] line, like a clean pass that found little. Plain arrays remain
+ * valid for every retriever that has nothing to report.
+ */
+export interface LegacyRetrieveResult {
+  chunks: LegacyChunk[];
+  /** Why the pass ran without its semantic arm (e.g. 'hybrid_threw'). */
+  degraded?: string;
 }
 
 export interface SourceRegistry {
@@ -111,6 +124,48 @@ function isAdmissibleModeAttachment(e: EvidenceItem, allowed: ReadonlySet<Source
   return DOCUMENT_POOL_TYPES.some((t) => allowed.has(t));
 }
 
+// ── A file of the mode handed over WHOLE stays in the prompt (2026-10-04) ───
+//
+// Measured on main with the evidence-rich benchmark: on a heard Recruiting turn
+// the needed claims are about the candidate, and the claim-authority filter
+// below keeps only items that can evidence one of them. The mode's own hiring
+// job description (typed JOB_DESCRIPTION) cannot, so it was dropped from a pack
+// that was otherwise handed over whole: on 13 of 27 heard Recruiting turns,
+// including the ones where the candidate asks what the role pays, how much
+// travel it has, or whether they would carry the pager. The same file is in the
+// prompt on typed turns.
+//
+// Claim authority exists so a JD's "Postgres required" cannot ANSWER "does the
+// candidate have Postgres experience?". That is decided by what an item may
+// support (`acceptedFor`, evidenceSupportsClaim), which this does not touch.
+// What changes is only presence in the prompt, and only for a file the user
+// attached to this mode that the mode port hands over entire: the pack is one
+// thing, and a turn that reads it reads all of it.
+function isWholeModeFile(e: EvidenceItem): boolean {
+  return e.provenance === 'MODE_REFERENCE_FILE'
+    && (e.metadata as Record<string, unknown> | undefined)?.wholeDocument === true;
+}
+
+// ── The same for a profile document handed over WHOLE (2026-10-05) ──────────
+//
+// Measured on the evidence-rich benchmark (630 development turns) once the
+// whole profile is planned on every retrieving turn: the profile port returned
+// the résumé and the job description entire, and this gate removed one or both
+// on nine turns. Typed "do I clear their experience bar? count it from my CV"
+// lost the job description, so the bar it asks about was not in the prompt;
+// with only a job description loaded a question about the user read nothing at
+// all (7 items → 0); "why am I leaving <company>" lost both documents.
+//
+// Presence only, as above: `acceptedFor` and evidenceSupportsClaim still keep
+// a job description from supporting a claim about the user. A profile read in
+// passages (too large, or raw text missing) keeps the gate exactly as it was.
+// The user's own answers are one more whole item of the profile (2026-10-14):
+// the same rule keeps them in view on a turn whose claims they cannot evidence.
+function isWholeProfileDocument(e: EvidenceItem): boolean {
+  return (e.provenance === 'PROFILE_RESUME' || e.provenance === 'PROFILE_JOB_DESCRIPTION' || e.provenance === 'PROFILE_FACT')
+    && (e.metadata as Record<string, unknown> | undefined)?.wholeDocument === true;
+}
+
 export function createLegacyRetrievalPort(deps: LegacyPortDeps): RetrievalPort {
   const now = deps.now ?? (() => 0);
 
@@ -140,15 +195,23 @@ export function createLegacyRetrievalPort(deps: LegacyPortDeps): RetrievalPort {
         const t0 = now();
         let raw: LegacyChunk[] = [];
         let failed: string | undefined;
+        let degraded: string | undefined;
         try {
-          raw = await deps.retrieve(query, {
+          const got = await deps.retrieve(query, {
             topK: decision.retrievalPlan.maximumCandidates,
             timeoutMs: decision.retrievalPlan.timeoutMs,
             sourceTypes: decision.retrievalPlan.sourceTypes,
             intentQuery: decision.resolvedQuestion,
             ...(decision.retrievalPlan.exhaustive ? { exhaustive: true } : {}),
             ...(typeof decision.retrievalPlan.evidenceTokens === 'number' ? { tokenBudget: decision.retrievalPlan.evidenceTokens } : {}),
+            ...(decision.retrievalPlan.wholeProfile === true ? { wholeProfile: true } : {}),
+            ...(decision.retrievalPlan.wholeOwnAnswers === true ? { wholeOwnAnswers: true } : {}),
           });
+          if (Array.isArray(got)) raw = got;
+          else {
+            raw = Array.isArray(got?.chunks) ? got.chunks : [];
+            if (typeof got?.degraded === 'string' && got.degraded) degraded = got.degraded;
+          }
         } catch (e) {
           // §22.1: a retrieval failure is RECORDED, never silently converted
           // into an ungrounded answer that looks grounded.
@@ -167,7 +230,7 @@ export function createLegacyRetrievalPort(deps: LegacyPortDeps): RetrievalPort {
 
         const inScope = adapted.evidence.filter((e) => allowed.has(e.sourceType) || isAdmissibleModeAttachment(e, allowed));
         const kept: EvidenceItem[] = neededClaims.size
-          ? inScope.filter((e) => e.acceptedFor.some((c) => neededClaims.has(c)))
+          ? inScope.filter((e) => e.acceptedFor.some((c) => neededClaims.has(c)) || isWholeModeFile(e) || isWholeProfileDocument(e))
           : inScope;
 
         // Post-adapter drops, made observable (context-debug, 2026-08-01):
@@ -204,6 +267,7 @@ export function createLegacyRetrievalPort(deps: LegacyPortDeps): RetrievalPort {
           rejections,
           durationMs: now() - t0,
           ...(failed ? { failed } : {}),
+          ...(degraded ? { degraded } : {}),
         });
 
         return kept;
@@ -254,7 +318,7 @@ export function createLegacyRetrievalPort(deps: LegacyPortDeps): RetrievalPort {
       // the historical value.
       const wantsHistorical = /\b(retired|legacy|archived|old|previous|former|superseded|original|historical)\b/i
         .test(decision.resolvedQuestion);
-      const RETIRED = new Set(['retired', 'deprecated', 'archived', 'superseded', 'legacy', 'obsolete']);
+      const RETIRED = new Set(['retired', 'deprecated', 'archived', 'superseded', 'legacy', 'obsolete', 'expired', 'outdated']);
       const statusClass = (e: EvidenceItem): number => {
         if (wantsHistorical) return 0;
         const s = (e.metadata as Record<string, unknown> | undefined)?.documentStatus;

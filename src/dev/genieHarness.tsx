@@ -29,12 +29,12 @@
 // HindsightStatusBanner's floating card, ProviderChangeNotice) over whatever
 // backdrop the probe sets, fed by stand-ins for the IPC they listen to, and
 // driven by window.__notices: quota(), hindsight(state, reason?),
-// provider(), progress(done, total), clearProgress().
+// provider(), progress(done, total), clearProgress(), degraded(kind?),
+// clearDegraded().
 //
-// `?cards=1` mounts the REAL Natively API card (premium; nothing without it)
-// and Trial promo, driven by window.__cards: nap(open), setKey(hasKey) for
-// which Natively API variant the next open picks, trial(open) (remounted per
-// open, as the orchestrator does) and trialOutcome('fail' | 'hang').
+// `?cards=1` mounts the REAL Natively API card (premium; nothing without it),
+// driven by window.__cards: nap(open) and setKey(hasKey) for which Natively
+// API variant the next open picks.
 //
 //   window.__genie.open() / .close()   drive it
 //   window.__genie.bands()             band copies present right now
@@ -46,8 +46,7 @@ import '../index.css';
 import { GenieModal } from '../components/ui/GenieModal';
 import { NativelyQuotaBanner } from '../components/NativelyQuotaBanner';
 import { HindsightStatusBanner } from '../components/HindsightStatusBanner';
-import { ProviderChangeNotice, type ProviderChangeWarning, type ReindexProgress } from '../components/ProviderChangeNotice';
-import { TrialPromoToaster } from '../components/trial/TrialPromoToaster';
+import { ProviderChangeNotice, type ProviderChangeWarning, type ReindexProgress, type EmbeddingDegradedNotice } from '../components/ProviderChangeNotice';
 import { NativelyApiPromoToaster } from '../premium';
 
 // Outside Electron there is no capturePage. A probe that wants pictures
@@ -97,7 +96,6 @@ if (NOTICES) {
 
 const CARDS = new URLSearchParams(location.search).get('cards') === '1';
 let cardsHasKey = false;
-let trialOutcome: 'fail' | 'hang' = 'fail';
 if (CARDS) {
   (window as any).electronAPI = {
     ...(window as any).electronAPI,
@@ -108,32 +106,15 @@ if (CARDS) {
 
 function CardsStage() {
   const [nap, setNap] = useState(false);
-  const [trial, setTrial] = useState(false);
-  const [trialKey, setTrialKey] = useState(0);
   useEffect(() => {
     (window as any).__cards = {
       nap: (open: boolean) => setNap(open),
       setKey: (has: boolean) => { cardsHasKey = has; },
-      trial: (open: boolean) => { if (open) setTrialKey(k => k + 1); setTrial(open); },
-      trialOutcome: (o: 'fail' | 'hang') => { trialOutcome = o; },
     };
   }, []);
   return (
     <>
       <NativelyApiPromoToaster isOpen={nap} onDismiss={() => setNap(false)} onOpenSettings={() => {}} />
-      {trialKey > 0 && (
-        <TrialPromoToaster
-          key={trialKey}
-          isOpen={trial}
-          hasNativelyKey={false}
-          hasTrialToken={false}
-          onDismiss={() => setTrial(false)}
-          onStartTrial={() => trialOutcome === 'hang'
-            ? new Promise<void>(() => {})
-            : Promise.reject(new Error('Could not start trial. Check your connection.'))}
-          onManualSetup={() => {}}
-        />
-      )}
     </>
   );
 }
@@ -142,6 +123,7 @@ function NoticesStage() {
   const [quotaKey, setQuotaKey] = useState(0);
   const [warning, setWarning] = useState<ProviderChangeWarning | null>(null);
   const [progress, setProgress] = useState<ReindexProgress | null>(null);
+  const [degraded, setDegraded] = useState<EmbeddingDegradedNotice | null>(null);
   useEffect(() => {
     (window as any).__notices = {
       // A fresh quota banner: it checks usage 3 s after it mounts, as at start-up.
@@ -151,6 +133,8 @@ function NoticesStage() {
       provider: () => setWarning({ count: 12, oldProvider: 'OpenAI', newProvider: 'Gemini' }),
       progress: (done: number, total: number) => setProgress({ done, total }),
       clearProgress: () => setProgress(null),
+      degraded: (kind: EmbeddingDegradedNotice['kind'] = 'fallback') => setDegraded({ kind, fallbackProvider: 'local' }),
+      clearDegraded: () => setDegraded(null),
     };
   }, []);
   return (
@@ -158,9 +142,10 @@ function NoticesStage() {
       {quotaKey > 0 && <NativelyQuotaBanner key={quotaKey} />}
       <HindsightStatusBanner variant="floating-card" />
       <ProviderChangeNotice
-        open={!!warning || !!progress}
+        open={!!warning || !!progress || !!degraded}
         warning={warning}
         progress={progress}
+        degraded={degraded}
         onDismiss={() => setWarning(null)}
         onReindex={() => { setProgress({ done: 0, total: warning?.count ?? 0 }); setWarning(null); }}
       />

@@ -1,3 +1,4 @@
+import type { AssistCatchUp, AssistDailyBrief, AssistEvent, AssistLiveRecap, AssistMeetingBrief, AssistOwedItem, AssistSender, LiveHelperAction } from './assist'
 // Phase 3 — DynamicActionPayload mirrors electron/services/dynamic-actions/DynamicAction.ts.
 // Kept as a structural interface (not a class import) to preserve the strict main↔renderer
 // type boundary — the renderer never imports from electron/* directly.
@@ -61,6 +62,22 @@ export interface DirectAssistError {
   code: string
   message: string
   retryable: boolean
+  /** HTTP status of the failure, when the provider gave one. */
+  status?: number
+  /** The provider's own explanation: one line, keys removed, capped in main. */
+  detail?: string
+  /** The provider was never reached (offline, connection refused). */
+  unreachable?: boolean
+  /** Every provider tried, when more than one was and none answered. */
+  attempts?: Array<{
+    provider: string
+    model: string
+    reason: string
+    status?: number
+    detail?: string
+    unreachable?: boolean
+    waitedMs: number
+  }>
 }
 
 export type DirectAssistEvent =
@@ -74,10 +91,33 @@ export type DirectAssistEvent =
       from: { provider: string; model: string }
       to: { provider: string; model: string }
       reason: string
+      status?: number
+      detail?: string
+      /** How long `from` was given, retries included. */
+      waitedMs: number
+      unreachable?: boolean
     }
   | { type: 'done'; requestId: string; sequence: number; provider: string; model: string; fullText?: string }
   | { type: 'error'; requestId: string; sequence: number; partial: boolean; error: DirectAssistError }
   | { type: 'cancel'; requestId: string; sequence: number }
+
+/** Mirrors electron/llm/visionResolver.ts VisionModelState (the renderer never imports from electron/*). */
+export interface VisionModelState {
+  /** The user's own answer; `auto` leaves it to Natively. */
+  setting: 'auto' | 'on' | 'off'
+  /** The answer in force, the setting included, and where it came from. */
+  reads: 'yes' | 'no' | 'unknown'
+  source: 'override' | 'route' | 'provider' | 'test' | 'names' | null
+  /** What Natively itself can tell. */
+  auto: { reads: 'yes' | 'no' | 'unknown'; source: 'override' | 'route' | 'provider' | 'test' | 'names' | null; testedAt?: number }
+  provider: string
+  /** A one-time image test of this model is running now. */
+  checking: boolean
+  /** The one-time test may ask this model now. */
+  testable: boolean
+  /** Only on the answer to "Test again": the test ran and could not finish. */
+  inconclusive?: boolean
+}
 
 export interface ElectronAPI {
   updateContentDimensions: (dimensions: {
@@ -97,6 +137,7 @@ export interface ElectronAPI {
   onOverlayUiState?: (
     callback: (state: Record<string, unknown>) => void
   ) => () => void
+  getOverlayUiState?: () => Promise<Record<string, unknown> | null>
   sendOverlayUiAction?: (action: { type: string }) => Promise<void>
   // Managed group drag (macOS + Windows): the pill moves the whole group.
   sendOverlayGroupDrag?: (delta: {
@@ -112,7 +153,9 @@ export interface ElectronAPI {
       | { phase: 'begin'; drag?: { direction: string; startWidth: number; startHeight: number; minWidth: number; minHeight: number; panelLeft: number } }
       | { phase: 'end'; final?: { width: number; height: number } },
   ) => Promise<{ width: number; height: number } | undefined>
-  setOverlayHoverInteractive?: (interactive: boolean) => Promise<void>
+  setOverlayHoverInteractive?: (interactive: boolean, source?: 'probe', idleMs?: number) => Promise<void>
+  onOverlayHoverReset?: (callback: () => void) => () => void
+  onOverlayHoverProbe?: (callback: (point: { x: number; y: number }) => void) => () => void
   dismissOverlayPopovers?: (opts?: { settings?: boolean; model?: boolean }) => Promise<void>
   onToggleExpand: (callback: () => void) => () => void
   getRecognitionLanguages: () => Promise<Record<string, any>>
@@ -122,6 +165,9 @@ export interface ElectronAPI {
   // The model panel itself goes through its own `(window as any).electronAPI`
   // cast, so only the two read APIs SettingsOverlay calls are declared here.
   localWhisperGetModels?: () => Promise<{ models: any[]; activeModelId: string }>
+  /** People sharing the microphone: diarize the mic channel and split its voices at save. */
+  roomSpeakersGet?: () => Promise<{ enabled: boolean }>
+  roomSpeakersSet?: (enabled: boolean) => Promise<{ success: boolean; error?: string }>
   localWhisperGetChannelConfig?: () => Promise<{
     enabled: boolean
     micModelId: string
@@ -175,7 +221,7 @@ export interface ElectronAPI {
   onMeetingStateChanged: (callback: (data: { isActive: boolean }) => void) => () => void
   onWindowMaximizedChanged: (callback: (isMaximized: boolean) => void) => () => void
   onEnsureExpanded: (callback: () => void) => () => void
-  openExternal: (url: string) => Promise<void>
+  openExternal: (url: string, opts?: { surface?: string }) => Promise<{ ok: boolean }>
   // Genie snapshots (electron/genieSnapshots.ts): pictures of popup cards the genie warps.
   genieSnapshotCapture?: (rect: { x: number; y: number; width: number; height: number }) => Promise<{ png: Uint8Array; width: number; height: number } | null>
   genieSnapshotSave?: (key: string, png: Uint8Array) => Promise<boolean>
@@ -225,7 +271,7 @@ export interface ElectronAPI {
   runLocalFallbackPreflight: () => Promise<any>
   switchToOllama: (model?: string, url?: string) => Promise<{ success: boolean; error?: string }>
   switchToGemini: (apiKey?: string, modelId?: string) => Promise<{ success: boolean; error?: string }>
-  testLlmConnection: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion', apiKey?: string) => Promise<{ success: boolean; error?: string }>
+  testLlmConnection: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'agentrouter', apiKey?: string) => Promise<{ success: boolean; error?: string }>
   selectServiceAccount: () => Promise<{ success: boolean; path?: string; cancelled?: boolean; error?: string }>
 
   // API Key Management
@@ -238,6 +284,7 @@ export interface ElectronAPI {
   /** `retrievalDeactivated` is true when CLEARING the key also switched an OpenRouter embedding/reranker off. */
   setOpenrouterApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string; retrievalDeactivated?: boolean }>
   setFluxionConfig: (config: { apiKey?: string; protocol?: 'openai' | 'anthropic' }) => Promise<{ success: boolean; error?: string; message?: string; protocol?: 'openai' | 'anthropic'; protocolDetected?: boolean }>
+  setAgentRouterApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string; message?: string }>
   setLitellmConfig: (config: { apiKey: string; baseURL: string; maxTokens?: number }) => Promise<{ success: boolean; error?: string }>
   setNinerouterConfig: (config: { apiKey: string; baseURL: string; maxTokens?: number; thinking?: string }) => Promise<{ success: boolean; error?: string }>
   getAvailableNinerouterModels: () => Promise<string[]>
@@ -252,6 +299,7 @@ export interface ElectronAPI {
   setCloudEnabledModels: (provider: string, models: string[]) => Promise<{ success: boolean; error?: string }>
   setNativelyApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string; proPending?: boolean; proError?: string }>
   setNvidiaNimSttModel: (model: string) => Promise<{ success: boolean; error?: string }>
+  setSttModel: (provider: 'deepgram' | 'openai', model: string) => Promise<{ success: boolean; error?: string }>
   // ── In-app review / testimonial prompt ─────────────────────────────────
   reviewGetPromptState: () => Promise<{
     ok: boolean;
@@ -269,7 +317,6 @@ export interface ElectronAPI {
     eligible?: { eligible: boolean; reason: string };
     error?: string;
   }>
-  reviewRecordSession: () => Promise<{ ok: boolean; error?: string }>
   reviewFlushSession: () => Promise<{ ok: boolean; totals?: { session_count: number; total_usage_ms: number; usage_ms: number; counted: boolean }; error?: string }>
   reviewMarkShown: () => Promise<{ ok: boolean; error?: string }>
   reviewDismissLater: () => Promise<{ ok: boolean; error?: string }>
@@ -287,7 +334,7 @@ export interface ElectronAPI {
   // bridge. Four user-facing categories over five server-side meters.
   getNativelyUsage: (force?: boolean) => Promise<import('./nativelyUsage').NativelyUsageResponse>
   getNativelyPlans: () => Promise<import('./nativelyUsage').NativelyPlansResponse>
-  getStoredCredentials: () => Promise<{ hasNativelyKey?: boolean; hasGeminiKey: boolean; hasGroqKey: boolean; hasOpenaiKey: boolean; hasClaudeKey: boolean; hasDeepseekKey: boolean; hasNvidiaNimKey?: boolean; hasOpenrouterKey?: boolean; hasFluxionKey?: boolean; fluxionProtocol?: 'openai' | 'anthropic'; hasLitellmBaseURL?: boolean; litellmBaseURL?: string | null; litellmMaxTokens?: number | null; hasNinerouterBaseURL?: boolean; hasNinerouterKey?: boolean; ninerouterBaseURL?: string | null; ninerouterMaxTokens?: number | null; ninerouterThinking?: string | null; ninerouterModelMeta?: Record<string, { reasoning?: boolean; thinkingCanDisable?: boolean; thinkingFormat?: string }>; googleServiceAccountPath: string | null; sttProvider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim' | 'natively' | 'local-whisper' | 'apple-speech'; hasSttGroqKey: boolean; hasSttOpenaiKey: boolean; hasDeepgramKey: boolean; hasElevenLabsKey: boolean; hasAzureKey: boolean; azureRegion: string; hasIbmWatsonKey: boolean; ibmWatsonRegion: string; groqSttModel?: string; hasSonioxKey?: boolean; hasTavilyKey?: boolean; geminiPreferredModel?: string; groqPreferredModel?: string; openaiPreferredModel?: string; claudePreferredModel?: string; deepseekPreferredModel?: string; nvidia_nimPreferredModel?: string; openrouterPreferredModel?: string; fluxionPreferredModel?: string; litellmPreferredModel?: string; ninerouterPreferredModel?: string; disabledProviders?: string[]; cloudEnabledModels?: Record<string, string[]>; sttGroqKey?: string; sttOpenaiKey?: string; sttDeepgramKey?: string; sttElevenLabsKey?: string; sttAzureKey?: string; sttIbmKey?: string; sttSonioxKey?: string; openAiSttBaseUrl?: string }>
+  getStoredCredentials: () => Promise<{ hasNativelyKey?: boolean; hasOwnAiKey?: boolean; hasGeminiKey: boolean; hasGroqKey: boolean; hasOpenaiKey: boolean; hasClaudeKey: boolean; hasDeepseekKey: boolean; hasNvidiaNimKey?: boolean; hasOpenrouterKey?: boolean; hasFluxionKey?: boolean; fluxionProtocol?: 'openai' | 'anthropic'; hasAgentRouterKey?: boolean; hasLitellmBaseURL?: boolean; litellmBaseURL?: string | null; litellmMaxTokens?: number | null; hasNinerouterBaseURL?: boolean; hasNinerouterKey?: boolean; ninerouterBaseURL?: string | null; ninerouterMaxTokens?: number | null; ninerouterThinking?: string | null; ninerouterModelMeta?: Record<string, { reasoning?: boolean; thinkingCanDisable?: boolean; thinkingFormat?: string }>; googleServiceAccountPath: string | null; sttProvider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim' | 'natively' | 'local-whisper' | 'apple-speech'; hasSttGroqKey: boolean; hasSttOpenaiKey: boolean; hasDeepgramKey: boolean; hasElevenLabsKey: boolean; hasAzureKey: boolean; azureRegion: string; hasIbmWatsonKey: boolean; ibmWatsonRegion: string; groqSttModel?: string; nvidiaNimSttModel?: string; sttModels?: { deepgram?: string; openai?: string }; hasSonioxKey?: boolean; hasTavilyKey?: boolean; geminiPreferredModel?: string; groqPreferredModel?: string; openaiPreferredModel?: string; claudePreferredModel?: string; deepseekPreferredModel?: string; nvidia_nimPreferredModel?: string; openrouterPreferredModel?: string; fluxionPreferredModel?: string; agentrouterPreferredModel?: string; litellmPreferredModel?: string; ninerouterPreferredModel?: string; disabledProviders?: string[]; cloudEnabledModels?: Record<string, string[]>; sttGroqKey?: string; sttOpenaiKey?: string; sttDeepgramKey?: string; sttElevenLabsKey?: string; sttAzureKey?: string; sttIbmKey?: string; sttSonioxKey?: string; openAiSttBaseUrl?: string }>
   // R-10 resolution flow: ambiguous credential stores (names + last-4 only; null when nothing to resolve).
   getAmbiguousCredentialStores: () => Promise<{
     keyring: { keys: { name: string; last4: string }[]; mtimeIso: string | null };
@@ -306,15 +353,23 @@ export interface ElectronAPI {
 
   // Free Trial
   /** `persisted: false` = started and live for THIS session, but the credential store could not write it, so a restart loses it. The server keeps the trial and re-issues it (idempotent per hardware id). */
-  startTrial:     () => Promise<{ ok: boolean; hasToken?: boolean; persisted?: boolean; started_at?: string; expires_at?: string; expired?: boolean; already_used?: boolean; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: { duration_ms: number; ai_requests: number; stt_minutes: number; search_requests: number }; error?: string; status?: number }>
-  getTrialStatus: () => Promise<{ ok: boolean; expired?: boolean; remaining_ms?: number; started_at?: string; expires_at?: string; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: object; error?: string }>
-  getLocalTrial:  () => Promise<{ hasToken: boolean; trialClaimed?: boolean; expiresAt?: string; startedAt?: string; expired?: boolean }>
+  startTrial:     (surface?: string) => Promise<{ ok: boolean; hasToken?: boolean; persisted?: boolean; started_at?: string; expires_at?: string; expired?: boolean; already_used?: boolean; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: { duration_ms: number; ai_requests: number; stt_minutes: number; search_requests: number }; error?: string; status?: number }>
+  getTrialStatus: () => Promise<{ ok: boolean; expired?: boolean; showEndedCard?: boolean; remaining_ms?: number; started_at?: string; expires_at?: string; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: object; error?: string }>
+  getLocalTrial:  () => Promise<{ hasToken: boolean; trialClaimed?: boolean; expiresAt?: string; startedAt?: string; expired?: boolean; showEndedCard?: boolean; superseded?: boolean }>
   convertTrial:   (choice: string) => Promise<{ ok: boolean }>
-  endTrialByok:        () => Promise<{ success: boolean; error?: string }>
-  wipeTrialProfileData: () => Promise<{ success: boolean; error?: string }>
+  endTrialByok:        (opts?: { force?: boolean }) => Promise<{ success: boolean; wipeIncomplete?: boolean; error?: string }>
+  // Card ledger (toaster policy, src/lib/cards/cardPolicy.mjs)
+  cardsGet: () => Promise<{ ok: boolean; ledger?: import('../lib/cards/cardPolicy.mjs').Ledger; error?: string }>
+  cardsRecord: (id: string, outcome: string, meta?: { until?: number }) => Promise<{ ok: boolean; ledger?: import('../lib/cards/cardPolicy.mjs').Ledger; error?: string }>
+  /** Report a funnel event only the renderer can see (a card on screen, a locked feature opened). */
+  funnelTrack: (eventType: string, props?: Record<string, string | number | boolean>) => Promise<{ ok: boolean; result?: string; error?: string }>
+  cardsImportLegacy: (legacy: import('../lib/cards/cardPolicy.mjs').LegacyCardHistory) => Promise<{ ok: boolean; ledger?: import('../lib/cards/cardPolicy.mjs').Ledger; error?: string }>
+  onCardsChanged: (cb: (ledger: import('../lib/cards/cardPolicy.mjs').Ledger) => void) => () => void
   onTrialEnded:   (cb: (data: { choice: string }) => void) => () => void
   /** Emitted by `trial:start`, so a trial claimed mid-session unlocks Pro surfaces without a relaunch. */
   onTrialStarted: (cb: (data: { expiresAt: string; startedAt: string; usage?: { ai: number; ai_tokens?: number; stt_seconds: number; search: number }; limits?: { duration_ms: number; ai_requests: number; stt_minutes: number; search_requests: number } }) => void) => () => void
+  /** A meeting with no AI is starting the free trial by itself. `pending`: on its way. `failed`: it could not (offline, rate limited), so the overlay offers the manual start. `settled`: done, one way or the other. */
+  onTrialAutoStart: (cb: (data: { state: 'pending' | 'settled' } | { state: 'failed'; reason: 'unreachable' | 'rate_limited' }) => void) => () => void
 
   // STT Provider Management
   setSttProvider: (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim' | 'natively' | 'local-whisper' | 'apple-speech') => Promise<{ success: boolean; error?: string }>
@@ -365,6 +420,8 @@ export interface ElectronAPI {
   getAiResponseLanguages: () => Promise<Array<{ label: string; code: string }>>
   setAiResponseLanguage: (language: string) => Promise<{ success: boolean; error?: string }>
   getSttLanguage: () => Promise<string>
+  getUserDictionary?: () => Promise<string[]>
+  setUserDictionary?: (terms: string[]) => Promise<{ success: boolean; terms?: string[]; error?: string }>
   getAiResponseLanguage: () => Promise<string>
   onSttLanguageAutoDetected: (callback: (bcp47: string) => void) => () => void
   // `titleKey` is the i18n key for the warning banner's heading (main.ts
@@ -375,7 +432,8 @@ export interface ElectronAPI {
   onDeviceSelectionApplied: (callback: (payload: { kind: 'input' | 'output'; requested: string | null; actual: string | null; fellBack: boolean; reason?: string }) => void) => () => void
   onAudioCaptureFailed: (callback: (payload: { channel: 'system' | 'mic'; message: string; attempt: number; maxAttempts: number; terminal?: boolean; stuck?: boolean; titleKey?: string }) => void) => () => void
 
-  onSttStatusChanged: (callback: (data: { state: 'connected' | 'reconnecting' | 'failed' | 'awaiting-audio' | 'preparing'; provider: string; error?: string; channel: 'user' | 'interviewer'; reconnectAttempts?: number }) => void) => () => void
+  // STT Status Events
+  onSttStatusChanged: (callback: (data: { state: 'connected' | 'reconnecting' | 'failed' | 'awaiting-audio' | 'preparing'; provider: string; error?: string; channel: 'user' | 'interviewer'; reconnectAttempts?: number; /** A stand-in carries the channel while `provider` is down. */ fallback?: { provider: string; notice: string } }) => void) => () => void
   onAudioInitStatus: (callback: (data: { stage: string; progress?: number; message?: string; modelId?: string }) => void) => () => void
   onLocalWhisperDownloadProgress: (callback: (data: { modelId: string; progress: number }) => void) => () => void
   onLocalWhisperDownloadComplete: (callback: (data: { modelId: string }) => void) => () => void
@@ -414,6 +472,8 @@ export interface ElectronAPI {
   generateFollowUp: (intent: string, userRequest?: string) => Promise<{ refined: string | null; intent: string }>
   generateFollowUpQuestions: () => Promise<{ questions: string | null }>
   generateRecap: () => Promise<{ summary: string | null }>
+  /** The overlay's live helpers: What did I miss?, Define, Sound smart. Streams like Recap and Clarify. */
+  generateLiveHelper?: (action: LiveHelperAction, opts?: { sinceMs?: number }) => Promise<{ text: string | null }>
   submitManualQuestion: (question: string) => Promise<{ answer: string | null; question: string }>
   getIntelligenceContext: () => Promise<{ context: string; lastAssistantMessage: string | null; activeMode: string }>
   resetIntelligence: () => Promise<{ success: boolean; error?: string }>
@@ -471,10 +531,28 @@ export interface ElectronAPI {
   getRecentMeetings: () => Promise<Array<{ id: string; title: string; date: string; duration: string; summary: string }>>
   getMeetingDetails: (id: string) => Promise<any>
   searchGlobalMeetings: (query: string, filters?: any) => Promise<{ enabled: boolean; results: any[] }>
+  /** Folders, tags, People and Companies. */
+  organise: OrganiseApi
   searchMemories?: (query: string) => Promise<{ enabled: boolean; results: Array<{ text: string; meetingId?: string; meetingTitle?: string; date?: string }> }>
   searchInMeeting: (query: string) => Promise<{ enabled: boolean; results: any[] }>
   generateLectureNotes: (opts?: { title?: string; course?: string }) => Promise<{ enabled: boolean; notes: any }>
   generateDiagram: (text?: string) => Promise<{ enabled: boolean; diagram: any }>
+  // ── System-design diagram artifacts (electron/services/diagram/diagramIpc.ts) ──
+  /** The feature switch: off = a ```mermaid block is an ordinary code block. */
+  getDiagramsEnabled?: () => Promise<boolean>
+  onDiagramsEnabledChanged?: (callback: (enabled: boolean) => void) => () => void
+  /** One bounded model call to fix a Mermaid block that did not parse. */
+  repairDiagram?: (payload: { requestId: string; source: string; diagnostic?: string; stage?: string; manual?: boolean }) => Promise<{ ok: true; source: string } | { ok: false; reason: string }>
+  cancelDiagramRepair?: (requestId: string) => Promise<boolean>
+  /** The repaired block drew: record it where the broken one was recorded. */
+  acceptDiagramRepair?: (payload: { originalSource: string; repairedSource: string }) => Promise<boolean>
+  /** Save a diagram the renderer produced (svg text, base64 png, or Mermaid source). */
+  exportDiagram?: (payload: { format: 'svg' | 'png' | 'mmd' | 'json' | 'csv'; data: string; name?: string }) => Promise<{ saved: boolean; canceled?: boolean; fileName?: string; silent?: boolean; error?: string }>
+  /** Meeting outputs: export, Slack, Notion, CRM notes, the local MCP server, follow-up style. */
+  meetingOutputs?: import('./meetingOutputs').MeetingOutputsApi
+  /** The main process asks this window to draw a diagram for the phone. */
+  onDiagramRenderRequest?: (callback: (request: { requestId: string; key: string; source: string }) => void) => () => void
+  sendDiagramRenderResult?: (result: { requestId: string; key: string; ok: boolean; svg?: string }) => void
   // ── Embedding settings (configured independently of the generation model) ──
   getEmbeddingStatus: () => Promise<{
     active: { configured: boolean; provider?: string | null; model?: string | null; dimensions?: number | null; space?: string | null; location?: 'on-device' | 'cloud' | 'unknown'; lightweight?: boolean }
@@ -618,10 +696,13 @@ export interface ElectronAPI {
   }>
   cancelLocalRerankerModel: (id: string) => Promise<{ success: boolean; error?: string }>
   removeLocalRerankerModel: (id: string) => Promise<{ success: boolean; error?: string; message?: string }>
+  /** Hash an installed model's files and fetch again whatever is damaged. `repaired` is empty when it was intact. */
+  verifyLocalRerankerModel: (id: string) => Promise<{ success: boolean; repaired?: string[]; error?: string; message?: string }>
   useLocalRerankerModel: (id: string | null) => Promise<{
     success: boolean; activeId?: string | null; topIndex?: number; error?: string; message?: string
   }>
-  onLocalRerankerModelProgress: (callback: (p: { id: string; fraction: number; currentFile: string }) => void) => () => void
+  /** `phase` is 'checking' while a file already on disk is hashed, 'downloading' while one is fetched. */
+  onLocalRerankerModelProgress: (callback: (p: { id: string; fraction: number; currentFile: string; phase?: 'checking' | 'downloading' }) => void) => () => void
 
   listLocalEmbeddingModels: () => Promise<{
     models: Array<{
@@ -650,6 +731,8 @@ export interface ElectronAPI {
   }>
   cancelLocalEmbeddingModel: (id: string) => Promise<{ success: boolean; error?: string }>
   removeLocalEmbeddingModel: (id: string) => Promise<{ success: boolean; error?: string; message?: string }>
+  /** Hash an installed model's files and fetch again whatever is damaged. `restartToApply` when the repaired model is the one in use. */
+  verifyLocalEmbeddingModel: (id: string) => Promise<{ success: boolean; repaired?: string[]; restartToApply?: boolean; error?: string; message?: string }>
   useLocalEmbeddingModel: (id: string | null) => Promise<{
     success: boolean; activeId?: string | null; dimensions?: number; reindexRequired?: boolean; incompatibleCount?: number; error?: string; message?: string
     /** Present when error === 'license_not_acknowledged'. */
@@ -661,7 +744,8 @@ export interface ElectronAPI {
   revealLocalEmbeddingModelsFolder: () => Promise<{ success: boolean }>
   /** Persist the user's acceptance of a catalog model's licence terms. Must be called before install/use on models where requiresAcknowledgement is true. */
   acknowledgeLocalEmbeddingCatalogModel: (id: string) => Promise<{ success: boolean; error?: string; message?: string }>
-  onLocalEmbeddingModelProgress: (callback: (p: { id: string; fraction: number; currentFile: string }) => void) => () => void
+  /** `phase` is 'checking' while a file already on disk is hashed, 'downloading' while one is fetched. */
+  onLocalEmbeddingModelProgress: (callback: (p: { id: string; fraction: number; currentFile: string; phase?: 'checking' | 'downloading' }) => void) => () => void
 
   listExtensions: () => Promise<{
     available: boolean
@@ -738,6 +822,8 @@ export interface ElectronAPI {
   setWindowMode: (mode: 'launcher' | 'overlay', inactive?: boolean) => Promise<void>
   setMeetingInterfaceTheme: (theme: string) => void
   onMeetingInterfaceThemeChanged: (callback: (theme: string) => void) => () => void
+  setGenieAnimationEnabled: (enabled: boolean) => void
+  onGenieAnimationChanged: (callback: (enabled: boolean) => void) => () => void
 
   // Phase 3 — Cluely-style dynamic action cards.
   onIntelligenceDynamicAction: (callback: (data: { action: DynamicActionPayload }) => void) => () => void
@@ -749,7 +835,7 @@ export interface ElectronAPI {
   // Intelligence Mode Events
   onIntelligenceAssistUpdate: (callback: (data: { insight: string }) => void) => () => void
   onIntelligenceSuggestedAnswerToken: (callback: (data: { token: string; question: string; confidence: number }) => void) => () => void
-  onIntelligenceSuggestedAnswer: (callback: (data: { answer: string; question: string; confidence: number; generationId?: number; sourceLabel?: string; emittedAt?: number }) => void) => () => void
+  onIntelligenceSuggestedAnswer: (callback: (data: { answer: string; question: string; confidence: number; generationId?: number; sourceLabel?: string; emittedAt?: number; stopReason?: string }) => void) => () => void
   onIntelligenceSuggestedAnswerDiscard: (callback: (data: { reason: string }) => void) => () => void
   // Verified code execution (background): ✓ badge + corrected message.
   onIntelligenceCodeVerified: (callback: (data: { question: string; passed: number; total: number; language: string }) => void) => () => void
@@ -774,9 +860,9 @@ export interface ElectronAPI {
   onSessionReset: (callback: () => void) => () => void;
 
   // Streaming listeners
-  streamGeminiChat: (message: string, imagePaths?: string[], context?: string, options?: { skipSystemPrompt?: boolean, ignoreKnowledgeMode?: boolean }) => Promise<void>
+  streamGeminiChat: (message: string, imagePaths?: string[], context?: string, options?: { skipSystemPrompt?: boolean, ignoreKnowledgeMode?: boolean, liveQuestion?: boolean }) => Promise<void>
   onGeminiStreamToken: (callback: (token: string, meta?: { streamId?: number }) => void) => () => void
-  onGeminiStreamDone: (callback: (data?: { finalText?: string; streamId?: number }) => void) => () => void
+  onGeminiStreamDone: (callback: (data?: { finalText?: string; streamId?: number; incomplete?: boolean; incompleteReason?: string }) => void) => () => void
   onGeminiStreamError: (callback: (error: string, meta?: { streamId?: number | null; source?: string }) => void) => () => void;
 
   // NOTE: onSkillsChanged broadcast subscription was removed. Skills are
@@ -794,6 +880,13 @@ export interface ElectronAPI {
   setFastModel: (modelId: string | null) => Promise<{ success: boolean; error?: string }>;
   /** Narrows picker options to the ids the fast path can actually dispatch. */
   filterFastModelCandidates: (ids: string[]) => Promise<{ ids: string[] }>;
+  /** "Reads images: Auto / On / Off" per model. Keyed by picker id; null = that id has no row control. */
+  getVisionModelStates: (ids: string[]) => Promise<{ states: Record<string, VisionModelState | null> }>;
+  setVisionSetting: (id: string, setting: 'auto' | 'on' | 'off') => Promise<{ state: VisionModelState | null }>;
+  /** Forget the saved image test and ask the model again now. */
+  retestVision: (id: string) => Promise<{ state: VisionModelState | null }>;
+  /** An answer changed (a setting, or a background image test finished): ask again. */
+  onVisionCapabilityChanged: (callback: () => void) => () => void;
   toggleModelSelector: (coords: { x: number; y: number; activate?: boolean }) => Promise<void>;
   modelSelectorCloseIfOpen: () => Promise<void>;
   // NOTE: this interface and the one in electron/preload.ts are maintained
@@ -812,9 +905,9 @@ export interface ElectronAPI {
   // Groq Fast Text Mode
   getGroqFastTextMode: () => Promise<{ enabled: boolean }>;
   setGroqFastTextMode: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
-  getCodexCliConfig: () => Promise<{ enabled: boolean; path: string; model: string; fastModel: string; timeoutMs: number; sandboxMode: string; serviceTier?: string; modelReasoningEffort?: string }>;
-  setCodexCliConfig: (config: { enabled: boolean; path: string; model: string; fastModel: string; timeoutMs: number; sandboxMode?: string; serviceTier?: string; modelReasoningEffort?: string }) => Promise<{ success: boolean; error?: string; config?: { enabled: boolean; path: string; model: string; fastModel: string; timeoutMs: number; sandboxMode: string; serviceTier?: string; modelReasoningEffort?: string } }>;
-  testCodexCli: (config?: { enabled?: boolean; path?: string; model?: string; fastModel?: string; timeoutMs?: number; sandboxMode?: string; serviceTier?: string; modelReasoningEffort?: string }) => Promise<{ success: boolean; error?: string; resolvedPath?: string; config?: { enabled: boolean; path: string; model: string; fastModel: string; timeoutMs: number; sandboxMode: string; serviceTier?: string; modelReasoningEffort?: string } }>;
+  getCodexCliConfig: () => Promise<{ enabled: boolean; path: string; model: string; timeoutMs: number; sandboxMode: string; serviceTier?: string; modelReasoningEffort?: string }>;
+  setCodexCliConfig: (config: { enabled: boolean; path: string; model: string; timeoutMs: number; sandboxMode?: string; serviceTier?: string; modelReasoningEffort?: string }) => Promise<{ success: boolean; error?: string; config?: { enabled: boolean; path: string; model: string; timeoutMs: number; sandboxMode: string; serviceTier?: string; modelReasoningEffort?: string } }>;
+  testCodexCli: (config?: { enabled?: boolean; path?: string; model?: string; timeoutMs?: number; sandboxMode?: string; serviceTier?: string; modelReasoningEffort?: string }) => Promise<{ success: boolean; error?: string; resolvedPath?: string; config?: { enabled: boolean; path: string; model: string; timeoutMs: number; sandboxMode: string; serviceTier?: string; modelReasoningEffort?: string } }>;
   codexCliAuthStatus: (config?: any) => Promise<{ success: boolean; action: string; output?: string; error?: string; resolvedPath?: string; config?: any }>;
   codexCliLogout: (config?: any) => Promise<{ success: boolean; action: string; output?: string; error?: string; resolvedPath?: string; config?: any }>;
   codexCliLogin: (config?: any) => Promise<{ success: boolean; action: string; output?: string; error?: string; resolvedPath?: string; config?: any }>;
@@ -848,6 +941,12 @@ export interface ElectronAPI {
   generateFollowupEmail: (input: any) => Promise<string>;
   extractEmailsFromTranscript: (transcript: Array<{ text: string }>) => Promise<string[]>;
   getCalendarAttendees: (eventId: string) => Promise<Array<{ email: string; name: string }>>;
+  /** Calendar events overlapping a saved meeting, nearest start first (the notes' "which event was this"). */
+  getMeetingCalendarCandidates: (meetingId: string) => Promise<Array<{ id: string; title: string; startTime: string; endTime: string; link?: string; attendees: Array<{ email: string; name?: string; response?: string }>; linkedBy: string }>>;
+  /** When a saved meeting's recording ran (epoch ms), or null when unknown. */
+  getMeetingRecordingSpan: (meetingId: string) => Promise<{ startMs: number; endMs: number } | null>;
+  /** Link a saved meeting to one of those events, or unlink it (null). */
+  setMeetingCalendarEvent: (meetingId: string, eventId: string | null) => Promise<{ success: boolean }>;
   openMailto: (params: { to: string; subject: string; body: string }) => Promise<{ success: boolean; error?: string }>;
 
   // Audio Test
@@ -865,12 +964,15 @@ export interface ElectronAPI {
   onUndetectableChanged: (callback: (state: boolean) => void) => () => void;
   onGroqFastTextChanged: (callback: (enabled: boolean) => void) => () => void;
   onModelChanged: (callback: (modelId: string) => void) => () => void;
+  onModelSelectorShown: (callback: () => void) => () => void;
+  onModelSelectorHeightBudget: (callback: (maxHeight: number) => void) => () => void;
 
   onOllamaPullProgress: (callback: (data: { status: string; percent: number }) => void) => () => void;
   onOllamaPullComplete: (callback: () => void) => () => void;
   onOllamaError: (callback: (data: { message: string }) => void) => () => void;
 
   onMeetingsUpdated: (callback: () => void) => () => void
+  onCalendarConnectionChanged: (callback: (connected: boolean) => void) => () => void
 
   // Provider Compatibility
   onIncompatibleProviderWarning: (callback: (data: { count: number, oldProvider: string, newProvider: string }) => void) => () => void;
@@ -886,9 +988,87 @@ export interface ElectronAPI {
   // Calendar
   calendarConnect: () => Promise<{ success: boolean; error?: string }>
   calendarDisconnect: () => Promise<{ success: boolean; error?: string }>
-  getCalendarStatus: () => Promise<{ connected: boolean; email?: string }>
-  getUpcomingEvents: () => Promise<Array<{ id: string; title: string; startTime: string; endTime: string; link?: string; source: 'google'; attendees?: Array<{ email: string; name?: string; photoUrl?: string; response?: 'accepted' | 'declined' | 'tentative' | 'needsAction' }> }>>
-  calendarRefresh: () => Promise<{ success: boolean; error?: string }>
+  getCalendarStatus: () => Promise<{ connected: boolean; email?: string; name?: string }>
+  getSyncedCalendars: () => Promise<Array<{ id: string; name: string; primary: boolean; color?: string }>>
+  /** Every calendar source this platform offers (Apple Calendar on macOS only), with where each stands. */
+  getCalendarSources?: () => Promise<Array<{
+    id: 'google' | 'outlook' | 'apple' | 'ics'
+    state: 'connected' | 'disconnected' | 'unconfigured' | 'notAllowed'
+    account?: string
+    detail?: string
+    lastRefresh?: { at: number; ok: boolean }
+  }>>
+  /** Connects one source; `input` is the pasted link for 'ics'. `error` is a sentence for the row. */
+  calendarSourceConnect?: (id: 'google' | 'outlook' | 'apple' | 'ics', input?: string) => Promise<{ success: boolean; error?: string }>
+  calendarSourceDisconnect?: (id: 'google' | 'outlook' | 'apple' | 'ics') => Promise<{ success: boolean }>
+  /** Meeting detection (Settings › Calendar): offer to start when a call begins. */
+  getMeetingDetectionEnabled?: () => Promise<boolean>
+  setMeetingDetectionEnabled?: (on: boolean) => Promise<{ success: boolean; error?: string }>
+  /** Start automatically (Settings › Calendar): a detected call starts after a 10 s countdown. Default off. */
+  getMeetingAutoStartEnabled?: () => Promise<boolean>
+  setMeetingAutoStartEnabled?: (on: boolean) => Promise<{ success: boolean; error?: string }>
+  /** Calendar reminder lead time in minutes: 1, 2 or 5. */
+  getCalendarReminderMinutes?: () => Promise<number>
+  setCalendarReminderMinutes?: (minutes: number) => Promise<{ success: boolean; error?: string }>
+  /** The "meeting detected" offer for the launcher's panel (null clears it). autoStartAt: wall time of the automatic start. */
+  onMeetingOffer?: (callback: (offer: { id: string; title: string | null; app: string; body: string; autoStartAt: number | null } | null) => void) => () => void
+  getMeetingOffer?: () => Promise<{ id: string; title: string | null; app: string; body: string; autoStartAt: number | null } | null>
+  startMeetingOffer?: (id: string) => Promise<{ success: boolean }>
+  dismissMeetingOffer?: (id: string) => Promise<{ success: boolean }>
+  getMeetingAutoStopEnabled?: () => Promise<boolean>
+  setMeetingAutoStopEnabled?: (on: boolean) => Promise<{ success: boolean; error?: string }>
+  getFollowMeetingMute?: () => Promise<boolean>
+  getDictationEnabled?: () => Promise<boolean>
+  setDictationEnabled?: (on: boolean) => Promise<{ success: boolean; error?: string }>
+  setFollowMeetingMute?: (on: boolean) => Promise<{ success: boolean; error?: string }>
+  getMeetingMuteState?: () => Promise<{ muted: boolean; app: string | null }>
+  onMeetingMuteChanged?: (callback: (state: { muted: boolean; app: string | null }) => void) => () => void
+  getScreenShareSnapshots?: () => Promise<boolean>
+  setScreenShareSnapshots?: (on: boolean) => Promise<{ success: boolean; error?: string }>
+  meetingAutoStopKeepGoing?: () => Promise<{ success: boolean }>
+  /** Assist (electron/services/assist): the daily brief, You owe, Brief me, the catch-up, Last time. */
+  assistGetDailyBrief?: (events: AssistEvent[]) => Promise<AssistDailyBrief>
+  assistGetOwed?: () => Promise<AssistOwedItem[]>
+  assistSetOwedDone?: (key: string, done: boolean) => Promise<{ ok: boolean }>
+  assistGetMeetingBrief?: (event: AssistEvent, opts?: { refresh?: boolean }) => Promise<{ ok: true; brief: AssistMeetingBrief } | { ok: false; error: string }>
+  assistGetCatchUp?: () => Promise<AssistCatchUp | null>
+  assistDismissCatchUp?: (key: string) => Promise<{ ok: boolean }>
+  assistGetLiveRecap?: () => Promise<AssistLiveRecap>
+  assistDismissLiveRecap?: () => Promise<{ ok: boolean }>
+  onAssistLastTimeRecap?: (callback: (payload: AssistLiveRecap) => void) => () => void
+  getCatchUpEnabled?: () => Promise<boolean>
+  setCatchUpEnabled?: (on: boolean) => Promise<{ success: boolean; error?: string }>
+  assistGetSender?: () => Promise<AssistSender>
+  assistOpenMailDraft?: (url: string) => Promise<{ ok: boolean; error?: string }>
+  /** The calendar reminder's "Running late": open that draft in the launcher. */
+  onAssistReminderDraft?: (callback: (req: { kind: 'running_late' | 'no_show' | 'reschedule'; event: AssistEvent }) => void) => () => void
+  meetingAutoStopTyping?: () => void
+  /** The notes window (`?window=notes`): the overlay's Notes button, its own X. */
+  notesWindowToggle?: () => Promise<{ open: boolean }>
+  notesWindowClose?: () => Promise<{ success: boolean }>
+  notesWindowIsOpen?: () => Promise<boolean>
+  onNotesWindowVisibility?: (callback: (open: boolean) => void) => () => void
+  /** The notes window's text and the meeting it belongs to. */
+  liveNotesGetState?: () => Promise<{ phase: 'idle' | 'live' | 'ended'; meetingId: string | null; text: string }>
+  /** Every change of the notes window's text (main keeps it with the meeting). */
+  liveNotesSetText?: (text: string) => void
+  onLiveNotesState?: (callback: (state: { phase: 'idle' | 'live' | 'ended'; meetingId: string | null; text?: string }) => void) => () => void
+  /** "Open meeting" in the notes window: the launcher opens that meeting. */
+  notesWindowOpenMeeting?: (meetingId: string) => Promise<{ success: boolean }>
+  onLauncherOpenMeeting?: (callback: (meetingId: string) => void) => () => void
+  /** Earlier versions of a meeting's notes, oldest first. */
+  getMeetingNotesVersions?: (meetingId: string) => Promise<Array<{ id: number; label: string; createdAt: number; templateType: string | null; detailedSummary: any }>>
+  /** Thumbs up / down on the notes shown (current: versionId null). */
+  rateMeetingNotes?: (input: { meetingId: string; rating: 'up' | 'down'; comment?: string; versionId?: number | null }) => Promise<{ success: boolean }>
+  getMeetingNotesRating?: (input: { meetingId: string; versionId?: number | null }) => Promise<{ rating: 'up' | 'down'; comment: string | null } | null>
+  /** Compare two versions of the notes blind: A and B in a random order, named only after the pick. */
+  compareMeetingNotesStart?: (input: { meetingId: string; versions: [number | 'current', number | 'current'] }) => Promise<{ id: string; a: any; b: any } | null>
+  compareMeetingNotesPick?: (input: { id: string; choice: 'A' | 'B' | 'same'; reason?: string }) => Promise<{ choice: 'A' | 'B' | 'same'; saved: boolean; a: { version: 'current' | number; label: string; provider: string | null; model: string | null }; b: { version: 'current' | number; label: string; provider: string | null; model: string | null } } | null>
+  onMeetingAutoStopNotice?: (callback: (data: { stopsAt: number | null }) => void) => () => void
+  /** A notification's Start (a detected call, the calendar reminder), relayed by main to the launcher. */
+  onMeetingStartRequest?: (callback: (req: { title?: string; calendarEventId?: string; via?: 'detected' | 'reminder' }) => void) => () => void
+  getUpcomingEvents: () => Promise<Array<{ id: string; title: string; startTime: string; endTime: string; link?: string; source: 'google' | 'outlook' | 'apple' | 'ics'; attendees?: Array<{ email: string; name?: string; photoUrl?: string; response?: 'accepted' | 'declined' | 'tentative' | 'needsAction' }> }>>
+  calendarRefresh: () => Promise<{ success: boolean; error?: string; fresh?: boolean }>
 
   // Auto-Update
   onUpdateAvailable: (callback: (info: any) => void) => () => void
@@ -906,7 +1086,7 @@ export interface ElectronAPI {
   // RAG (Retrieval-Augmented Generation) API
   ragQueryMeeting: (meetingId: string, query: string) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>
   ragQueryLive: (query: string) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>
-  ragQueryGlobal: (query: string) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>
+  ragQueryGlobal: (query: string, scope?: { folderId?: string }) => Promise<{ success?: boolean; fallback?: boolean; error?: string }>
   ragCancelQuery: (options: { meetingId?: string; global?: boolean }) => Promise<{ success: boolean }>
   ragIsMeetingProcessed: (meetingId: string) => Promise<boolean>
   ragGetQueueStatus: () => Promise<{ pending: number; processing: number; completed: number; failed: number }>
@@ -971,6 +1151,18 @@ export interface ElectronAPI {
   }>
   profileSetMode: (enabled: boolean) => Promise<{ success: boolean; error?: string }>
   profileDelete: () => Promise<{ success: boolean; error?: string }>
+  // "Cue Cards": what the user says about themselves that no résumé states.
+  profileGetOwnAnswers: () => Promise<{
+    success: boolean;
+    error?: string;
+    questions: Array<{ key: string; label: string; hint: string; drafted: boolean; needsJob?: boolean; maxChars: number }>;
+    answers: Array<{ key: string; text: string; status: 'draft' | 'saved'; updatedAt?: string }>;
+    drafting: boolean;
+  }>;
+  profileSaveOwnAnswer: (key: string, text: string) => Promise<{ success: boolean; text?: string; error?: string }>;
+  profileUseOwnAnswerDrafts: (keys?: string[]) => Promise<{ success: boolean; changed?: number; error?: string }>;
+  profileDraftOwnAnswers: () => Promise<{ success: boolean; written?: string[]; error?: string }>;
+  onProfileOwnAnswersUpdated: (callback: (data: { written: string[] }) => void) => () => void;
   profileGetProfile: () => Promise<any>
   profileGetCompanyDossier: () => Promise<any | null>
   profileSelectFile: () => Promise<{ success?: boolean; cancelled?: boolean; filePath?: string; error?: string }>
@@ -991,9 +1183,10 @@ export interface ElectronAPI {
   // Tavily Search API
   setTavilyApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
 
-  // Dynamic Model Discovery
-  fetchProviderModels: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion', apiKey: string) => Promise<{ success: boolean; models?: {id: string, label: string}[]; error?: string }>
-  setProviderPreferredModel: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'litellm' | 'ninerouter', modelId: string) => Promise<void>
+  // Dynamic Model Discovery & Live Catalog
+  fetchProviderModels: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'agentrouter', apiKey: string) => Promise<{ success: boolean; models?: {id: string, label: string}[]; error?: string }>
+  onLiveCatalogUpdated: (callback: (data: { provider?: string; models?: { id: string; label: string }[] }) => void) => () => void
+  setProviderPreferredModel: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'agentrouter' | 'litellm' | 'ninerouter', modelId: string) => Promise<void>
 
   // License Management
   licenseActivate: (key: string) => Promise<{ success: boolean; error?: string }>
@@ -1013,6 +1206,8 @@ export interface ElectronAPI {
   // Verbose / Debug Logging
   getVerboseLogging: () => Promise<boolean>;
   setVerboseLogging: (enabled: boolean) => Promise<{ success: boolean }>;
+  getUsageStatistics: () => Promise<boolean>;
+  setUsageStatistics: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
   exportDebugLogs: () => Promise<{ success: boolean; path?: string; files?: string[]; error?: string }>;
 
   // Windows shortcut guard — the always-on WH_KEYBOARD_LL hook that swallows
@@ -1064,6 +1259,9 @@ export interface ElectronAPI {
     key: 'seenStartup' | 'seenProfileOnboarding' | 'seenModesOnboarding' | 'permsShown',
     value: boolean,
   ) => Promise<{ success: boolean; error?: string }>;
+  /** First-launch shortcut tour: taught shortcuts become practice presses. */
+  onboardingSetShortcutTour: (active: boolean) => Promise<{ success: boolean }>;
+  onOnboardingTourShortcut: (callback: (actionId: string) => void) => () => void;
 
   // Arch
   getArch: () => Promise<string>;
@@ -1083,6 +1281,8 @@ export interface ElectronAPI {
   // Skills
   skillsRefresh: () => Promise<SkillSummary[]>;
   skillsOpenFolder: () => Promise<{ success: boolean; path: string; error?: string }>;
+  /** Picks a SKILL.md through main's (capture-guarded) dialog; returns skills:upload's payload. */
+  skillsPickFile?: () => Promise<{ canceled: boolean; error?: string; payload?: { kind: 'file'; filename: string; contentBase64: string } }>;
   // Per-skill management: hard-delete. Built-ins are refused inside the
   // manager. Enable/disable is intentionally NOT exposed on the renderer —
   // users who don't want a skill delete it instead.
@@ -1110,6 +1310,11 @@ export interface ElectronAPI {
   // when a coding page was auto-attached (arrives via onDomContextReceived), else
   // attached:false (answer proceeds without browser context).
   phoneMirrorRequestAutoContext: () => Promise<{ attached: boolean; reason?: string; category?: string }>;
+  // Phone Mirror shows the overlay's attached-screenshot tray and, once a
+  // question is sent, the screenshots it was sent with. Overlay window only.
+  phoneMirrorSetAttachments?: (items: Array<{ path: string; preview: string }>) => void;
+  phoneMirrorImagesSent?: (id: string, paths: string[]) => void;
+  onPhoneMirrorDetach?: (callback: (data: { path: string }) => void) => () => void;
   // Smart Browser Context v2 — auto-capture settings.
   browserContextGetSettings: () => Promise<BrowserContextSettings | { error: string }>;
   browserContextSetSettings: (
@@ -1364,6 +1569,83 @@ export interface PhoneMirrorInfo {
   extPairedAt?: number;
   /** Resolved bind host — '127.0.0.1' for loopback-only, '0.0.0.0' when LAN-exposed. */
   bindAddress: string;
+}
+
+// ── Folders, tags, People, Companies (electron/services/organise) ──────────
+export type OrganiseRuleKind = 'title' | 'attendee' | 'mode'
+export interface OrganiseFolder {
+  id: string
+  name: string
+  position: number
+  meetingCount: number
+  rules: Array<{ kind: OrganiseRuleKind; value: string }>
+  /** When "Apply to past meetings" was offered for the current rules; null while still open. */
+  pastOfferedAt: number | null
+}
+export interface OrganiseTag { id: number; name: string; meetingCount: number }
+export interface OrganiseMeetingRow { id: string; title: string; date: string; duration: string; summary: string; summaryStatus?: string }
+export interface OrganisePerson {
+  id: string
+  name: string
+  email: string | null
+  title: string | null
+  company: string | null
+  companyDomain: string | null
+  meetingCount: number
+  lastMetAt: string | null
+}
+export interface OrganiseMeetingRef { id: string; title: string; date: string; startMs: number }
+export interface OrganiseActionItem { text: string; owner?: string; deadline?: string; meetingId: string; meetingTitle: string; date: string }
+export interface OrganiseFact {
+  id: number
+  kind: 'title' | 'company'
+  value: string
+  quote: string
+  status: 'suggested' | 'accepted' | 'dismissed'
+  meetingId: string
+  meetingTitle: string
+}
+export interface OrganisePersonDetail extends OrganisePerson {
+  notes: string | null
+  titleSource: string | null
+  companySource: string | null
+  meetings: OrganiseMeetingRef[]
+  openActionItems: OrganiseActionItem[]
+  lastMet: { meetingId: string; title: string; date: string; recap: string } | null
+  suggestions: OrganiseFact[]
+}
+export interface OrganiseCompany { domain: string; name: string; peopleCount: number; meetingCount: number; lastMetAt: string | null }
+export interface OrganiseCompanyDetail extends OrganiseCompany {
+  description: string | null
+  descriptionSource: string | null
+  notes: string | null
+  people: OrganisePerson[]
+  meetings: OrganiseMeetingRef[]
+  openActionItems: OrganiseActionItem[]
+}
+export interface OrganiseApi {
+  /** Older meetings were indexed in the background; refresh People / Companies. Returns the unsubscribe. */
+  onPeopleIndexed?: (callback: () => void) => () => void
+  listFolders: () => Promise<OrganiseFolder[]>
+  createFolder: (name: string) => Promise<OrganiseFolder | null>
+  renameFolder: (id: string, name: string) => Promise<boolean>
+  deleteFolder: (id: string) => Promise<boolean>
+  setFolderRules: (id: string, rules: Array<{ kind: OrganiseRuleKind; value: string }>) => Promise<{ saved: Array<{ kind: OrganiseRuleKind; value: string }>; offerPast: boolean } | null>
+  applyFolderRulesToPast: (id: string) => Promise<{ added: number }>
+  dismissPastOffer: (id: string) => Promise<boolean>
+  getMeeting: (meetingId: string) => Promise<{ folderIds: string[]; tags: string[] }>
+  setMeetingFolder: (meetingId: string, folderId: string, inFolder: boolean) => Promise<boolean>
+  setMeetingTags: (meetingId: string, tags: string[]) => Promise<string[] | null>
+  listMeetings: (filter: { folderId?: string; tag?: string }) => Promise<OrganiseMeetingRow[]>
+  listTags: () => Promise<OrganiseTag[]>
+  listPeople: (query?: string) => Promise<OrganisePerson[]>
+  getPerson: (id: string) => Promise<OrganisePersonDetail | null>
+  updatePerson: (id: string, patch: { name?: string; title?: string; company?: string; notes?: string }) => Promise<boolean>
+  resolveFact: (factId: number, accept: boolean) => Promise<boolean>
+  listCompanies: (query?: string) => Promise<OrganiseCompany[]>
+  getCompany: (domain: string) => Promise<OrganiseCompanyDetail | null>
+  updateCompany: (domain: string, patch: { name?: string; description?: string; descriptionSource?: 'user' | 'drafted'; notes?: string }) => Promise<boolean>
+  draftCompanyDescription: (domain: string) => Promise<{ text: string | null; reason?: 'no-notes' | 'not-enough' | 'failed' | 'not-allowed' }>
 }
 
 declare global {

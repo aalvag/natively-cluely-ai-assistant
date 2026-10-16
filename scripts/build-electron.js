@@ -59,8 +59,37 @@ const coreSmokePremiumExternalPlugin = {
   },
 };
 
+// Calendar sync's Google client secret is baked in here rather than committed:
+// see scripts/lib/calendar-client-secret.cjs. Empty when unset, which leaves
+// calendar sync unable to connect; scripts/package-app.js refuses to package an
+// installer from such a build.
+const {
+  BAKED_EXPRESSION: CALENDAR_SECRET_EXPRESSION,
+  ENV_NAME: CALENDAR_SECRET_ENV,
+  resolveCalendarClientSecret,
+} = require('./lib/calendar-client-secret.cjs');
+const calendarClientSecret = resolveCalendarClientSecret(rootDir);
+if (!calendarClientSecret) {
+  console.warn(`[build-electron] ${CALENDAR_SECRET_ENV} is not set (env or .env): calendar sync will not connect in this build.`);
+}
+
+// Outlook calendar's Microsoft app registration (a public client: an ID, no
+// secret), baked in the same way. Not a secret, so it may also live in .env.
+// Empty leaves the Outlook row in Settings disabled with a one-line note; see
+// docs/microsoft-calendar-setup.md.
+const { resolveMicrosoftCalendarConfig, MICROSOFT_ID_EXPRESSION, MICROSOFT_TENANT_EXPRESSION } = require('./lib/microsoft-calendar-client.cjs');
+const microsoftCalendar = resolveMicrosoftCalendarConfig(rootDir);
+if (!microsoftCalendar.clientId) {
+  console.warn('[build-electron] MICROSOFT_CALENDAR_CLIENT_ID is not set (env or .env): the Outlook calendar row will be disabled in this build.');
+}
+
 const buildOptions = {
   entryPoints,
+  define: {
+    [CALENDAR_SECRET_EXPRESSION]: JSON.stringify(calendarClientSecret),
+    [MICROSOFT_ID_EXPRESSION]: JSON.stringify(microsoftCalendar.clientId),
+    [MICROSOFT_TENANT_EXPRESSION]: JSON.stringify(microsoftCalendar.tenant),
+  },
   bundle: true,           // resolve all static + dynamic imports so postProcessor
                          // is inlined and the path rewrite works (vs bundle:false
                          // which copies files as-is and leaves unresolved relative paths)
@@ -108,6 +137,16 @@ const buildOptions = {
     'pdfjs-dist',
     'pdf-parse',
     'mammoth',
+    // sharp 0.35 requires its prebuilt binding through STATIC paths
+    // (`require('./lib/sharp-darwin-arm64-<version>.node')` inside each
+    // @img/sharp-<platform> package) so that bundlers can follow them. esbuild
+    // does follow them and stops with "No loader is configured for .node
+    // files". Up to 0.34 the binding was reached through a template-string
+    // require esbuild could not resolve, so sharp's JavaScript was inlined and
+    // the binding was still found in node_modules at runtime. Externalizing
+    // keeps the same runtime lookup: sharp and @img/** are shipped in
+    // node_modules and listed in build.asarUnpack.
+    'sharp',
   ],
   sourcemap: true,
   jsx: 'automatic',

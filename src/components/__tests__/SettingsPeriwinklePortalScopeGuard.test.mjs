@@ -40,6 +40,8 @@ const REPO_ROOT = resolve(__dirname, '../../..');
 const GUARDED_FILES = [
   'src/components/SettingsOverlay.tsx',
   'src/components/settings/AIProvidersSettings.tsx',
+  'src/components/settings/CalendarSettings.tsx',
+  'src/components/settings/ConnectionsSettings.tsx',
   'src/components/settings/EmbeddingSettings.tsx',
   'src/components/settings/HelpSettings.tsx',
   'src/components/settings/help/HelpGraphics.tsx',
@@ -55,10 +57,12 @@ const GUARDED_FILES = [
   'src/components/settings/ProviderPerformanceSettings.tsx',
   'src/components/settings/RerankerSettings.tsx',
   'src/components/settings/RetrievalSettings.tsx',
+  'src/components/settings/RoomSpeakersSettings.tsx',
   'src/components/settings/SettingsRow.tsx',
   'src/components/settings/SettingsToggle.tsx',
   'src/components/settings/Sidebar.tsx', // dead code (unused, zero imports) — covered in case it's ever revived
   'src/components/settings/SkillsSettings.tsx',
+  'src/components/settings/SpeechDictionarySettings.tsx',
   'src/components/LocalWhisperModelPanel.tsx',
   'src/components/ProfileIntelligenceSettings.tsx',
   'src/components/ui/AccordionSection.tsx', // shared disclosure primitive used by several guarded files above

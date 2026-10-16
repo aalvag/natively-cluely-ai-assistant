@@ -13,7 +13,7 @@
  *     stayed false — and the countdown banner never appeared either.
  *
  * Source-level (`node --test`, no JSX renderer in this repo — see
- * TrialPromoToaster.test.mjs for the same constraint). The main-process half of
+ * FreeTrialModal.test.mjs for the same constraint). The main-process half of
  * this fix is executed for real in
  * electron/services/__tests__/TrialActivationRuntimeSync2026_09_25.test.mjs.
  *
@@ -140,7 +140,8 @@ describe('A trial claimed mid-session reaches App without a relaunch', () => {
   test('the status poll starts for a mid-session trial, and only once', () => {
     const handler = handlerBody('onTrialStarted?.(');
     assert.ok(
-      /if\s*\(!trialPollId\)/.test(handler),
+      // (`ownsTrialClock &&`: only the launcher keeps the trial clock, toaster policy §7.5.)
+      /if\s*\((?:ownsTrialClock && )?!trialPollId\)/.test(handler),
       'the poll must be guarded — a second interval would be the only thing watching for expiry, twice',
     );
     assert.ok(handler.includes('setInterval(checkTrial'), 'a trial started mid-session must poll for its own expiry');

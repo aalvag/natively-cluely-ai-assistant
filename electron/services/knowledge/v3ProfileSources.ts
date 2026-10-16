@@ -40,37 +40,46 @@ function canonicalProfileSourceId(kind: 'resume' | 'jd' | 'fact'): string {
   return `psrc_${crypto.createHash('sha1').update(`__profile_okf__:${kind}`).digest('hex').slice(0, 16)}`;
 }
 
-/**
- * DERIVED profile facts (2026-08-02) — currently the résumé-based salary
- * estimate SalaryIntelligenceEngine computes on every résumé ingest.
+/*
+ * NO DERIVED PROFILE FACTS (2026-09-30).
  *
- * Why this closes a real hole: the planner emits PROFILE_FACT for questions
- * like "what is my expected salary", but the pool behind it was hardcoded
- * empty, so the turn resolved to zero evidence and answered
- * DOCUMENT_FACT_NOT_FOUND — about a number the app had already calculated and
- * written to its own log. The résumé genuinely does not state an expected
- * salary, so RESUME can never answer it; a derived fact is the correct source.
+ * From 2026-08-02 this module served the résumé-based salary ESTIMATE
+ * (SalaryIntelligenceEngine) as a PROFILE_FACT source, so "what is my expected
+ * salary" had evidence. That was the wrong fix for a real gap: the figure is a
+ * model's MARKET estimate for the role and location, not the candidate's
+ * expectation, and PROFILE_FACT is an authoritative source for claims about the
+ * user (source-authority-policy USER_* claims). Served there, an LLM guess was
+ * spoken in the first person as the user's own number — and it could be the
+ * previous résumé's guess, because the estimate cache is unkeyed.
  *
- * Best-effort and additive: any failure yields no fact source, exactly as
- * before. Never throws into a live answer.
+ * PROFILE_FACT is reserved for facts the user stated or verified. Since
+ * 2026-10-14 it has a store: "Cue Cards" in Profile Intelligence
+ * (ownAnswers.ts, OwnAnswersStore.ts), where the user writes or approves what
+ * they say about themselves. Only those answers are served here; a draft
+ * Natively wrote and the user has not approved never is. With none saved the
+ * pool is empty and a salary-expectation question is answered as unstated,
+ * which it is.
  */
-function collectDerivedFacts(orchestrator: unknown): { structured: Record<string, unknown>; versionId: string } | null {
-  try {
-    const getEstimate = (orchestrator as { getResumeSalaryEstimate?: () => unknown })?.getResumeSalaryEstimate;
-    if (typeof getEstimate !== 'function') return null;
-    const estimate = getEstimate.call(orchestrator) as Record<string, unknown> | null;
-    if (!estimate || typeof estimate !== 'object') return null;
-    if (typeof estimate.min !== 'number' || typeof estimate.max !== 'number') return null;
 
-    const structured = { salary_estimate: estimate };
-    // Version on the CONTENT of the estimate, not on wall-clock: re-deriving the
-    // same band must not invalidate evidence mid-conversation, while a genuinely
-    // new estimate (new résumé, new role) must.
-    const versionId = crypto.createHash('sha1')
-      .update(JSON.stringify([estimate.currency, estimate.min, estimate.max, estimate.confidence, estimate.role, estimate.location]))
-      .digest('hex').slice(0, 16);
-    return { structured, versionId };
-  } catch { return null; }
+/** The user's own saved answers as one profile document, or null when there are none. */
+function ownAnswersDoc(): ProfileDocLike | null {
+  try {
+    const { listOwnAnswers } = require('./OwnAnswersStore') as typeof import('./OwnAnswersStore');
+    const { servedOwnAnswers } = require('./ownAnswers') as typeof import('./ownAnswers');
+    const answers = servedOwnAnswers(listOwnAnswers());
+    if (answers.length === 0) return null;
+    return {
+      kind: 'fact',
+      sourceId: canonicalProfileSourceId('fact'),
+      // The content hash: an edited answer is a new version, so the next turn reads the new words.
+      versionId: crypto.createHash('sha1').update(JSON.stringify(answers)).digest('hex').slice(0, 16),
+      fileName: 'Your own answers (Profile Intelligence)',
+      structured: { ownAnswers: answers },
+    };
+  } catch (err) {
+    try { console.warn('[V3] own answers unavailable this turn:', (err as Error)?.message ?? err); } catch { /* noop */ }
+    return null;
+  }
 }
 
 export interface CollectedProfileSources {
@@ -116,6 +125,8 @@ export function collectV3ProfileSources(orchestrator: unknown): CollectedProfile
           title: String(c.title ?? ''),
           body: String(c.body ?? ''),
           approvalStatus: typeof c.approvalStatus === 'string' ? c.approvalStatus : undefined,
+          // Provenance travels so the port can refuse model-composed AOT cards.
+          generatedFrom: typeof c.generatedFrom === 'string' ? c.generatedFrom : undefined,
         }));
       resumeCards = toCards(builder.getProfilePack('resume'));
       jdCards = toCards(builder.getProfilePack('jd'));
@@ -150,22 +161,10 @@ export function collectV3ProfileSources(orchestrator: unknown): CollectedProfile
       });
       resolved.push({ role: 'profile_job_description', id });
     }
-
-    // DERIVED facts last: they are the lowest-precedence pool, and a document
-    // that actually STATES a fact must always outrank a computed one.
-    const facts = collectDerivedFacts(orchestrator);
-    if (facts) {
-      const id = canonicalProfileSourceId('fact');
-      docs.push({
-        kind: 'fact',
-        sourceId: id,
-        versionId: facts.versionId,
-        fileName: 'Derived profile facts (Profile Intelligence)',
-        structured: facts.structured,
-        cards: [],
-        rawText: null,
-      });
-      resolved.push({ role: 'profile_fact', id });
+    const own = ownAnswersDoc();
+    if (own) {
+      docs.push(own);
+      resolved.push({ role: 'profile_fact', id: own.sourceId });
     }
 
     return {
@@ -173,14 +172,9 @@ export function collectV3ProfileSources(orchestrator: unknown): CollectedProfile
       counts: {
         profileResume: ctx.activeResume ? 1 : 0,
         profileJd: ctx.activeJD ? 1 : 0,
-        // DERIVED facts only (2026-08-02). profile_custom_notes still has no
-        // production accessor (orphaned v13→14 table), so USER_MOTIVATION —
-        // where RESUME is PROHIBITED — remains structurally unsupported and is
-        // correctly disclosed as unstated. What changed is that PROFILE_FACT is
-        // no longer unconditionally empty: the salary estimate the app already
-        // computes is now reachable, instead of the planner asking for a source
-        // that could never resolve.
-        profileFact: facts ? 1 : 0,
+        // Only what the user wrote or approved (see the note above). No derived
+        // fact is served: a salary ESTIMATE is not a profile fact.
+        profileFact: own ? 1 : 0,
       },
       resolved,
     };
@@ -243,6 +237,14 @@ export function buildProfileRawRetriever(
       forceDocumentGrounding: true, ...(meetingActive === undefined ? {} : { meetingActive }),
       // The mode port forwards these (2026-09-10, after a measured 13.5 s stall); this binding did not.
       ...(typeof o.timeoutMs === 'number' ? { timeoutMs: o.timeoutMs, queryEmbedRetryBudgetMs: o.timeoutMs } : {}),
+      // Unlike the mode port, this arm IS raced at the plan's timeout (the
+      // profile port's semantic-arm deadline), so a rerank whose own budget is
+      // longer can never be waited for. Without the deadline it started anyway
+      // and took the arm down with it: live 2026-09-27 (looking for work),
+      // "semantic arm exceeded 1200 ms" on 19 of 19 turns — every answer paid
+      // 1.2 s and got BM25 only. With it, the retriever skips a rerank that
+      // cannot fit and returns its first-stage ranking inside the budget.
+      ...(typeof o.timeoutMs === 'number' ? { rerankDeadlineMs: o.timeoutMs } : {}),
     });
     const out: Array<{ sourceId: string; text: string; chunkIndex: number; score: number }> = [];
     for (const c of res?.chunks ?? []) {

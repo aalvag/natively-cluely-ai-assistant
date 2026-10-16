@@ -44,12 +44,15 @@ import { Worker } from 'worker_threads';
 import { resampleToF32 } from './whisper/audioResampler';
 import { VadProcessor } from './whisper/vadProcessor';
 import { filterHallucination } from './whisper/hallucinationFilter';
-import { configureTransformersCache } from './whisper/modelManager';
+import { configureTransformersCache, getModelSizeMb, purgeCorruptModel } from './whisper/modelManager';
 import { clearLoadSentinel, modelPreloader, writeLoadSentinel } from './whisper/modelPreloader';
 import { buildWorkerInitMessage } from './whisper/inferenceConfig';
 import { resolveWhisperWorkerPath } from './whisper/workerPathResolver';
-import type { WorkerOutMessage } from './whisper/types';
-import { acquireOnnxSlotWithin, hasEnoughMemoryForOnnxSession, getMinFreeGBForOnnxSession } from '../utils/onnxThreadConfig';
+import type { WhisperModelId, WorkerOutMessage } from './whisper/types';
+import { acquireOnnxSlotWithin, hasEnoughMemoryForModelSize, getMinFreeGBForModelSize } from '../utils/onnxThreadConfig';
+import { retireOnnxWorker, trackOnnxWorker } from '../utils/onnxWorkerShutdown';
+import { classifyLocalModelLoadFailure, describeLocalModelLoadFailure } from './whisper/loadFailure';
+import { listMissingVcRuntimeDlls, resolveOnnxBindingDir } from './whisper/windowsVcRuntime';
 
 /**
  * Cold-start deadline for the local model worker's `ready`. Live-reproduced
@@ -91,10 +94,10 @@ function markLocalSttUnavailable(err: unknown): Error {
  * LocalWhisperSpawnFailTeardown2026_07_10) and must NOT contain "unavailable",
  * which sttErrorMapper titles "Service Unavailable ... Trying to reconnect".
  */
-function localSttMemoryRefusal(): Error {
+function localSttMemoryRefusal(modelSizeMb: number | undefined): Error {
     const heapGB = (process.memoryUsage().heapUsed / 1024 ** 3).toFixed(1);
     return markLocalSttUnavailable(new Error(
-        `Local STT could not start: insufficient available memory (under ${getMinFreeGBForOnnxSession()}GB free, app heap ${heapGB}GB). ` +
+        `Local STT could not start: insufficient available memory (under ${getMinFreeGBForModelSize(modelSizeMb)}GB free, app heap ${heapGB}GB). ` +
         `Close other apps to free memory, choose a smaller local model, or use a cloud STT provider.`,
     ));
 }
@@ -153,6 +156,12 @@ export class LocalWhisperSTT extends EventEmitter {
     // stop() (or after a restart) must neither spawn an orphan worker nor
     // tear down the NEXT session with its stale rejection.
     private spawnGeneration = 0;
+    // spawnWorker() calls that have not settled yet. While one is pending the
+    // worker may not exist at all (waiting for a download, an ONNX slot, or —
+    // Nemotron — the whole shared-worker load), and speech that closes in that
+    // window has to be QUEUED, not dropped. A counter, not a flag: a stop()
+    // followed by a start() overlaps the old spawn with the new one.
+    private spawnsInFlight = 0;
     private workerSlowLoadTimer: NodeJS.Timeout | null = null;
     private workerSpawnedAt = 0;
     private vad: VadProcessor | null = null;
@@ -167,6 +176,8 @@ export class LocalWhisperSTT extends EventEmitter {
     private workerReady = false;
     private isDrainingFinals = false;
     private drainingFinalsInFlight = 0;
+    /** Final (non-streaming) transcribe tasks posted and not yet answered, whatever the answer. */
+    private finalTasksOutstanding = 0;
     // Pending audio waiting for the worker to become ready. Always finals —
     // streaming partials are never queued (they're best-effort and only fire
     // while a segment is open AND the worker is ready).
@@ -181,6 +192,7 @@ export class LocalWhisperSTT extends EventEmitter {
     // buffer every tick, as before.
     private nemotronSentSamples = 0;
     private readonly isNemotronModel: boolean;
+    private readonly isParakeetModel: boolean;
 
     // Dual-channel Nemotron only. The channel identity this instance
     // registered with the shared worker (see
@@ -231,10 +243,6 @@ export class LocalWhisperSTT extends EventEmitter {
     // stops sending audio before VAD's hangover completes.
     private gapFlushTimer: ReturnType<typeof setTimeout> | null = null;
     private static readonly GAP_FLUSH_MS = 400;
-    // 5s grace timer for the previous worker to finish in-flight transcribes
-    // before we terminate it. Tracked so rapid stop/start cycles or app quit
-    // don't pin the event loop with stale termination timers.
-    private workerTerminateTimer: ReturnType<typeof setTimeout> | null = null;
     /** F-205: bounds the "keep the worker alive to drain finals" path in
      *  stop(). Every other release path is worker-reply-driven, so a worker
      *  that never replies (hung ONNX inference) would otherwise leak both the
@@ -287,6 +295,7 @@ export class LocalWhisperSTT extends EventEmitter {
         super();
         this.modelId = modelId;
         this.isNemotronModel = LocalWhisperSTT.isNemotronModelId(modelId);
+        this.isParakeetModel = LocalWhisperSTT.isParakeetModelId(modelId);
         configureTransformersCache();
 
         // Tune the streaming loop for this specific model's characteristics.
@@ -306,6 +315,10 @@ export class LocalWhisperSTT extends EventEmitter {
 
     private static isNemotronModelId(modelId: string): boolean {
         return modelId.toLowerCase().includes('nemotron');
+    }
+
+    private static isParakeetModelId(modelId: string): boolean {
+        return modelId.toLowerCase().includes('parakeet');
     }
 
     /**
@@ -354,6 +367,9 @@ export class LocalWhisperSTT extends EventEmitter {
             // so a faster poll costs nothing.
             return { intervalMs: 280, minAudioMs: 560, skipAgreement: true };
         }
+        if (LocalWhisperSTT.isParakeetModelId(modelId)) {
+            return { intervalMs: 500, minAudioMs: 400, skipAgreement: true };
+        }
         const isTiny = (modelId || '').toLowerCase().includes('tiny');
         if (isTiny) {
             return { intervalMs: 400, minAudioMs: 250, skipAgreement: true };
@@ -366,6 +382,7 @@ export class LocalWhisperSTT extends EventEmitter {
     setRecognitionLanguage(key: string): void {
         this.language = key || 'auto';
         if (this.isNemotronModel) this.resolveAndApplyNemotronLanguage();
+        if (this.isParakeetModel) this.resolveAndApplyParakeetLanguage();
     }
     setCredentials(_credPath: string): void {}
 
@@ -480,13 +497,39 @@ export class LocalWhisperSTT extends EventEmitter {
         this.nemotronLangIdSentToWorker = this.nemotronLangId;
     }
 
+    private resolveAndApplyParakeetLanguage(): void {
+        const attemptedKey = this.language;
+        if (!attemptedKey || attemptedKey === 'auto') return;
+        const { RECOGNITION_LANGUAGES } = require('../config/languages');
+        const entry = RECOGNITION_LANGUAGES[attemptedKey];
+        const iso = entry?.iso639 || attemptedKey.split('-')[0].toLowerCase();
+        const { PARAKEET_TDT_SUPPORTED_ISO639 } = require('./whisper/modelLanguageSupport');
+        if (!PARAKEET_TDT_SUPPORTED_ISO639.has(iso)) {
+            setImmediate(() => {
+                this.emit('error', new Error(
+                    `Parakeet STT: recognition language "${attemptedKey}"` +
+                    (iso ? ` (${iso})` : '') +
+                    ' is not in the 25 supported European languages — keeping "auto" multilingual detection rather than an unsupported language.',
+                ));
+            });
+            this.language = 'auto';
+            return;
+        }
+        if (this.worker && this.workerReady) {
+            this.worker.postMessage({ type: 'setLanguage', language: this.language, channelId: this.channelLabel || 'default' });
+        }
+    }
+
     start(): void {
         if (this.isActive) return;
         this.isDrainingFinals = false;
         this.drainingFinalsInFlight = 0;
         this.isActive = true;
         this.vad = new VadProcessor();
-        this.spawnWorker().catch((err) => {
+        this.spawnsInFlight++;
+        this.spawnWorker().finally(() => {
+            this.spawnsInFlight = Math.max(0, this.spawnsInFlight - 1);
+        }).catch((err) => {
             // Gate refusal or worker spawn failure (e.g. insufficient memory for
             // the ONNX session). There is NO retry path, so we must NOT leave a
             // live streaming loop + VAD churning with worker=null — that silently
@@ -504,6 +547,8 @@ export class LocalWhisperSTT extends EventEmitter {
             this.vad = null;
             this.isActive = false;
             this.workerReady = false;
+            // Speech queued while the spawn was pending has nowhere to go.
+            this.pendingAudio = [];
             this.emit('error', err instanceof Error ? err : new Error(String(err)));
         });
         this.startStreamingLoop();
@@ -570,6 +615,13 @@ export class LocalWhisperSTT extends EventEmitter {
                 return;
             }
             this.beginWorkerTermination(w);
+        } else {
+            // Stopped before a worker ever existed (still waiting on a
+            // download, a slot or the shared load). Nothing will transcribe
+            // what was queued, and left in place it would be replayed into
+            // the NEXT meeting's first segment.
+            this.pendingAudio = [];
+            this.isDrainingFinals = false;
         }
     }
 
@@ -620,6 +672,15 @@ export class LocalWhisperSTT extends EventEmitter {
      * seconds a local model needs, instead of the short grace it gives a
      * channel with nothing pending.
      */
+    /**
+     * A final is queued for a loading worker or being transcribed: a result
+     * (possibly empty, which emits nothing) is still to come. Read by
+     * dictation's last-words wait only.
+     */
+    hasPendingWork(): boolean {
+        return this.isActive && (this.pendingAudio.length > 0 || this.finalTasksOutstanding > 0);
+    }
+
     finalize(): boolean {
         if (!this.isActive || !this.vad) return false;
         const segs = this.vad.flush();
@@ -973,7 +1034,11 @@ export class LocalWhisperSTT extends EventEmitter {
     /* ──────────────── Final segment dispatch ──────────────── */
 
     private dispatchFinal(audio: Float32Array): void {
-        if (!this.worker) return;
+        // No worker and none on its way: the instance is torn down.
+        // No worker YET (a spawn is pending) falls through to the queue below
+        // — returning here used to throw away everything said while a model
+        // was still loading, which for Nemotron is the entire shared load.
+        if (!this.worker && this.spawnsInFlight === 0) return;
 
         // A final pass closes the streaming window — clear agreement state so
         // the next segment starts clean.
@@ -1000,7 +1065,7 @@ export class LocalWhisperSTT extends EventEmitter {
             this.nemotronSentSamples = 0;
         }
 
-        if (!this.workerReady) {
+        if (!this.worker || !this.workerReady) {
             const MAX_PENDING = 500;
             const item = { audio: outgoing.slice(), nemotronReset };
             if (this.pendingAudio.length < MAX_PENDING) {
@@ -1029,6 +1094,7 @@ export class LocalWhisperSTT extends EventEmitter {
     private sendTranscribe(audio: Float32Array, streaming: boolean, nemotronReset: boolean = false): void {
         if (!this.worker) return;
         const taskId = `${streaming ? 's' : 't'}${++this.taskCounter}`;
+        if (!streaming) this.finalTasksOutstanding++;
         const copy = audio.slice();
         this.worker.postMessage(
             { type: 'transcribe', taskId, audio: copy, language: this.language, streaming, nemotronReset, channelId: this.nemotronChannelId }
@@ -1037,7 +1103,128 @@ export class LocalWhisperSTT extends EventEmitter {
 
     /* ──────────────── Worker lifecycle ──────────────── */
 
+    /**
+     * A promise for this model's download when it is not on disk yet, else null.
+     *
+     * LocalModelDownloadService is the ONE thing that downloads a model. This
+     * instance used to start a second download of its own whenever a meeting
+     * began before the first had finished — two workers writing the same files
+     * (see ensureDownloaded for what that destroyed). It now joins the
+     * download in flight, or starts it through the service, and waits.
+     *
+     * Speech that closes during the wait is queued (dispatchFinal) and
+     * transcribed once the model is up. The wait is bounded by PROGRESS, not
+     * by size: a slow download that keeps moving is fine, one that has stalled
+     * for the whole ready deadline fails the channel visibly. The download
+     * itself is left running either way — the next meeting will have it.
+     *
+     * Returns null (and changes nothing) when the model is already installed,
+     * or when there is no registered download provider in this context, in
+     * which case the worker fetches what it needs itself, as it always did.
+     */
+    private pendingModelDownload(generation: number): Promise<void> | null {
+        let service: any;
+        let providerName: string;
+        try {
+            const mod = require('../services/LocalModelDownloadService');
+            service = mod.LocalModelDownloadService.getInstance();
+            providerName = mod.resolveLocalModelProviderName(this.modelId);
+        } catch {
+            return null;
+        }
+        if (!service?.hasProvider?.(providerName)) return null;
+        if (service.isModelReady(providerName, this.modelId)) return null;
+
+        const label = this.channelLabel || 'stt';
+        console.log(`[LocalWhisperSTT/${label}] ${this.modelId} is not downloaded yet — waiting for its download before starting`);
+        // A wait that outlives its session must neither fail the NEXT session
+        // nor surface an error on a stopped one.
+        const abandoned = () => generation !== this.spawnGeneration || !this.isActive;
+        return new Promise<void>((resolve, reject) => {
+            let lastProgress = 0;
+            let settled = false;
+            let stallTimer: NodeJS.Timeout | null = null;
+            const finish = (fn: () => void) => {
+                if (settled) return;
+                settled = true;
+                if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+                fn();
+            };
+            const armStall = () => {
+                if (stallTimer) clearTimeout(stallTimer);
+                stallTimer = setTimeout(() => finish(() => {
+                    if (abandoned()) { resolve(); return; }
+                    reject(markLocalSttUnavailable(new Error(
+                        `Local STT model ${this.modelId} is still downloading (${lastProgress}%) and has made no progress for ` +
+                        `${Math.round(WORKER_READY_TIMEOUT_MS / 1000)}s — nothing on the ${label} channel was transcribed. ` +
+                        `Check the internet connection, or choose a cloud STT provider for this meeting.`,
+                    )));
+                }), WORKER_READY_TIMEOUT_MS);
+                (stallTimer as any).unref?.();
+            };
+            armStall();
+            service.ensureDownloaded(providerName, this.modelId, {
+                // Any progress event means bytes arrived (the worker sends one
+                // every few seconds while they do), even when the whole-number
+                // percentage has not moved: a 3 GB model is ~30 MB per step.
+                onProgress: (pct: number) => {
+                    lastProgress = pct;
+                    armStall();
+                },
+                shouldAbandon: abandoned,
+            }).then(
+                () => finish(resolve),
+                (err: unknown) => finish(() => {
+                    if (abandoned()) { resolve(); return; }
+                    reject(markLocalSttUnavailable(err instanceof Error ? err : new Error(String(err))));
+                }),
+            );
+        });
+    }
+
+    /**
+     * A model failed to load. Deletes the model ONLY when its own files are
+     * the cause, and returns the error to surface.
+     *
+     * TERMINAL in every case: nothing restarts a LocalWhisperSTT, and each
+     * message tells the user what to do. Emitted as a bare Error this was
+     * filed by main under "retryable" and the overlay read "STT reconnecting"
+     * for the rest of the meeting (reproduced 2026-09-21 with a profile whose
+     * selected model was missing, then purged).
+     */
+    private modelLoadFailure(message: string): Error {
+        const bindingDir = resolveOnnxBindingDir();
+        const ctx = {
+            platform: process.platform,
+            missingWindowsRuntimeDlls: listMissingVcRuntimeDlls({ extraDirs: bindingDir ? [bindingDir] : [] }),
+        };
+        // The files are present but unreadable — a truncated download that the
+        // cache check waved through on `size > 0`. Remove them so the model
+        // stops counting as installed and the next Install really re-fetches.
+        // Every OTHER cause (memory, network, a missing runtime, an
+        // unsupported OS) leaves a good download exactly where it is.
+        let purged = false;
+        if (classifyLocalModelLoadFailure(message, ctx) === 'corrupt-files') {
+            try {
+                purged = purgeCorruptModel(this.modelId as WhisperModelId, message);
+            } catch (e) {
+                console.error('[LocalWhisperSTT] Corrupt-model purge failed:', e);
+            }
+        }
+        return markLocalSttUnavailable(new Error(describeLocalModelLoadFailure(message, { ...ctx, purged })));
+    }
+
     private async spawnWorker(): Promise<void> {
+        const generation = ++this.spawnGeneration;
+        const modelSizeMb = getModelSizeMb(this.modelId);
+
+        const download = this.pendingModelDownload(generation);
+        if (download) {
+            await download;
+            // stop() (or a restart) ran while the model was downloading.
+            if (generation !== this.spawnGeneration || !this.isActive) return;
+        }
+
         if (this.isNemotronModel) {
             // Dual-channel Nemotron: route through the shared-worker registry
             // instead of the warm-preload / cold-spawn / direct acquireOnnxSlot
@@ -1048,24 +1235,53 @@ export class LocalWhisperSTT extends EventEmitter {
             // warm-worker path is also skipped entirely for Nemotron (see
             // modelPreloader.preload's own Nemotron guard) so there is never
             // a warm worker to take here in the first place.
-            if (!hasEnoughMemoryForOnnxSession()) throw localSttMemoryRefusal();
+            if (!hasEnoughMemoryForModelSize(modelSizeMb)) throw localSttMemoryRefusal(modelSizeMb);
             const channelId = this.channelLabel || `nemotron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
             this.nemotronChannelId = channelId;
             const initMsg = buildWorkerInitMessage(this.modelId);
             const workerPath = resolveWhisperWorkerPath();
             console.log(`[LocalWhisperSTT] Acquiring shared Nemotron worker for channel "${channelId}"`);
             writeLoadSentinel(this.modelId);
+            this.workerSpawnedAt = Date.now();
+            const acquiring = acquireSharedNemotronWorker(
+                this.modelId,
+                channelId,
+                initMsg.executionProviders ?? ['cpu'],
+                initMsg.cacheDir,
+                workerPath,
+            );
+            // The same ready deadline every other model has. This path had
+            // none: a shared worker that never reported ready left the channel
+            // silent for the whole meeting with no error at all. The model is
+            // already on disk by now (see pendingModelDownload), so this
+            // bounds the slot wait plus the load, not a download.
+            const LOAD_TIMED_OUT = Symbol('nemotron-load-timed-out');
+            let deadline: NodeJS.Timeout | null = null;
+            const timedOut = new Promise<typeof LOAD_TIMED_OUT>((resolve) => {
+                deadline = setTimeout(() => resolve(LOAD_TIMED_OUT), WORKER_READY_TIMEOUT_MS);
+                (deadline as any).unref?.();
+            });
             let worker: Worker;
             let release: () => void;
             try {
-                ({ worker, release } = await acquireSharedNemotronWorker(
-                    this.modelId,
-                    channelId,
-                    initMsg.executionProviders ?? ['cpu'],
-                    initMsg.cacheDir,
-                    workerPath,
-                ));
+                const outcome = await Promise.race([acquiring, timedOut]);
+                if (outcome === LOAD_TIMED_OUT) {
+                    // The shared worker may still be inside a native session
+                    // load, so it is NOT stopped here. This channel's hold is
+                    // handed back whenever the load does finish.
+                    acquiring.then(({ release: late }) => late(), () => { /* it failed on its own */ });
+                    clearLoadSentinel(this.modelId);
+                    modelPreloader.recordLoadFailure(this.modelId);
+                    if (generation !== this.spawnGeneration || !this.isActive) return;
+                    throw markLocalSttUnavailable(new Error(
+                        `Local STT model ${this.modelId} did not finish loading within ${Math.round(WORKER_READY_TIMEOUT_MS / 1000)}s ` +
+                        `on the ${channelId} channel — nothing from this channel was transcribed. ` +
+                        `Choose a smaller local model or a cloud STT provider.`,
+                    ));
+                }
+                ({ worker, release } = outcome);
             } catch (err: any) {
+                if ((err as any)?.code === LOCAL_STT_UNAVAILABLE_CODE) throw err;
                 // (2026-08-14 code review, two CONFIRMED findings.)
                 //
                 // 1. Clear the crash sentinel on ANY JS-level rejection. The
@@ -1081,6 +1297,8 @@ export class LocalWhisperSTT extends EventEmitter {
                 //    notice, precisely when a user restarts after seeing a
                 //    soft STT failure.
                 clearLoadSentinel(this.modelId);
+                // A stop() that raced the failure: nobody is listening.
+                if (generation !== this.spawnGeneration || !this.isActive) return;
                 // 2. The corrupt-model purge lived only in this instance's
                 //    worker 'message' handler — which is attached AFTER this
                 //    await. A Nemotron init failure travels through the
@@ -1088,30 +1306,32 @@ export class LocalWhisperSTT extends EventEmitter {
                 //    lands HERE instead, so the purge was unreachable: a
                 //    corrupt-but-nonzero download stayed "installed" forever
                 //    (isNemotronModelCached only checks size > 0) and every
-                //    meeting start failed identically. Mirror the
-                //    message-handler path's FULL structure — including the
-                //    symbol-error guard: a macOS-12 dylib symbol failure is
-                //    an environment problem, not corrupt files, and must
-                //    never delete a perfectly good download.
+                //    meeting start failed identically. modelLoadFailure()
+                //    applies the same classification as the message-handler
+                //    path: only damaged files are deleted.
                 const message = err?.message ?? String(err);
                 if (message.includes('Failed to load model')) {
-                    const isOnnxSymbolError = message.includes('Symbol not found')
-                        || message.includes('__ZNSt3__18to_charsEPcS0_d')
-                        || message.includes('libonnxruntime');
-                    if (!isOnnxSymbolError) {
-                        try {
-                            const { isCorruptModelError, purgeCorruptModel } = require('./whisper/modelManager');
-                            if (isCorruptModelError(message)) {
-                                purgeCorruptModel(this.modelId, message);
-                            }
-                        } catch (purgeErr) {
-                            console.error('[LocalWhisperSTT] Corrupt-model purge failed:', purgeErr);
-                        }
-                    }
+                    throw this.modelLoadFailure(message);
                 }
-                throw err;
+                // Slot timeout, a second Nemotron model, a worker that died
+                // mid-join: nothing restarts this instance either.
+                throw markLocalSttUnavailable(err);
+            } finally {
+                if (deadline) clearTimeout(deadline);
             }
             clearLoadSentinel(this.modelId);
+            if (generation !== this.spawnGeneration || !this.isActive) {
+                // stop() ran while the shared worker was loading. Without this
+                // the stopped instance kept its hold on the worker for good —
+                // the registry's refcount never reached zero again.
+                release();
+                return;
+            }
+            console.log(
+                `[LocalWhisperSTT/${channelId}] shared worker ready in ${Date.now() - this.workerSpawnedAt}ms ` +
+                `(${this.pendingAudio.length} queued segment(s) flushing)`,
+            );
+            this.workerSpawnedAt = 0;
             this.worker = worker;
             this.nemotronWorkerRelease = release;
             // acquireSharedNemotronWorker only resolves once THIS channel's
@@ -1141,14 +1361,13 @@ export class LocalWhisperSTT extends EventEmitter {
         // Cold path. Acquire the shared ONNX slot at HIGH priority — Whisper
         // is latency-critical (~750ms real-time streaming) and would deadlock
         // behind a queued embedding batch.
-        if (!hasEnoughMemoryForOnnxSession()) throw localSttMemoryRefusal();
+        if (!hasEnoughMemoryForModelSize(modelSizeMb)) throw localSttMemoryRefusal(modelSizeMb);
 
         // Bounded: an unbounded wait here was a silent dead channel — the local
         // embedding + reranker workers hold the whole default gate (cap 2) for
         // the app lifetime, so this never resolved and nothing was logged.
         // The rejection propagates to start()'s spawnWorker catch, which tears
         // the instance down and emits 'error' so main shows an STT failure.
-        const generation = ++this.spawnGeneration;
         // A preload that is still loading (or warm for a model this channel
         // cannot take) must not hold the slot this LIVE channel needs.
         modelPreloader.yieldUnclaimedWorkerIfStarving();
@@ -1178,7 +1397,7 @@ export class LocalWhisperSTT extends EventEmitter {
         console.log(`[LocalWhisperSTT] Cold-starting worker for ${this.modelId}`);
         const workerPath = resolveWhisperWorkerPath();
         writeLoadSentinel(this.modelId);
-        this.worker = new Worker(workerPath);
+        this.worker = trackOnnxWorker(new Worker(workerPath));
         this.attachWorkerListeners();
         this.worker.postMessage(buildWorkerInitMessage(this.modelId));
         this.armWorkerReadyDeadline();
@@ -1313,6 +1532,7 @@ export class LocalWhisperSTT extends EventEmitter {
                 }
                 this.handleStreamingPartial(msg.text);
             } else if (msg.type === 'result') {
+                if (msg.taskId?.startsWith('t')) this.finalTasksOutstanding = Math.max(0, this.finalTasksOutstanding - 1);
                 const text = filterHallucination(msg.text);
                 if (this.isNemotronModel) {
                     // Distinguishes the three silent outcomes this path had no
@@ -1368,6 +1588,7 @@ export class LocalWhisperSTT extends EventEmitter {
                     this.repeatedWorkerErrorCount = 1;
                     console.error('[LocalWhisperSTT] Worker error:', msg.message);
                 }
+                if (msg.taskId?.startsWith('t')) this.finalTasksOutstanding = Math.max(0, this.finalTasksOutstanding - 1);
                 if (this.isDrainingFinals && msg.taskId?.startsWith('t')) {
                     this.drainingFinalsInFlight = Math.max(0, this.drainingFinalsInFlight - 1);
                     if (this.drainingFinalsInFlight === 0 && this.worker) {
@@ -1388,44 +1609,10 @@ export class LocalWhisperSTT extends EventEmitter {
                     if (this.isNemotronModel) this.nemotronSentSamples = 0;
                 }
                 if (msg.message.includes('Failed to load model')) {
-                    const isOnnxSymbolError = msg.message.includes('Symbol not found')
-                        || msg.message.includes('__ZNSt3__18to_charsEPcS0_d')
-                        || msg.message.includes('libonnxruntime');
-
-                    // The files are present but unreadable — almost always a
-                    // truncated download that isModelCached waved through on its
-                    // `size > 0` check. Remove them so the cache check stops
-                    // reporting the model as installed and the next Install
-                    // actually re-fetches. Without this the state is permanent:
-                    // cached-but-corrupt reads as cached forever.
-                    let purged = false;
-                    if (!isOnnxSymbolError) {
-                        try {
-                            const { isCorruptModelError, purgeCorruptModel } = require('./whisper/modelManager');
-                            if (isCorruptModelError(msg.message)) {
-                                purged = purgeCorruptModel(this.modelId, msg.message);
-                            }
-                        } catch (e) {
-                            console.error('[LocalWhisperSTT] Corrupt-model purge failed:', e);
-                        }
-                    }
-
-                    // TERMINAL, all three: nothing restarts a LocalWhisperSTT, and each
-                    // message tells the user what to do. Emitted as a bare Error this was
-                    // filed by main under "retryable" and the overlay read "STT
-                    // reconnecting" for the rest of the meeting (reproduced 2026-09-21 with
-                    // a profile whose selected model was missing, then purged).
-                    this.emit('error', markLocalSttUnavailable(new Error(
-                        isOnnxSymbolError
-                            ? 'Local Whisper is not supported on macOS 12 (Monterey) or earlier. Please upgrade to macOS 13 Ventura or later, or use a cloud STT provider.'
-                            // The old copy said "model not found" for this case, which was
-                            // wrong twice over: the files were there, and it pointed the
-                            // user at a download that silently no-opped because the model
-                            // still counted as cached.
-                            : purged
-                                ? 'The local model files were incomplete and have been removed. Please reinstall the model in Settings → Audio.'
-                                : 'Local Whisper model not found. Please download a model in Settings → Audio.'
-                    )));
+                    // The load is over; the ready deadline must not fire a
+                    // second, different error two minutes later.
+                    this.clearWorkerReadyDeadline();
+                    this.emit('error', this.modelLoadFailure(msg.message));
                 }
             }
         };
@@ -1575,6 +1762,7 @@ export class LocalWhisperSTT extends EventEmitter {
         this.workerReady = false;
         this.isDrainingFinals = false;
         this.drainingFinalsInFlight = 0;
+        this.finalTasksOutstanding = 0;
         // Free the shared ONNX gate slot on clean shutdown — the session's
         // BFCArena is being torn down with the worker, so the slot can go.
         if (this.slotRelease) { this.slotRelease(); this.slotRelease = null; }
@@ -1608,10 +1796,8 @@ export class LocalWhisperSTT extends EventEmitter {
             if (this.nemotronErrorHandler) { w.off('error', this.nemotronErrorHandler); this.nemotronErrorHandler = null; }
             if (this.nemotronExitHandler) { w.off('exit', this.nemotronExitHandler); this.nemotronExitHandler = null; }
             //
-            // No terminate()-after-a-timer here, unlike the non-Nemotron path
-            // below: release() itself decides synchronously whether the
-            // underlying worker actually terminates (refcount reaches 0) or
-            // just loses this one channel — there's nothing to defer.
+            // release() decides whether the underlying worker is asked to
+            // stop (refcount reaches 0) or just loses this one channel.
             if (this.nemotronWorkerRelease) { this.nemotronWorkerRelease(); this.nemotronWorkerRelease = null; }
             this.nemotronChannelId = null;
             return;
@@ -1624,13 +1810,14 @@ export class LocalWhisperSTT extends EventEmitter {
         this.expectedWorkerExits.add(w);
         w.removeAllListeners('message');
         w.removeAllListeners('error');
-        if (this.workerTerminateTimer) clearTimeout(this.workerTerminateTimer);
-        const t = setTimeout(() => {
-            this.workerTerminateTimer = null;
-            w.terminate();
-        }, 5000);
-        // unref so the timer doesn't pin the Node event loop on app quit.
-        (t as any).unref?.();
-        this.workerTerminateTimer = t;
+        // The worker lives on until it reaches an idle point, and a Worker
+        // 'error' with no listener is an uncaught exception in THIS process.
+        w.on('error', () => { /* already retired — nothing to surface */ });
+        // Cooperative stop, never w.terminate(): this used to wait five
+        // seconds and then terminate, which only narrowed the window. A model
+        // load or an inference that outlasted the timer was killed inside a
+        // native ONNX call, and that aborts the whole app (see
+        // onnxWorkerShutdown.ts — the crash a 2.9.2 user reported).
+        retireOnnxWorker(w);
     }
 }

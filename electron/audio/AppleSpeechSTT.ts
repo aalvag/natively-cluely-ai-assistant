@@ -44,11 +44,17 @@ export interface AppleSpeechLocales {
   maxReserved: number;
 }
 
+// Helper binary basename. MUST match scripts/build-apple-speech.js HELPER_NAME
+// (= disguise-name.cjs darwin value + "-asr"). Stealth is reverted, so the name
+// carries the brand like the rest of the app. Build + runtime are kept in sync
+// by scripts/__tests__/apple-speech-build.test.mjs.
+const APPLE_SPEECH_HELPER = 'Natively-asr';
+
 /** Path to the compiled helper (packaged vs development). */
 export function appleSpeechExecutablePath(): string {
   return app.isPackaged
-    ? path.join(process.resourcesPath, 'apple-speech', 'natively-apple-speech')
-    : path.join(app.getAppPath(), 'resources', 'apple-speech', 'natively-apple-speech');
+    ? path.join(process.resourcesPath, 'apple-speech', APPLE_SPEECH_HELPER)
+    : path.join(app.getAppPath(), 'resources', 'apple-speech', APPLE_SPEECH_HELPER);
 }
 
 const UNAVAILABLE: AppleSpeechLocales = { available: false, supported: [], installed: [], reserved: [], maxReserved: 0 };

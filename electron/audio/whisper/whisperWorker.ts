@@ -16,6 +16,7 @@
  */
 import { parentPort } from 'worker_threads';
 import { WhisperProgressAggregator } from './whisperProgressAggregator';
+import { downloadModelFilesResumable } from './resumableDownload';
 import { getBoundedOnnxSessionOptions } from '../../utils/onnxThreadConfig';
 // Shared language-capability module (also consumed by ipcHandlers for the
 // Settings UI). Replaces two hand-maintained tables that had both drifted:
@@ -30,6 +31,7 @@ import { getBoundedOnnxSessionOptions } from '../../utils/onnxThreadConfig';
 //    (English-only per NVIDIA's model card). isEnglishOnlyLocalModel() is
 //    derived from MODEL_CATALOG's own `multilingual` flag instead.
 import { isEnglishOnlyLocalModel, resolveWhisperLanguage } from './modelLanguageSupport';
+import { moonshineMaxNewTokens } from './moonshineTokenBudget';
 
 let pipe: any = null;
 let loadedModelId = '';
@@ -268,7 +270,53 @@ async function initNemotronChannel(msg: any, channelId: string): Promise<void> {
   }
 }
 
+// ── Dual-channel Parakeet TDT (2026-09-25) ─────────────────────────────
+let parakeetSharedResources: import('./parakeet/parakeetTdtEngine').ParakeetTdtSharedResources | null = null;
+const parakeetChannels = new Map<string, import('./parakeet/parakeetTdtEngine').ParakeetTdtEngine>();
+const parakeetChains = new Map<string, Promise<void>>();
+function getParakeetChain(channelId: string): Promise<void> {
+  return parakeetChains.get(channelId) ?? Promise.resolve();
+}
+function setParakeetChain(channelId: string, p: Promise<void>): void {
+  parakeetChains.set(channelId, p);
+}
+let parakeetInitChain: Promise<void> = Promise.resolve();
+
+async function initParakeetChannel(msg: any, channelId: string): Promise<void> {
+  try {
+    const { ParakeetTdtEngine } = require('./parakeet/parakeetTdtEngine');
+    let engine;
+    if (parakeetSharedResources) {
+      engine = await ParakeetTdtEngine.create(msg.cacheDir, msg.executionProviders ?? ['cpu'], parakeetSharedResources);
+    } else {
+      const { downloadParakeetTdtFiles } = require('./parakeet/downloadFiles');
+      const path = require('path');
+      const modelDir = path.join(msg.cacheDir, ...String(msg.modelId).split('/'));
+      await downloadParakeetTdtFiles(modelDir, (pct: number) => {
+        parentPort!.postMessage({ type: 'progress', modelId: msg.modelId, progress: pct, channelId: msg.channelId });
+      });
+      engine = await ParakeetTdtEngine.create(modelDir, msg.executionProviders ?? ['cpu']);
+      parakeetSharedResources = engine.getSharedResources();
+    }
+    parakeetChannels.set(channelId, engine);
+    loadedModelId = msg.modelId;
+    parentPort!.postMessage({ type: 'ready', channelId: msg.channelId });
+  } catch (e: any) {
+    parentPort!.postMessage({ type: 'error', channelId: msg.channelId, message: `Failed to load model: ${e?.message ?? String(e)}` });
+  }
+}
+
 parentPort.on('message', async (msg: any) => {
+  if (msg.type === 'shutdown') {
+    // Cooperative stop — see electron/utils/onnxWorkerShutdown.ts. The host
+    // never calls worker.terminate() on this worker: doing that while an ONNX
+    // run() or session load is on this thread aborts the whole app. A message
+    // is only delivered when this thread is idle, so no native call is in
+    // flight here, and process.exit() in a worker thread stops this thread
+    // only. Work still queued behind this message is abandoned on purpose —
+    // the host has already stopped listening for it.
+    process.exit(0);
+  }
   if (msg.type === 'init') {
     initWorkerLogger(msg.cacheDir);
     logWorker(`[WhisperWorker] init received for model: ${msg.modelId} (sessionLayout: ${msg.sessionLayout || 'pipeline'})`);
@@ -307,6 +355,13 @@ parentPort.on('message', async (msg: any) => {
       });
       return; // do not fall through to the transformers.js pipeline() path below
     }
+    if (msg.sessionLayout === 'parakeet-tdt') {
+      const channelId: string = msg.channelId || 'default';
+      parakeetInitChain = parakeetInitChain.then(() => initParakeetChannel(msg, channelId)).catch((chainErr) => {
+        console.error('[WhisperWorker] parakeet init chain error (should be unreachable):', chainErr);
+      });
+      return;
+    }
     // Validate required fields BEFORE entering the try/catch so the error
     // surfaces as a structured `error` postMessage rather than an unhandled
     // worker throw (which would leave the host's workerReady stuck false).
@@ -324,11 +379,27 @@ parentPort.on('message', async (msg: any) => {
       }
       env.allowRemoteModels = true;
 
-      // Apply hardware-specific execution providers (CoreML, DirectML, CUDA, CPU)
-      const providers: string[] = msg.executionProviders ?? ['cpu'];
-      if (env.backends?.onnx) {
-        env.backends.onnx.executionProviders = providers;
-      }
+      // This path runs on the CPU, on every platform, and says so.
+      //
+      // It used to set `env.backends.onnx.executionProviders` to the host's
+      // list (['coreml','cpu'] on Apple Silicon, ['dml','cpu'] on Windows) and
+      // log "providers=coreml,cpu". transformers.js 3.x never reads that
+      // field: it derives the providers from the pipeline's `device` option,
+      // which defaults to 'cpu' under Node, and only fills
+      // session_options.executionProviders when it is absent. No `device` was
+      // ever passed, so every Whisper, Distil-Whisper and Moonshine session
+      // has always been CPU — while the log and the Settings copy claimed the
+      // GPU.
+      //
+      // The dead assignment is removed rather than "fixed" by wiring the
+      // accelerator in, because the one measurement there is says not to:
+      // Moonshine Base, M4 MacBook Air, 2026-10-14, 2.46 s clip, median of 3 —
+      //   cpu          load  533ms   infer 174ms
+      //   coreml+cpu   load 1126ms   infer 289ms
+      // (the same direction as the Nemotron and Parakeet numbers in
+      // inferenceConfig.ts). DirectML has never been measured for these models
+      // at all. Turning either on is a change to make with numbers, per model.
+      const providers: string[] = ['cpu'];
       // Per-module dtype: required. @huggingface/transformers v3 no longer
       // honors the v2 `quantized: true` flag — must use `dtype` explicitly.
       const dtype: string | Record<string, string> = msg.dtype;
@@ -336,9 +407,18 @@ parentPort.on('message', async (msg: any) => {
       const dtypeDesc = typeof dtype === 'string'
         ? dtype
         : 'mixed:' + Object.entries(dtype).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join(',');
-      const sessionOptions = getBoundedOnnxSessionOptions();
+      // Whisper and Distil-Whisper get more than one intra-op thread (the host
+      // decides, see OnnxWorkload 'whisper-encode'); every other model keeps
+      // the shared default.
+      const intraOpThreads = Number(msg.intraOpThreads);
+      const sessionOptions = Number.isInteger(intraOpThreads) && intraOpThreads > 0
+        ? { ...getBoundedOnnxSessionOptions(), intraOpNumThreads: intraOpThreads }
+        : getBoundedOnnxSessionOptions();
+      // The files may come from a different repo than the id Settings stores
+      // (see WhisperModelInfo.repoId). Progress and errors still say modelId.
+      const sourceRepoId: string = typeof msg.sourceRepoId === 'string' && msg.sourceRepoId ? msg.sourceRepoId : msg.modelId;
 
-      console.log(`[WhisperWorker] Loading ${msg.modelId} | providers=${providers.join(',')} | dtype=${dtypeDesc}`);
+      console.log(`[WhisperWorker] Loading ${msg.modelId}${sourceRepoId !== msg.modelId ? ` from ${sourceRepoId}` : ''} | providers=${providers.join(',')} | dtype=${dtypeDesc} | threads=${sessionOptions.intraOpNumThreads}`);
 
       // DIAGNOSTICS (2026-06-13): the model files load fine in isolation (raw ORT +
       // transformers, both in system node), yet the live worker can fail with
@@ -348,7 +428,7 @@ parentPort.on('message', async (msg: any) => {
       try {
         const _fs = require('fs');
         const _path = require('path');
-        const _orgName = String(msg.modelId).split('/');
+        const _orgName = String(sourceRepoId).split('/');
         const _modelDir = _path.join(String(msg.cacheDir), _orgName[0] || '', _orgName[1] || '', 'onnx');
         const _encName = typeof dtype === 'string' && dtype !== 'fp32' ? `encoder_model_${dtype}.onnx` : 'encoder_model.onnx';
         const _decName = typeof dtype === 'string' && dtype !== 'fp32' ? `decoder_model_merged_${dtype}.onnx` : 'decoder_model_merged.onnx';
@@ -392,7 +472,32 @@ parentPort.on('message', async (msg: any) => {
       // "filesystem error: in file_size: ... encoder_model.onnx_data".
       const useExternalDataFormat: boolean | Record<string, boolean> | undefined =
         msg.useExternalDataFormat;
-      pipe = await pipeline('automatic-speech-recognition', msg.modelId, {
+      // Not installed yet: fetch the large files with resume first, so a
+      // dropped connection costs the bytes since the drop, not the whole file.
+      // pipeline() then finds them in its cache and fetches only the small ones.
+      const resumableFiles: string[] = Array.isArray(msg.resumableFiles) ? msg.resumableFiles : [];
+      if (resumableFiles.length > 0) {
+        let lastPct = -1;
+        let lastPostAt = 0;
+        await downloadModelFilesResumable({
+          cacheDir: msg.cacheDir,
+          repo: sourceRepoId,
+          files: resumableFiles,
+          onProgress: (event) => {
+            const { pct } = aggregator.update(event);
+            if (pct === null) return;
+            // One message per step, not per network chunk; but also one every
+            // few seconds while bytes keep arriving, so a meeting waiting on a
+            // big model on a slow line (Turbo: ~28 MB per step) sees it moving.
+            const now = Date.now();
+            if (pct === lastPct && now - lastPostAt < 3000) return;
+            lastPct = pct;
+            lastPostAt = now;
+            parentPort!.postMessage({ type: 'progress', modelId: msg.modelId, progress: pct });
+          },
+        });
+      }
+      pipe = await pipeline('automatic-speech-recognition', sourceRepoId, {
         dtype,
         session_options: sessionOptions,
         ...(useExternalDataFormat !== undefined
@@ -447,6 +552,8 @@ parentPort.on('message', async (msg: any) => {
       nemotronChannels.delete(msg.channelId);
       nemotronChains.delete(msg.channelId);
       nemotronSegmentTokens.delete(msg.channelId);
+      parakeetChannels.delete(msg.channelId);
+      parakeetChains.delete(msg.channelId);
     }
     return;
   } else if (msg.type === 'setPrompt') {
@@ -475,6 +582,18 @@ parentPort.on('message', async (msg: any) => {
         // message behind a rejected promise — log and let the chain continue.
         console.error('[WhisperWorker] nemotron chain error (should be unreachable):', chainErr);
       }));
+      return;
+    }
+    const parakeetChannelKey = channelId || 'default';
+    const parakeet = parakeetChannels.get(parakeetChannelKey) ?? (parakeetChannels.size === 1 ? parakeetChannels.values().next().value : undefined);
+    if (parakeet && msg.language && msg.language !== 'auto') {
+      const { RECOGNITION_LANGUAGES } = require('../../config/languages');
+      const langEntry = RECOGNITION_LANGUAGES[msg.language];
+      const iso = langEntry?.iso639 || String(msg.language).split('-')[0].toLowerCase();
+      const { PARAKEET_TDT_SUPPORTED_ISO639 } = require('./modelLanguageSupport');
+      if (iso && !PARAKEET_TDT_SUPPORTED_ISO639.has(iso)) {
+        console.warn(`[WhisperWorker] Parakeet TDT language warning: "${msg.language}" (${iso}) is not in 25 supported European languages`);
+      }
     }
     return;
   } else if (msg.type === 'transcribe') {
@@ -534,6 +653,40 @@ parentPort.on('message', async (msg: any) => {
       }));
       return;
     }
+    const parakeetChannelKey = channelId || 'default';
+    const parakeetEngine = parakeetChannels.get(parakeetChannelKey) ?? (parakeetChannels.size === 1 ? parakeetChannels.values().next().value : undefined);
+    if (parakeetEngine) {
+      setParakeetChain(parakeetChannelKey, getParakeetChain(parakeetChannelKey).then(async () => {
+        try {
+          if (msg.language && msg.language !== 'auto') {
+            const { RECOGNITION_LANGUAGES } = require('../../config/languages');
+            const langEntry = RECOGNITION_LANGUAGES[msg.language];
+            const iso = langEntry?.iso639 || String(msg.language).split('-')[0].toLowerCase();
+            const { PARAKEET_TDT_SUPPORTED_ISO639 } = require('./modelLanguageSupport');
+            if (iso && !PARAKEET_TDT_SUPPORTED_ISO639.has(iso)) {
+              console.warn(`[WhisperWorker] Parakeet TDT does not support language "${msg.language}" (${iso}) — defaulting to European multilingual recognition`);
+            }
+          }
+          const res = await parakeetEngine.transcribe(msg.audio);
+          parentPort!.postMessage({
+            type: msg.streaming ? 'partial' : 'result',
+            taskId: msg.taskId,
+            channelId: msg.channelId,
+            text: res.text,
+          });
+        } catch (e: any) {
+          parentPort!.postMessage({
+            type: 'error',
+            taskId: msg.taskId,
+            channelId: msg.channelId,
+            message: e?.message ?? String(e),
+          });
+        }
+      }).catch((chainErr) => {
+        console.error('[WhisperWorker] parakeet chain error (should be unreachable):', chainErr);
+      }));
+      return;
+    }
     if (!pipe) {
       logWorker(`[WhisperWorker] Error: Model not loaded for transcribe taskId=${msg.taskId}`);
       parentPort!.postMessage({ type: 'error', taskId: msg.taskId, message: 'Model not loaded' });
@@ -580,6 +733,10 @@ parentPort.on('message', async (msg: any) => {
         const rawAudio = msg.audio instanceof Float32Array ? msg.audio : new Float32Array(Object.values(msg.audio));
         const audioInput = new Float32Array(rawAudio.length);
         audioInput.set(rawAudio);
+
+        if (isMoonshineModel(loadedModelId)) {
+          opts.max_new_tokens = moonshineMaxNewTokens(msg.audio?.length ?? 0, 16000);
+        }
 
         const startTime = Date.now();
         const result = await pipe(audioInput, opts);

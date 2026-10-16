@@ -54,8 +54,12 @@ const cjs = require('./lib/nativeArch.cjs');
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // HERE = <repo>/electron  →  REPO_ROOT = <repo>. One `..` is enough.
 const REPO_ROOT = path.resolve(HERE, '..');
-const SHIPPED_ARM64_RESOURCES = path.join(REPO_ROOT, 'release', 'mac-arm64', 'Natively.app', 'Contents', 'Resources');
-const SHIPPED_X64_RESOURCES = path.join(REPO_ROOT, 'release', 'mac', 'Natively.app', 'Contents', 'Resources');
+// The packaged bundle is "Natively.app" (productName = the brand; stealth
+// reverted). Derive it from the single source of truth so this test finds the
+// real shipped artifact instead of silently skipping on a stale path.
+const APP_BUNDLE = `${require('../scripts/disguise-name.cjs').darwin}.app`;
+const SHIPPED_ARM64_RESOURCES = path.join(REPO_ROOT, 'release', 'mac-arm64', APP_BUNDLE, 'Contents', 'Resources');
+const SHIPPED_X64_RESOURCES = path.join(REPO_ROOT, 'release', 'mac', APP_BUNDLE, 'Contents', 'Resources');
 const SHIPPED_RESOURCES = SHIPPED_ARM64_RESOURCES;
 const SHIPPED_SQLITE = path.join(SHIPPED_ARM64_RESOURCES, 'app.asar.unpacked', 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node');
 const SHIPPED_KEYTAR = path.join(SHIPPED_ARM64_RESOURCES, 'app.asar.unpacked', 'node_modules', 'keytar', 'build', 'Release', 'keytar.node');

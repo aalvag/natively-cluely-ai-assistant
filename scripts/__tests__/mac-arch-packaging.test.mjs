@@ -22,7 +22,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { resolveVersions, computeMissing, ensureMacOptionalDeps } = require('../lib/ensure-mac-optional-deps.cjs');
+const { resolveVersions, computeMissing, computeStale, ensureMacOptionalDeps } = require('../lib/ensure-mac-optional-deps.cjs');
 const { verifyPackedArchFamilies } = require('../ad-hoc-sign.js');
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,13 @@ test('computeMissing returns only the not-yet-installed packages', () => {
   const installed = new Set(['a']);
   assert.deepEqual(computeMissing(['a', 'b', 'c'], (n) => installed.has(n)), ['b', 'c']);
   assert.deepEqual(computeMissing(['a'], (n) => installed.has(n)), []);
+});
+
+test('computeStale treats a wrong-version package as not installed (parent upgraded, cross-arch binding left behind)', () => {
+  const versions = { a: '0.35.5', b: '0.35.5', c: '1.3.4' };
+  const onDisk = { a: '0.35.5', b: '0.34.5' }; // b predates the upgrade, c is absent
+  assert.deepEqual(computeStale(['a', 'b', 'c'], versions, (n) => onDisk[n] ?? null), ['b', 'c']);
+  assert.deepEqual(computeStale(['a'], versions, (n) => onDisk[n] ?? null), []);
 });
 
 test('ensureMacOptionalDeps is a no-op on Windows', () => {
@@ -144,6 +151,26 @@ test('a complete x64 pack passes', () => {
 test('the mirror-image bug is caught too: arm64 pack with only the x64 canvas', () => {
   const app = fakePack(['@napi-rs/canvas-darwin-x64']);
   assert.throws(() => guard(app, 'arm64'), /@napi-rs\/canvas-darwin-arm64 MISSING/);
+});
+
+test('an Intel pack with only the Apple-Silicon llama.cpp runtime fails the build', () => {
+  // What an arm64 build host produces on its own: @node-llama-cpp/mac-x64 declares
+  // cpu x64, so npm never installs it there. No GGUF model could load on Intel.
+  const app = fakePack(['@node-llama-cpp/mac-arm64-metal']);
+  assert.throws(() => guard(app, 'x64'), (err) => {
+    assert.match(err.message, /@node-llama-cpp\/mac-x64 MISSING/);
+    assert.match(err.message, /@node-llama-cpp\/mac-arm64-metal IS packed/);
+    return true;
+  });
+});
+
+test('the llama.cpp runtime is matched per arch in both directions', () => {
+  guard(fakePack(['@node-llama-cpp/mac-arm64-metal', '@node-llama-cpp/mac-x64']), 'x64'); // must not throw
+  guard(fakePack(['@node-llama-cpp/mac-arm64-metal']), 'arm64'); // must not throw
+  assert.throws(
+    () => guard(fakePack(['@node-llama-cpp/mac-x64']), 'arm64'),
+    /@node-llama-cpp\/mac-arm64-metal MISSING/
+  );
 });
 
 test('a family absent for BOTH arches is tolerated, not fatal', () => {

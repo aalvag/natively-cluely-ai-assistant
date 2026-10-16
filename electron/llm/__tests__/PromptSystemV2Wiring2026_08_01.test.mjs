@@ -220,7 +220,9 @@ describe('universal coding contract — every surface resolves its signals throu
     // Prompt-only would be undone: with no contract argument
     // validateAnswerStructure force-injects the six sections back into a
     // "code only" answer. Manual chat has always passed it; the live path did not.
-    assert.match(engineSrc, /validateAnswerStructure\(\s*answerPlan\.answerType, fullAnswer, liveExplicitCodingContract,?\s*\)/);
+    // 2026-09-29: plus the coding SHAPE, from the same question the persona's
+    // contract read, so the repair never demands sections the prompt left out.
+    assert.match(engineSrc, /validateAnswerStructure\(\s*answerPlan\.answerType, fullAnswer, liveExplicitCodingContract, liveCodingShape,?\s*\)/);
     // Resolved through the SHARED resolver, not detectExplicitCodingContract
     // directly, so the repair layer stands down on exactly the formats the prompt
     // asked for (the continuation-only ones are gated on a prior coding turn).
@@ -240,7 +242,11 @@ describe('flag + meeting surfaces', () => {
     // The structured-summary prompt is DELIBERATELY untouched: its JSON shape
     // (overview/keyPoints/actionItems + mode note sections) is coupled to the
     // deterministic parser in MeetingPersistence. Guard that it still exists.
-    assert.ok(meetingSrc.includes('"keyPoints": ['), 'summary JSON schema prompt must be preserved');
+    // 2026-10-15: the fallback prompt and its parser moved together into
+    // services/meeting/v2FallbackNotes.ts, which MeetingPersistence calls.
+    const fallbackSrc = read('../../services/meeting/v2FallbackNotes.ts');
+    assert.ok(fallbackSrc.includes('"keyPoints": ['), 'summary JSON schema prompt must be preserved');
+    assert.match(meetingSrc, /buildV2FallbackPrompts\(\{/, 'MeetingPersistence must still build the fallback prompt from it');
   });
 
   test('follow-up email uses the v2 contract with the legacy pair as fallback', () => {

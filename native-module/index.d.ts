@@ -108,6 +108,90 @@ export interface AudioDeviceInfo {
   name: string
 }
 
+/** Where the Calendars permission stands; never prompts. */
+export declare function calendarAuthorizationStatus(): string
+
+export interface CalendarEventInfo {
+  /** EKEvent.eventIdentifier: shared by every occurrence of a series. */
+  eventIdentifier?: string
+  /** calendarItemExternalIdentifier: the invite's iCalendar UID on most accounts. */
+  externalId?: string
+  title?: string
+  startMs: number
+  endMs: number
+  /** EKEvent.occurrenceDate: an occurrence's original start. */
+  occurrenceMs?: number
+  isAllDay: boolean
+  /** EKEventStatus. */
+  status: number
+  hasRecurrence: boolean
+  isDetached: boolean
+  location?: string
+  notes?: string
+  url?: string
+  timeZone?: string
+  organizer?: CalendarParticipant
+  attendees: Array<CalendarParticipant>
+}
+
+export interface CalendarParticipant {
+  name?: string
+  /** The participant's URL, usually "mailto:…". */
+  url?: string
+  /** EKParticipantStatus. */
+  status: number
+  /** EKParticipantType. */
+  kind: number
+  isCurrentUser: boolean
+}
+
+export interface CallTree {
+  /** macOS: the Accessibility permission is granted. Windows: always true. */
+  trusted: boolean
+  /** A bound (nodes, depth, time) cut the walk short. */
+  truncated: boolean
+  windows: Array<CallTreeWindow>
+  elapsedMs: number
+}
+
+export interface CallTreeNode {
+  /** 0 for a window's root. */
+  depth: number
+  /**
+   * macOS AXRole (with ":" + AXSubrole when there is one); Windows the
+   * control type's name ("ListItem", "Button", …).
+   */
+  role: string
+  /** macOS AXTitle; Windows Name. */
+  name: string
+  /** macOS AXDescription; Windows HelpText. */
+  description: string
+  /** macOS AXValue (strings only); Windows ItemStatus. */
+  value: string
+  /**
+   * macOS AXIdentifier, else AXDOMIdentifier (a web view's element id);
+   * Windows AutomationId (a WebView2 element's DOM id).
+   */
+  id: string
+  /**
+   * A link's address: macOS AXURL; Windows a Hyperlink's Value. Empty for
+   * everything else. Read so a meeting's join link can be recognised.
+   */
+  url: string
+}
+
+export interface CallTreeOptions {
+  maxNodes?: number
+  maxDepth?: number
+  budgetMs?: number
+  maxWindows?: number
+}
+
+export interface CallTreeWindow {
+  title: string
+  nodes: Array<CallTreeNode>
+}
+
 /**
  * Event payload delivered to the JS callback. Crossing the V8 boundary is
  * not free, so we keep this struct flat (no nested objects) and only include
@@ -162,6 +246,12 @@ export interface CapturedKey {
 export declare function deactivateDodoKey(licenseKey: string, instanceId: string): Promise<unknown>
 
 /**
+ * The occurrences overlapping [start_ms, end_ms]; null without full access or
+ * on another OS. Runs on a worker thread.
+ */
+export declare function getCalendarEvents(startMs: number, endMs: number): Promise<Array<CalendarEventInfo> | null>
+
+/**
  * Returns the platform-native ID of the current default output device.
  * macOS: CoreAudio device UID. Windows: WASAPI device id (eMultimedia/eConsole role).
  * Empty string on error or unsupported platform.
@@ -182,13 +272,28 @@ export declare function getHardwareId(): string
 
 export declare function getInputDevices(): Array<AudioDeviceInfo>
 
+/** Who is capturing from a microphone right now; null where the OS can't say. */
+export declare function getMicUsers(): Array<MicUser> | null
+
 export declare function getOutputDevices(): Array<AudioDeviceInfo>
+
+/** The visible top-level windows; null where the OS can't say. */
+export declare function getVisibleWindows(): Array<WindowInfo> | null
 
 /**
  * True if this process has Accessibility trust (required for CGEventTap).
  * Cheap; safe to poll from JS to drive UI state.
  */
 export declare function isAccessibilityGranted(): boolean
+
+export interface MicUser {
+  /** macOS: the capturing process. Windows: unknown (the consent store is per app). */
+  pid?: number
+  /** macOS: the process's bundle id. Windows: a packaged app's family name. */
+  bundleId?: string
+  /** The executable: macOS proc_pidpath; Windows a NonPackaged entry's path. */
+  path?: string
+}
 
 export interface OverlayBoundsInput {
   x: number
@@ -198,12 +303,26 @@ export interface OverlayBoundsInput {
 }
 
 /**
+ * The app's windows as flattened accessibility trees; null where this OS has
+ * no reader or the pid is not a running app. Resolves on a worker thread.
+ */
+export declare function readCallTree(pid: number, options?: CallTreeOptions | undefined | null): Promise<CallTree | null>
+
+/**
+ * Asks for calendar access (once: the OS answers at once after the first
+ * time), resolving to the status afterwards. Runs on a worker thread.
+ */
+export declare function requestCalendarAccess(): Promise<string>
+
+/**
  * macOS: whether ScreenCaptureKit can currently enumerate a display (false
  * while every display is asleep — the state in which an SCK stream stops
  * with -3815 and a rebuild would fail "No displays found"). Always true on
  * other platforms, whose backends are not display-bound.
  */
 export declare function screenCaptureDisplaysAvailable(): boolean
+
+export declare function setForeignWindowsCaptureExcluded(excluded: boolean, ownHandles: Array<Buffer>): number
 
 /**
  * One joint-state transition from the dual-channel tracker
@@ -249,3 +368,12 @@ export declare function verifyDodoKey(licenseKey: string, deviceLabel: string): 
  * The HTTP call runs on a libuv worker thread to prevent blocking the Node.js event loop.
  */
 export declare function verifyGumroadKey(licenseKey: string): Promise<unknown>
+
+export interface WindowInfo {
+  pid: number
+  /** The owning app's name (macOS kCGWindowOwnerName; Windows the exe's file name). */
+  owner: string
+  /** Empty when unknown (macOS without Screen Recording permission). */
+  title: string
+  path?: string
+}

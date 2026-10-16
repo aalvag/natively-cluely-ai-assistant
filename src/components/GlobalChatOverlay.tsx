@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useStreamBuffer } from '../hooks/useStreamBuffer';
 import { X, Copy, Check, Globe, ArrowUp } from 'lucide-react';
+import { DiagramAwareMarkdown } from './diagram/DiagramAwareMarkdown';
 import { motion, AnimatePresence } from 'framer-motion';
 import { genMessageId } from '../utils/messageId';
 import nativelyIcon from './icon.png';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
+import { stripGistTrailer } from '../lib/displayMarkup';
 
 // ============================================
 // Types
@@ -21,6 +23,8 @@ interface GlobalChatOverlayProps {
     isOpen: boolean;
     onClose: () => void;
     initialQuery?: string;
+    /** Asked from a folder: only its meetings are searched, and the header says so. */
+    scope?: { folderId: string; name: string } | null;
 }
 
 // ============================================
@@ -64,12 +68,12 @@ const UserMessage: React.FC<{ content: string }> = ({ content }) => (
     </motion.div>
 );
 
-const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean }> = ({ content, isStreaming }) => {
+const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean; isLatest?: boolean }> = ({ content, isStreaming, isLatest }) => {
     const [copied, setCopied] = useState(false);
 
     const handleCopy = async () => {
         try {
-            await navigator.clipboard.writeText(content);
+            await navigator.clipboard.writeText(stripGistTrailer(content));
             setCopied(true);
             setTimeout(() => setCopied(false), 2000);
         } catch (err) {
@@ -85,7 +89,18 @@ const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean }> = (
             className="flex flex-col items-start mb-6"
         >
             <div className="text-text-primary text-[15px] leading-relaxed max-w-[85%]">
-                {content}
+                {/* This chat shows answers as plain text. Its standard-chat fallback
+                    can answer a design question, so a ```mermaid block is still
+                    drawn by the shared diagram card; everything else is exactly
+                    the plain text it was. */}
+                <DiagramAwareMarkdown
+                    text={content}
+                    streaming={Boolean(isStreaming)}
+                    // Only the answer just given may be repaired by itself (one model
+                    // call); an older answer in the thread keeps its "Try to fix" button.
+                    allowAutoRepair={Boolean(isLatest)}
+                    renderMarkdown={(chunk, key) => <React.Fragment key={key}>{chunk}</React.Fragment>}
+                />
             </div>
             {!isStreaming && content && (
                 <button
@@ -133,7 +148,8 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
     isOpen,
     onClose,
-    initialQuery = ''
+    initialQuery = '',
+    scope = null
 }) => {
     const [messages, setMessages] = useState<Message[]>([]);
     const [chatState, setChatState] = useState<ChatState>('idle');
@@ -156,6 +172,9 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
     // whatever the other call had already buffered, so the eventual
     // completion can render empty. A ref updates immediately, no batching.
     const submitInFlightRef = useRef(false);
+    // Read when a question is sent (submitQuestion is created once).
+    const scopeRef = useRef(scope);
+    scopeRef.current = scope;
 
     // Submit initial query when overlay opens
     useEffect(() => {
@@ -305,7 +324,7 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
             // upstream of this call can guarantee the invoke() ever resolves.
             let result: { fallback?: boolean; success?: boolean; error?: string } | undefined;
             try {
-                const call = window.electronAPI?.ragQueryGlobal(question);
+                const call = window.electronAPI?.ragQueryGlobal(question, scopeRef.current ? { folderId: scopeRef.current.folderId } : undefined);
                 result = call
                     ? await withTimeout(call, RAG_QUERY_CLIENT_TIMEOUT_MS, 'ragQueryGlobal')
                     : undefined;
@@ -480,7 +499,7 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                         <div className="flex items-center justify-between px-4 py-3 border-b border-border-subtle shrink-0">
                             <div className="flex items-center gap-2 text-text-tertiary">
                                 <img src={nativelyIcon} className="w-3.5 h-3.5 force-black-icon opacity-50" alt="logo" />
-                                <span className="text-[13px] font-medium">Search all meetings</span>
+                                <span className="text-[13px] font-medium truncate">{scope ? `Search meetings in ${scope.name}` : 'Search all meetings'}</span>
                             </div>
                             <button
                                 onClick={onClose}
@@ -495,7 +514,7 @@ const GlobalChatOverlay: React.FC<GlobalChatOverlayProps> = ({
                             {messages.map((msg) => (
                                 msg.role === 'user'
                                     ? <UserMessage key={msg.id} content={msg.content} />
-                                    : <AssistantMessage key={msg.id} content={msg.content} isStreaming={msg.isStreaming} />
+                                    : <AssistantMessage key={msg.id} content={msg.content} isStreaming={msg.isStreaming} isLatest={msg.id === messages[messages.length - 1]?.id} />
                             ))}
 
                             {chatState === 'waiting_for_llm' && <TypingIndicator />}

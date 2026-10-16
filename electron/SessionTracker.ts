@@ -1,18 +1,22 @@
 // SessionTracker.ts
-// Manages session state, transcript arrays, context windows, and epoch compaction.
+// Manages session state, transcript arrays, context windows, and the rolling meeting recap.
 // Extracted from IntelligenceManager to decouple state management from LLM orchestration.
 
 import { RecapLLM } from './llm';
 import { isVerboseLogging } from './verboseLog';
 import { stripOverlappingPrefix } from './utils/rollingTranscriptState';
+import { makeUsagePreviews } from './services/meeting/usagePreviews';
 import type { AttemptId, TurnIdentity } from './llm/turnIdentity';
+import { stripGistTrailer } from '../src/lib/displayMarkup';
+import { createActiveDesignState, type ActiveDesign } from '../src/lib/diagram/activeDesign.mjs';
+import { replaceMermaidSource } from '../src/lib/diagram/fencedBlocks.mjs';
 
 // Canned-fallback phrases that mean the model gave up entirely, not phrases
 // that might legitimately appear inside a real answer. Matched only when the
 // ENTIRE (trimmed, punctuation-stripped) message consists of one of these —
 // never as a substring — so honest answers like "I'm not sure of his exact
 // title, but he's on the platform team" are kept in session history instead
-// of being silently dropped from contextItems/fullTranscript/history.
+// of being silently dropped from contextItems/the transcript/history.
 // Mirrors the equivalent guard in LLMHelper.processResponse (kept as a
 // separate local copy here to avoid a cross-module import for one helper).
 const CANNED_FALLBACK_PHRASES = [
@@ -37,6 +41,12 @@ function isCannedFallbackPhrase(text: string): boolean {
  */
 export type TranscriptOrigin = 'stt' | 'manual_chat' | 'assistant' | 'system_instruction' | 'test';
 
+// Label, inside [..], of a line the user typed to the assistant in the rolling
+// context. Defined in its own module so the other formatter can share it.
+import { TYPED_TURN_LABEL } from './llm/typedTurnLabel';
+import { insertSortedByTimestamp } from './audio/sttGapRecovery';
+export { TYPED_TURN_LABEL };
+
 export interface TranscriptSegment {
     marker?: string;
     speaker: string;
@@ -50,6 +60,11 @@ export interface TranscriptSegment {
     confidence?: number;
     /** Where this segment came from. Absent = legacy/unknown writer (see TranscriptOrigin). */
     origin?: TranscriptOrigin;
+    /** An assistant line that answers something the user TYPED (overlay chat or
+     *  phone), as opposed to a live suggestion nobody asked for in writing.
+     *  Meeting notes keep these beside the typed question they answer; every
+     *  other reader still sees origin 'assistant' and treats it as before. */
+    chatReply?: boolean;
     /** STT provider id that produced this segment (WTA audit F9, additive). */
     sttProvider?: string;
     /** Punctuation provenance (WTA audit F9): 'unavailable' means the provider
@@ -89,6 +104,8 @@ export interface SuggestionTrigger {
 // Context item matching Swift ContextManager structure
 export interface ContextItem {
     role: 'interviewer' | 'user' | 'assistant';
+    /** A user line that was TYPED to the assistant, not said in the meeting. */
+    typed?: boolean;
     text: string;
     timestamp: number;
     /** STT provider id (WTA audit F9, additive; absent on legacy/assistant items). */
@@ -161,23 +178,76 @@ export class SessionTracker {
     private currentMeetingMetadata: {
         title?: string;
         calendarEventId?: string;
+        /** Filled in at start by SessionCalendarLinker when the session matches an event. */
+        calendarEvent?: import('./services/calendar/calendarSessionMatch').CalendarEventSnapshot;
+        /** The call it is in (a meeting tab's key), for who spoke when (meetingDetection/callRoster). */
+        callKey?: string;
         source?: 'manual' | 'calendar';
+        /** From the Zoom / Teams window (main: startDesktopCallSpeakers), read-only facts. */
+        callSelfName?: string;
+        callMeetingKey?: string;
+        callParticipantCount?: number;
+        /** What others shared on screen, described (services/meeting/ScreenShareContext.ts). */
+        sharedScreens?: import('./services/meeting/ScreenShareContext').SharedScreenEntry[];
     } | null = null;
 
-    // Full Session Tracking (Persisted)
-    private fullTranscript: TranscriptSegment[] = [];
+    // Full Session Tracking: every segment of the session, oldest first. The
+    // saved meeting gets all of it; the assistant reads it from
+    // assistantViewStart on (getAssistantTranscript). Until 2026-10-15 a
+    // second, compacted array fed prompts and the saved meeting alike, so a
+    // 187-minute meeting was saved with only its last 73 minutes (each
+    // compaction dropped 500 segments past 1,800).
+    private persistedTranscript: TranscriptSegment[] = [];
+    // A ceiling, not a working limit: measured ~3.5 MB per 20,000 lines, and a
+    // ten-hour meeting is ~15,000. Only a runaway source could reach it.
+    private static readonly MAX_PERSISTED_SEGMENTS = 200_000;
     private fullUsage: any[] = []; // UsageInteraction
+    // AI interactions the assistant no longer holds but the saved meeting
+    // keeps: those before a reset made during a running meeting, and those
+    // past the 500-entry cap of fullUsage (which used to drop them from the
+    // saved meeting too).
+    private usageArchive: any[] = [];
+    // In memory: the live journal rewrites the whole session every few seconds
+    // (LiveMeetingJournal), and its row grows with this archive: measured 0.4 ms
+    // a write at 3 hours, 23 ms (84 worst) with 10,000 answers. Answers past it
+    // go to usageOverflowSink, written once each, and are read back at Stop and
+    // at recovery, so none is lost (2026-10-16).
+    private static readonly MAX_ARCHIVED_USAGE = 1_000;
+    private usageOverflowSink: ((entries: any[]) => void) | null = null;
+    // Screenshot previews (base64 JPEGs) in the archive are bounded too: past
+    // this many characters the oldest archived answers keep their text and
+    // lose their previews. (fullUsage's own 500 still hold theirs.)
+    private static readonly MAX_ARCHIVED_IMAGE_CHARS = 64 * 1024 * 1024;
+    private archivedImageChars = 0;
+    // Where the assistant's view of the transcript starts in persistedTranscript:
+    // 0, or the length at a reset made during a running meeting (the assistant
+    // forgets what came before; the saved meeting does not).
+    private assistantViewStart = 0;
+    // When that view began (Date.now() of a reset made during a running
+    // meeting), or 0. Lets stores keyed by time, like the live semantic index,
+    // forget the same lines (2026-10-16: it kept answering from before a reset).
+    private assistantViewStartedAt = 0;
     private sessionStartTime: number = Date.now();
 
-    // Rolling summarization: epoch summaries preserve early context when arrays are compacted
-    private static readonly MAX_EPOCH_SUMMARIES = 5;
-    private transcriptEpochSummaries: string[] = [];
-    private isCompacting: boolean = false;
+    // Rolling recap of the meeting (2026-10-15), for "summarise the meeting so
+    // far": a typed summary request is otherwise answered from the six
+    // retrieved windows, a few minutes of a long meeting. Each block of
+    // RECAP_BLOCK_LINES spoken lines is summarised once, in the background,
+    // after any answer in flight (ForegroundGate); nothing is evicted. Replaces
+    // the compaction recap, whose output nothing read.
+    private static readonly RECAP_BLOCK_LINES = 400;
+    private static readonly MAX_RECAPS = 60;
+    private static readonly RECAP_RETRY_MS = 60_000;
+    private meetingRecaps: Array<{ fromTs: number; toTs: number; lines: number; text: string }> = [];
+    // Index in persistedTranscript up to which recaps exist (or were attempted).
+    private recapCursor = 0;
+    private isRecapping: boolean = false;
+    private recapFailedAt = 0;
 
-    // Advanced by reset() only. The compaction recap call reads it before its
-    // await and drops its result if it moved, so an ended session cannot write
-    // into the next one. clearSessionContext() keeps the transcript and does
-    // NOT advance it: a compaction in flight across a mode switch still applies.
+    // Advanced by reset() only. The recap call reads it before its await and
+    // drops its result if it moved, so an ended session cannot write into the
+    // next one. clearSessionContext() keeps the transcript and does NOT advance
+    // it: a recap in flight across a mode switch still applies.
     private sessionEpoch: number = 0;
     // Advanced by reset() AND clearSessionContext(). An answer asked before
     // either (phone-mirror, launcher or overlay chat) is still shown, but not
@@ -192,13 +262,21 @@ export class SessionTracker {
     private codingQuestionSource: 'screenshot' | 'transcript' | null = null;
     private codingQuestionSetAt: number | null = null;
 
+    // The system design currently on the table (latest valid Mermaid diagram,
+    // its view and version). ONE shared instance for every route that records
+    // through addAssistantMessage — typed chat, What to Answer, Auto Answer,
+    // follow-ups — so a design drawn on one surface can be refined from
+    // another. Cleared with the session context (new meeting, mode switch,
+    // reset); expires on its own after a quiet half hour.
+    private activeDesign = createActiveDesignState();
+
     // Rolling buffer for multi-segment interviewer question detection
     private recentInterviewerBuffer: { text: string; timestamp: number }[] = [];
     private static readonly INTERVIEWER_BUFFER_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
     // Screenshot-detected question stays sticky for 3 min before transcript can override
     private static readonly SCREENSHOT_STALE_MS = 3 * 60 * 1000;
 
-    // Reference to RecapLLM for epoch summarization (injected later)
+    // Reference to RecapLLM for the rolling meeting recap (injected later)
     private recapLLM: RecapLLM | null = null;
 
     // ============================================
@@ -290,6 +368,9 @@ export class SessionTracker {
      */
     clearSessionContext(): void {
         this.contextItems = [];
+        this.activeDesign.clear();
+        this.pendingDiagramRepairs = [];
+        this.lastRepairedAnswer = null;
         this.detectedCodingQuestion = null;
         this.codingQuestionSource = null;
         this.codingQuestionSetAt = null;
@@ -353,6 +434,7 @@ export class SessionTracker {
             role,
             text,
             timestamp: segment.timestamp,
+            ...(role === 'user' && segment.origin === 'manual_chat' ? { typed: true } : {}),
             // F9 provenance rides along when the seam supplied it (additive;
             // legacy writers leave both undefined = neutral treatment).
             ...(segment.sttProvider ? { sttProvider: segment.sttProvider } : {}),
@@ -373,11 +455,10 @@ export class SessionTracker {
 
         if (!isInternalPrompt) {
             // Add to session transcript
-            this.fullTranscript.push(segment);
-            // Compact transcript with summarization instead of losing early context
-            // Fire-and-forget: sync context; errors are caught internally
-            void this.compactTranscriptIfNeeded().catch(e =>
-                console.warn('[SessionTracker] compactTranscript error (non-fatal):', e)
+            this.keepForPersistence(segment);
+            // Fire-and-forget; errors are caught internally
+            void this.recapIfDue().catch(e =>
+                console.warn('[SessionTracker] meeting recap error (non-fatal):', e)
             );
         }
 
@@ -385,11 +466,49 @@ export class SessionTracker {
     }
 
     /**
+     * A line recovered after a transcription outage (audio/sttGapRecovery.ts),
+     * put back at the time it was SAID, so the saved transcript and the notes
+     * read in order. Unlike handleTranscript it triggers nothing: no answer,
+     * no coding-question detection, no refinement. The rolling context gets it
+     * too when it still falls inside the window.
+     */
+    insertRecoveredTranscript(segment: TranscriptSegment): boolean {
+        const text = (segment.text || '').trim();
+        if (!text || !segment.final) return false;
+        // Into the whole transcript, at the time it was said. A line from
+        // before a reset made during the meeting stays out of the assistant's
+        // view; one inside an already recapped block is not recapped again.
+        const at = insertSortedByTimestamp(this.persistedTranscript, { ...segment, text });
+        if (at < this.assistantViewStart) this.assistantViewStart++;
+        if (at < this.recapCursor) this.recapCursor++;
+        if (this.persistedTranscript.length > SessionTracker.MAX_PERSISTED_SEGMENTS) {
+            this.persistedTranscript.shift();
+            if (this.assistantViewStart > 0) this.assistantViewStart--;
+            if (this.recapCursor > 0) this.recapCursor--;
+        }
+        const cutoff = Date.now() - (this.contextWindowDuration * 1000);
+        if (segment.timestamp >= cutoff) {
+            insertSortedByTimestamp(this.contextItems, {
+                role: this.mapSpeakerToRole(segment.speaker),
+                text,
+                timestamp: segment.timestamp,
+                ...(segment.sttProvider ? { sttProvider: segment.sttProvider } : {}),
+                ...(segment.punctuationSource ? { punctuationSource: segment.punctuationSource } : {}),
+            });
+        }
+        return true;
+    }
+
+    /**
      * Add assistant-generated message to context
      */
     addAssistantMessage(
         text: string,
-        writeDecision?: { policy?: 'store_conversational_only' | 'store_non_authoritative' | 'do_not_store'; reason?: string; blockedFromSessionTracker?: boolean },
+        // `answersSpokenQuestion`: the Answer button sends what the user SAID
+        // through the typed-chat handler, so its reply arrives on the
+        // 'manual_chat' surface too. It is a live suggestion, not a reply to
+        // typed chat, and must not be tagged (or noted) as one.
+        writeDecision?: { policy?: 'store_conversational_only' | 'store_non_authoritative' | 'do_not_store'; reason?: string; blockedFromSessionTracker?: boolean; answersSpokenQuestion?: boolean },
         // Phase 9 surface isolation (2026-07-14): OPTIONAL — absent means the
         // caller hasn't been updated yet, and this write behaves exactly as
         // before (shared lastAssistantMessage / assistantResponseHistory
@@ -405,6 +524,14 @@ export class SessionTracker {
         // lastCommittedAttemptBySurface above).
         identity?: TurnIdentity,
     ): boolean {
+        // A diagram of this answer that the overlay already repaired (the
+        // repair can land while the answer is still streaming, before any of
+        // it is recorded here) is recorded repaired.
+        {
+            const before = text;
+            text = this.withPendingDiagramRepairs(text);
+            this.lastRepairedAnswer = text !== before ? { before: stripGistTrailer(before), after: stripGistTrailer(text) } : null;
+        }
         console.log(`[SessionTracker] addAssistantMessage called`, { length: text.length, policy: writeDecision?.policy || 'store_conversational_only', surface: surface ?? 'unspecified' });
 
         // TurnIdentity write guard — checked FIRST, before any other filter
@@ -437,7 +564,7 @@ export class SessionTracker {
 
         // Prompt System v2 no-action sentinel (2026-08-01): [[NO_ACTION]] is a
         // machine signal, never a message. It must not enter contextItems,
-        // fullTranscript (and therefore epoch summaries, DB transcripts, or
+        // the transcript (and therefore meeting recaps, DB transcripts, or
         // meeting persistence), lastAssistantMessage, or response history —
         // regardless of which of the ~23 call sites forgot to gate it.
         try {
@@ -448,7 +575,11 @@ export class SessionTracker {
             }
         } catch { /* non-fatal — fall through to normal filtering */ }
 
-        const cleanText = text.trim();
+        // The trailing [[GIST]] line is display metadata (the overlay/phone
+        // chip), never answer text: history, the meeting transcript, the
+        // usage log and every follow-up that re-reads the last answer get the
+        // answer without it. One chokepoint for all ~30 callers.
+        const cleanText = stripGistTrailer(text).trim();
         if (cleanText.length < 10) {
             console.warn(`[SessionTracker] Ignored short message (<10 chars)`);
             return false;
@@ -465,8 +596,8 @@ export class SessionTracker {
             timestamp: Date.now()
         });
 
-        // Also add to fullTranscript so it persists in the session history (and summaries)
-        this.fullTranscript.push({
+        // Also add to the transcript so it persists in the session history (and summaries)
+        const assistantSegment: TranscriptSegment = {
             speaker: 'assistant',
             text: cleanText,
             timestamp: Date.now(),
@@ -474,19 +605,18 @@ export class SessionTracker {
             confidence: 1.0,
             // Defect B (2026-08-01): assistant answers are NOT meeting evidence.
             // Meeting-memory extraction filters on origin === 'stt'.
-            origin: 'assistant'
-        });
-
-        // Compact transcript with summarization instead of losing early context
-        // Fire-and-forget: sync context; errors are caught internally
-        void this.compactTranscriptIfNeeded().catch(e =>
-            console.warn('[SessionTracker] compactTranscript error (non-fatal):', e)
-        );
+            origin: 'assistant',
+            ...((surface === 'manual_chat' || surface === 'phone_mirror') && writeDecision?.answersSpokenQuestion !== true ? { chatReply: true } : {}),
+        };
+        this.keepForPersistence(assistantSegment);
 
         this.lastAssistantMessage = cleanText;
         if (surface) {
             this.lastAssistantMessageBySurface[surface] = cleanText;
         }
+        // A final answer carrying a valid diagram becomes (or updates) the
+        // design on the table. An answer without one leaves it untouched.
+        try { this.activeDesign.observeAnswer(cleanText); } catch { /* continuity only */ }
         if (identity) {
             this.lastCommittedAttemptBySurface[surface ?? 'unspecified'] = identity.attemptId;
         }
@@ -565,8 +695,8 @@ export class SessionTracker {
     /**
      * DURABLE context window (Intelligence OS, 2026-06-12). Unlike `getContext()`,
      * which reads `contextItems` — hard-evicted to `contextWindowDuration` (180s) on
-     * EVERY final segment by `evictOldEntries()` — this reads `fullTranscript`, the
-     * session's persisted store that survives the 180s eviction. It exists to make
+     * EVERY final segment by `evictOldEntries()` — this reads the session's
+     * persisted store that survives the 180s eviction. It exists to make
      * genuinely long-range recall possible: a project named at minute 1 is still
      * present at minute 62.
      *
@@ -575,28 +705,43 @@ export class SessionTracker {
      * window. But `contextItems` can never hold more than ~180s, so that path
      * silently saw at most the last two minutes — the long-range entity it was built
      * to recall had already been evicted. Pointing it at the durable store fixes the
-     * bug for the common case (a multi-minute session under the compaction threshold).
+     * bug for the common case.
      *
-     * BOUND: after a >1800-segment session `compactTranscriptIfNeeded` summarizes and
-     * evicts the OLDEST 500 raw segments into an epoch summary, so this returns only
-     * the raw segments STILL RESIDENT — a minute-1 entity in a *very* long session can
-     * still age out of the raw store into a summary. That's a far higher bar than the
-     * 180s `contextItems` eviction this fixes; for the full summary-prefixed view see
-     * `getFullSessionContext()`.
+     * Reads the whole transcript since the last reset (2026-10-15: it read a
+     * compacted copy, so past 1,800 lines compaction took the oldest 500 out of
+     * this window as well). Bounded by `lastSeconds` and by the last reset.
      *
      * @param lastSeconds Window size in seconds (default 7200 = 2h). `Infinity`
-     *   returns the entire resident transcript.
+     *   returns every line since the last reset.
      */
+    private static readonly DURABLE_SCAN_OLDER_RUN = 200;
+
     getDurableContext(lastSeconds: number = 7200): ContextItem[] {
         const cutoff = Number.isFinite(lastSeconds)
             ? Date.now() - (lastSeconds * 1000)
             : -Infinity;
         const out: ContextItem[] = [];
-        for (const seg of this.fullTranscript) {
+        // Found from the end: lines arrive roughly in time order, so the window starts where a
+        // run of lines older than the cutoff begins (a run, not the first one,
+        // because providers' timestamps can be slightly out of order). This
+        // keeps each call proportional to the window, not to the meeting.
+        const lines = this.persistedTranscript;
+        let from = lines.length;
+        for (let i = lines.length - 1, olderRun = 0; i >= this.assistantViewStart; i--) {
+            if (lines[i].timestamp < cutoff) {
+                if (++olderRun >= SessionTracker.DURABLE_SCAN_OLDER_RUN) break;
+            } else {
+                olderRun = 0;
+                from = i;
+            }
+        }
+        for (let i = from; i < lines.length; i++) {
+            const seg = lines[i];
             if (seg.timestamp < cutoff) continue;
             const text = (seg.text || '').trim();
             if (!text) continue;
-            out.push({ role: this.mapSpeakerToRole(seg.speaker), text, timestamp: seg.timestamp });
+            const role = this.mapSpeakerToRole(seg.speaker);
+            out.push({ role, text, timestamp: seg.timestamp, ...(role === 'user' && seg.origin === 'manual_chat' ? { typed: true } : {}) });
         }
         return out;
     }
@@ -671,6 +816,18 @@ export class SessionTracker {
     }
 
     /**
+     * What people SAID in the last `lastSeconds`, formatted like
+     * getFormattedContext, read from the durable transcript. getFormattedContext
+     * reads the rolling window, which is evicted after three minutes whatever
+     * is asked for: "draw what we discussed" was handed at most three minutes
+     * of a meeting however long the window it asked for. Speech only — the
+     * assistant's own suggestions are not something anyone described.
+     */
+    getFormattedSpeech(lastSeconds: number = 600): string {
+        return this.formatContextItems(this.getDurableContext(lastSeconds).filter((item) => item.role !== 'assistant' && !item.typed));
+    }
+
+    /**
      * Formatted context including rolling interim interviewer speech.
      */
     getFormattedContextWithInterim(lastSeconds: number = 120): string {
@@ -679,8 +836,14 @@ export class SessionTracker {
 
     private formatContextItems(items: ContextItem[]): string {
         return items.map(item => {
+            // A typed line is the user's, but it was never said aloud. Labelled
+            // [ME] it reached the prompt as the meeting's own speech — a typed
+            // "hi" was handed to the model as something said in the meeting,
+            // beside the same "hi" as a User line (2026-10-04). The label is
+            // upper-case words only so the label strippers and the two turn
+            // parsers (TYPED_TURN_LABEL's importers) treat it like the others.
             const label = item.role === 'interviewer' ? 'INTERVIEWER' :
-                item.role === 'user' ? 'ME' :
+                item.role === 'user' ? (item.typed ? TYPED_TURN_LABEL : 'ME') :
                     'ASSISTANT (PREVIOUS SUGGESTION)';
             return `[${label}]: ${item.text}`;
         }).join('\n');
@@ -702,7 +865,7 @@ export class SessionTracker {
      * Get full session context from accumulated transcript (User + Interviewer + Assistant)
      */
     getFullSessionContext(): string {
-        const recentTranscript = this.fullTranscript.map(segment => {
+        const recentTranscript = this.getAssistantTranscript().slice(this.recapCursor > this.assistantViewStart ? this.recapCursor - this.assistantViewStart : 0).map(segment => {
             const role = this.mapSpeakerToRole(segment.speaker);
             const label = role === 'interviewer' ? 'INTERVIEWER' :
                 role === 'user' ? 'ME' :
@@ -711,8 +874,8 @@ export class SessionTracker {
         }).join('\n');
 
         // Prepend epoch summaries for full session context preservation
-        if (this.transcriptEpochSummaries.length > 0) {
-            const epochContext = this.transcriptEpochSummaries.join('\n---\n');
+        if (this.meetingRecaps.length > 0) {
+            const epochContext = this.meetingRecaps.map(r => r.text).join('\n---\n');
             return `[SESSION HISTORY - EARLIER DISCUSSION]\n${epochContext}\n\n[RECENT TRANSCRIPT]\n${recentTranscript}`;
         }
 
@@ -723,12 +886,98 @@ export class SessionTracker {
     // Session Data Accessors (for MeetingPersistence)
     // ============================================
 
+    /** Every line since the last reset (the same as getAssistantTranscript()). */
     getFullTranscript(): TranscriptSegment[] {
-        return this.fullTranscript;
+        return this.getAssistantTranscript();
+    }
+
+    /** Every segment of the session, oldest first, for saving the meeting. */
+    getPersistableTranscript(): TranscriptSegment[] {
+        return this.persistedTranscript;
+    }
+
+    private keepForPersistence(segment: TranscriptSegment): void {
+        this.persistedTranscript.push(segment);
+        if (this.persistedTranscript.length > SessionTracker.MAX_PERSISTED_SEGMENTS) {
+            console.warn('[SessionTracker] persisted transcript hit its ceiling; dropping the oldest line');
+            this.persistedTranscript.shift();
+            if (this.assistantViewStart > 0) this.assistantViewStart--;
+            if (this.recapCursor > 0) this.recapCursor--;
+        }
+    }
+
+    /**
+     * The meeting starts now. The start time was otherwise left at the last
+     * reset() (the previous meeting's stop, or app launch), so a meeting's
+     * saved start and duration included the idle time before it.
+     */
+    markMeetingStart(at: number = Date.now()): void {
+        this.sessionStartTime = at;
     }
 
     getFullUsage(): any[] {
         return this.fullUsage;
+    }
+
+    /** Receives the oldest archived interactions as they leave memory (the running meeting writes them to disk). */
+    setUsageOverflowSink(sink: ((entries: any[]) => void) | null): void {
+        this.usageOverflowSink = sink;
+    }
+
+    /** Every AI interaction of the meeting still in memory, for saving it (includes those before a mid-meeting reset). */
+    getPersistableUsage(): any[] {
+        return this.usageArchive.length > 0 ? [...this.usageArchive, ...this.fullUsage] : this.fullUsage;
+    }
+
+    private archiveUsage(entries: any[]): void {
+        if (entries.length === 0) return;
+        const imageChars = (e: any): number => (Array.isArray(e?.images) ? e.images.reduce((n: number, img: unknown) => n + (typeof img === 'string' ? img.length : 0), 0) : 0);
+        this.usageArchive.push(...entries);
+        for (const e of entries) this.archivedImageChars += imageChars(e);
+        if (this.usageArchive.length > SessionTracker.MAX_ARCHIVED_USAGE) {
+            const dropped = this.usageArchive.slice(0, this.usageArchive.length - SessionTracker.MAX_ARCHIVED_USAGE);
+            for (const e of dropped) this.archivedImageChars -= imageChars(e);
+            // Their text goes to disk; screenshot previews of answers this old do not.
+            try { this.usageOverflowSink?.(dropped.map((e) => (Array.isArray(e?.images) ? (({ images: _i, ...rest }) => rest)(e) : e))); }
+            catch (err) { console.warn('[SessionTracker] usage overflow sink failed (non-fatal):', err); }
+            this.usageArchive = this.usageArchive.slice(-SessionTracker.MAX_ARCHIVED_USAGE);
+        }
+        // A copy without previews replaces the entry: the original object may
+        // still be held by whoever logged it.
+        for (let i = 0; i < this.usageArchive.length && this.archivedImageChars > SessionTracker.MAX_ARCHIVED_IMAGE_CHARS; i++) {
+            const chars = imageChars(this.usageArchive[i]);
+            if (chars === 0) continue;
+            const { images: _images, ...rest } = this.usageArchive[i];
+            this.usageArchive[i] = rest;
+            this.archivedImageChars -= chars;
+        }
+    }
+
+    /** Date.now() of the last reset made during a running meeting, else 0. */
+    getAssistantViewStartedAt(): number {
+        return this.assistantViewStartedAt;
+    }
+
+    /**
+     * The transcript the assistant reads for recall and retrieval: every line
+     * since the last reset. `maxLines` keeps the newest that many, for readers
+     * whose cost grows with the line count.
+     */
+
+    getAssistantTranscript(maxLines: number = Infinity): TranscriptSegment[] {
+        const from = Math.max(this.assistantViewStart, this.persistedTranscript.length - maxLines);
+        return from <= 0 ? this.persistedTranscript : this.persistedTranscript.slice(from);
+    }
+
+    // The keyword (BM25) index over the live transcript is rebuilt for every
+    // question: measured ~34 ms at 5,000 lines, ~93 ms at 15,000. The newest
+    // 6,000 lines (some 3.5 hours of speech) keep that cost off the first word
+    // of an answer; the embedded (JIT) index covers the whole meeting.
+    private static readonly RETRIEVAL_MAX_LINES = 6000;
+
+    /** The transcript retrieval reads for a question (see RETRIEVAL_MAX_LINES). */
+    getRetrievalTranscript(): TranscriptSegment[] {
+        return this.getAssistantTranscript(SessionTracker.RETRIEVAL_MAX_LINES);
     }
 
     getRecentManualTurn(maxAgeMs: number = 5 * 60 * 1000): { question: string; answer: string; timestamp: number } | null {
@@ -773,6 +1022,8 @@ export class SessionTracker {
      */
     capUsageArray(): void {
         if (this.fullUsage.length > 500) {
+            // Out of the assistant's memory, still in the saved meeting.
+            this.archiveUsage(this.fullUsage.slice(0, this.fullUsage.length - 500));
             this.fullUsage = this.fullUsage.slice(-500);
         }
     }
@@ -780,20 +1031,158 @@ export class SessionTracker {
     /**
      * Public method to log usage from external sources (e.g. IPC direct chat)
      */
-    logUsage(type: string, question: string, answer: string): void {
-        this.fullUsage.push({
+    logUsage(type: string, question: string, answer: string, imagePaths?: readonly string[]): void {
+        this.pushUsage({
             type,
             timestamp: Date.now(),
             question,
-            answer,
+            answer: typeof answer === 'string' ? stripGistTrailer(answer) : answer,
             source: type === 'chat' ? 'manual_chat' : 'external',
+            imagePaths,
         });
-        this.capUsageArray();
     }
 
+    // ============================================
+    // Active design (system-design diagrams)
+    // ============================================
+
+    /** The design on the table, or null. */
+    getActiveDesign(): ActiveDesign | null {
+        try { return this.activeDesign.get(); } catch { return null; }
+    }
+
+    /** A fresh design turn is starting; remember what it asked (a hint only). */
+    noteDesignQuestion(question: string | null | undefined): void {
+        try { this.activeDesign.noteDesignQuestion(question); } catch { /* hint only */ }
+    }
+
+    /**
+     * Says what the turn being answered is: a follow-up on the design (keep it
+     * in focus through the answer), or not one (`false`: forget a mark left by
+     * a follow-up that was never answered).
+     */
+    touchActiveDesign(followsUp: boolean = true, mayFollowUp: boolean = false): void {
+        try {
+            if (followsUp) this.activeDesign.touch();
+            else this.activeDesign.untouch();
+            // An undecided turn: the model was handed the design and decides
+            // whether the turn is about it (see activeDesign.consider).
+            if (!followsUp && mayFollowUp) this.activeDesign.consider();
+        } catch { /* hint only */ }
+    }
+
+    /** Drop the design (a new meeting must not inherit the previous one's). */
+    clearActiveDesign(): void {
+        this.activeDesign.clear();
+        this.pendingDiagramRepairs = [];
+        this.lastRepairedAnswer = null;
+    }
+
+    /**
+     * The renderer repaired a Mermaid block that did not parse. Put the working
+     * source wherever the broken one was recorded — the design on the table,
+     * the last answer, and the usage log that becomes the saved meeting — so a
+     * reopened meeting draws the repaired diagram. Exact-source match only: a
+     * repair can never be merged into a different answer.
+     */
+    applyDiagramRepair(originalSource: string, repairedSource: string): boolean {
+        let changed = false;
+        try { changed = this.activeDesign.applyRepair(originalSource, repairedSource) || changed; } catch { /* ignore */ }
+        const swap = (text: unknown): unknown => {
+            if (typeof text !== 'string') return text;
+            const next = replaceMermaidSource(text, originalSource, repairedSource);
+            if (next !== text) changed = true;
+            return next;
+        };
+        this.lastAssistantMessage = swap(this.lastAssistantMessage) as string | null;
+        for (const key of Object.keys(this.lastAssistantMessageBySurface) as ConversationSurface[]) {
+            this.lastAssistantMessageBySurface[key] = swap(this.lastAssistantMessageBySurface[key]) as string;
+        }
+        // Only the most recent entries: a repair belongs to an answer just shown.
+        // The saved record's tail, not the assistant's: after a reset made during
+        // a meeting the assistant's lists are empty, the answer is still saved.
+        for (const entry of this.getPersistableUsage().slice(-6)) {
+            if (!entry || typeof entry.answer !== 'string') continue;
+            entry.answer = swap(entry.answer);
+        }
+        for (const item of this.contextItems.slice(-6)) {
+            if (item.role === 'assistant') item.text = swap(item.text) as string;
+        }
+        for (const seg of this.persistedTranscript.slice(-12)) {
+            if (seg.speaker !== 'assistant') continue;
+            seg.text = swap(seg.text) as string;
+        }
+        for (const h of this.assistantResponseHistory.slice(-4)) {
+            h.text = swap(h.text) as string;
+        }
+        // The overlay accepts a repair when its card draws — which can be while
+        // the answer is still streaming, before any of it has been recorded.
+        // Nothing matched then, and the broken source was recorded afterwards
+        // (as the saved answer AND as the design on the table). It is kept for
+        // a short while and applied to what is recorded next.
+        if (!changed) this.rememberPendingDiagramRepair(originalSource, repairedSource);
+        return changed;
+    }
+
+    private pendingDiagramRepairs: Array<{ original: string; repaired: string; at: number }> = [];
+    /** The last answer a pending repair was applied to, as written and as recorded (for the usage log's copy). */
+    private lastRepairedAnswer: { before: string; after: string } | null = null;
+    private static readonly PENDING_DIAGRAM_REPAIR_TTL_MS = 5 * 60 * 1000;
+    private static readonly PENDING_DIAGRAM_REPAIR_MAX = 8;
+
+    private rememberPendingDiagramRepair(original: string, repaired: string): void {
+        if (typeof original !== 'string' || typeof repaired !== 'string' || !original.trim() || original === repaired) return;
+        this.pendingDiagramRepairs = this.pendingDiagramRepairs.filter((r) => r.original !== original);
+        this.pendingDiagramRepairs.push({ original, repaired, at: Date.now() });
+        while (this.pendingDiagramRepairs.length > SessionTracker.PENDING_DIAGRAM_REPAIR_MAX) this.pendingDiagramRepairs.shift();
+    }
+
+    /** An answer about to be recorded, with any diagram the overlay already repaired swapped in (exact source only). */
+    private withPendingDiagramRepairs(text: string): string {
+        if (typeof text !== 'string' || this.pendingDiagramRepairs.length === 0) return text;
+        const cutoff = Date.now() - SessionTracker.PENDING_DIAGRAM_REPAIR_TTL_MS;
+        this.pendingDiagramRepairs = this.pendingDiagramRepairs.filter((r) => r.at >= cutoff);
+        let out = text;
+        try {
+            for (const repair of [...this.pendingDiagramRepairs]) {
+                const next = replaceMermaidSource(out, repair.original, repair.repaired);
+                if (next !== out) {
+                    out = next;
+                    // Spent: one repair belongs to one answer.
+                    this.pendingDiagramRepairs = this.pendingDiagramRepairs.filter((r) => r !== repair);
+                }
+            }
+        } catch { /* the answer is recorded as written */ }
+        return out;
+    }
+
+    /**
+     * `imagePaths`: the screenshots the answer used. They are not stored; their
+     * previews are made in the background (usagePreviews.ts) and land on the same
+     * entry object as `images`, which is what DatabaseManager.saveMeeting persists.
+     * The screenshot files are temporary (ScreenshotHelper deletes them), so this
+     * has to happen now rather than at save time.
+     */
     pushUsage(entry: any): void {
+        // The same object stays in the log (callers may hold it); only the file
+        // paths come off it, so they are never persisted.
+        const imagePaths = entry?.imagePaths;
+        if (entry && 'imagePaths' in entry) delete entry.imagePaths;
+        // Same rule as logUsage: the usage log (ai_interactions) stores the
+        // answer without its [[GIST]] display line. In place, for the same reason.
+        if (entry && typeof entry.answer === 'string') entry.answer = stripGistTrailer(entry.answer);
+        // (The usage entry is written after the assistant message; a repair
+        // spent there is found here through the message it was applied to.)
+        if (entry && typeof entry.answer === 'string' && this.lastRepairedAnswer && entry.answer === this.lastRepairedAnswer.before) {
+            entry.answer = this.lastRepairedAnswer.after;
+        }
         this.fullUsage.push(entry);
         this.capUsageArray();
+        if (Array.isArray(imagePaths) && imagePaths.length > 0) {
+            makeUsagePreviews(imagePaths)
+                .then((images) => { if (images.length > 0) entry.images = images; })
+                .catch((err) => console.warn('[SessionTracker] Screenshot previews for usage failed:', err?.message ?? err));
+        }
     }
 
     // ============================================
@@ -816,12 +1205,30 @@ export class SessionTracker {
     // Reset
     // ============================================
 
-    reset(): void {
+    /**
+     * `keepMeetingRecord`: the reset shortcut during a running meeting clears
+     * what the assistant remembers, not the meeting's saved transcript or its
+     * start (it used to wipe both, so the saved meeting lost everything said
+     * before the reset).
+     */
+    reset(opts: { keepMeetingRecord?: boolean } = {}): void {
         this.contextItems = [];
-        this.fullTranscript = [];
+        if (!opts.keepMeetingRecord) {
+            this.persistedTranscript = [];
+            this.sessionStartTime = Date.now();
+            this.usageArchive = [];
+            this.archivedImageChars = 0;
+            this.assistantViewStart = 0;
+            this.assistantViewStartedAt = 0;
+        } else {
+            this.archiveUsage(this.fullUsage);
+            this.assistantViewStart = this.persistedTranscript.length;
+            this.assistantViewStartedAt = Date.now();
+        }
         this.fullUsage = [];
-        this.transcriptEpochSummaries = [];
-        this.sessionStartTime = Date.now();
+        this.meetingRecaps = [];
+        this.recapCursor = this.assistantViewStart;
+        this.recapFailedAt = 0;
         this.lastAssistantMessage = null;
         this.assistantResponseHistory = [];
         this.lastInterimInterviewer = null;
@@ -829,6 +1236,9 @@ export class SessionTracker {
         this.codingQuestionSource = null;
         this.codingQuestionSetAt = null;
         this.recentInterviewerBuffer = [];
+        this.activeDesign.clear();
+        this.pendingDiagramRepairs = [];
+        this.lastRepairedAnswer = null;
         this.sessionEpoch++;
         this.contextEpoch++;
     }
@@ -854,67 +1264,61 @@ export class SessionTracker {
     }
 
     /**
-     * Compact transcript buffer by summarizing oldest entries into an epoch summary.
-     * Called instead of raw slice() to preserve early meeting context.
+     * Summarise the next block of the meeting once it has RECAP_BLOCK_LINES
+     * spoken lines (see meetingRecaps). One call at a time; a failed one is
+     * retried after RECAP_RETRY_MS, never on every new line.
      */
-    private async compactTranscriptIfNeeded(): Promise<void> {
-        if (this.fullTranscript.length <= 1800 || this.isCompacting) return;
+    private async recapIfDue(): Promise<void> {
+        if (!this.recapLLM || this.isRecapping) return;
+        if (this.recapFailedAt && Date.now() - this.recapFailedAt < SessionTracker.RECAP_RETRY_MS) return;
+        const from = Math.max(this.recapCursor, this.assistantViewStart);
+        const block: TranscriptSegment[] = [];
+        let to = from;
+        for (; to < this.persistedTranscript.length && block.length < SessionTracker.RECAP_BLOCK_LINES; to++) {
+            const seg = this.persistedTranscript[to];
+            if (this.mapSpeakerToRole(seg.speaker) !== 'assistant' && seg.origin !== 'manual_chat' && (seg.text || '').trim()) block.push(seg);
+        }
+        if (block.length < SessionTracker.RECAP_BLOCK_LINES) return;
 
-        this.isCompacting = true;
-        // A meeting stop resets the session while the recap call below is still
-        // pending. Its summary and the 500-entry eviction belong to the session
-        // that ended, not the one that replaced it.
+        this.isRecapping = true;
         const epoch = this.sessionEpoch;
         try {
-            // Take the oldest 500 entries to summarize
-            const summarizeCount = 500;
-            const oldEntries = this.fullTranscript.slice(0, summarizeCount);
-            const summaryInput = oldEntries.map(seg => {
-                const role = this.mapSpeakerToRole(seg.speaker);
-                const label = role === 'interviewer' ? 'INTERVIEWER' :
-                    role === 'user' ? 'ME' : 'ASSISTANT';
-                return `[${label}]: ${seg.text}`;
-            }).join('\n');
-
-            // Fire-and-forget LLM summarization (non-blocking)
-            if (this.recapLLM) {
-                try {
-                    const epochSummary = await this.recapLLM.generate(
-                        `Summarize this conversation segment into 3-5 concise bullet points preserving key topics, decisions, and questions:\n\n${summaryInput}`
-                    );
-                    if (this.sessionEpoch !== epoch) return;
-                    if (epochSummary && epochSummary.trim().length > 0) {
-                        this.transcriptEpochSummaries.push(epochSummary.trim());
-                        console.log(`[SessionTracker] Epoch summary created (${this.transcriptEpochSummaries.length} total)`);
-                    } else {
-                        // Empty LLM response — store a basic marker so context is not lost
-                        const marker = `[Earlier discussion: ${oldEntries.length} segments summarized without transcript snippets.]`;
-                        this.transcriptEpochSummaries.push(marker);
-                    }
-                } catch (e) {
-                    if (this.sessionEpoch !== epoch) return;
-                    // If summarization fails, store a simple marker
-                    const fallback = `[Earlier discussion: ${oldEntries.length} segments summarized without transcript snippets.]`;
-                    this.transcriptEpochSummaries.push(fallback);
-                    console.warn('[SessionTracker] Epoch summarization failed, using fallback marker');
-                }
-            } else {
-                // BUG-03 fix: recapLLM not yet available — always push a plain marker so early
-                // context is not silently discarded with no record in transcriptEpochSummaries.
-                const marker = `[Earlier discussion (no LLM): ${oldEntries.length} segments summarized without transcript snippets.]`;
-                this.transcriptEpochSummaries.push(marker);
-                console.warn('[SessionTracker] recapLLM not available — storing plain epoch marker');
+            // Background work: never ahead of an answer being generated.
+            const { ForegroundGate } = require('./services/ForegroundGate') as typeof import('./services/ForegroundGate');
+            await ForegroundGate.waitUntilIdle();
+            if (this.sessionEpoch !== epoch) return;
+            const input = block.map((seg) => `[${this.mapSpeakerToRole(seg.speaker) === 'user' ? 'ME' : 'THEM'}]: ${seg.text}`).join('\n');
+            let text = '';
+            try {
+                text = (await this.recapLLM.generate(
+                    `Summarize this part of a meeting as 3 to 6 short bullet points. Keep every decision, owner, number, date and deadline exactly as said. No preamble.\n\n${input}`
+                )).trim();
+            } catch (e: any) {
+                if (this.sessionEpoch !== epoch) return;
+                this.recapFailedAt = Date.now();
+                console.warn('[SessionTracker] Meeting recap failed; retrying later:', e?.message || e);
+                return;
             }
-
-            // Cap epoch summaries to prevent LLM context window overflow
-            if (this.transcriptEpochSummaries.length > SessionTracker.MAX_EPOCH_SUMMARIES) {
-                this.transcriptEpochSummaries = this.transcriptEpochSummaries.slice(-SessionTracker.MAX_EPOCH_SUMMARIES);
-            }
-
-            // Evict ONLY the exact 500 oldest entries that we just summarized
-            this.fullTranscript = this.fullTranscript.slice(summarizeCount);
+            if (this.sessionEpoch !== epoch) return;
+            if (!text) { this.recapFailedAt = Date.now(); return; }
+            this.recapFailedAt = 0;
+            this.meetingRecaps.push({ fromTs: block[0].timestamp, toTs: block[block.length - 1].timestamp, lines: block.length, text });
+            if (this.meetingRecaps.length > SessionTracker.MAX_RECAPS) this.meetingRecaps.shift();
+            this.recapCursor = to;
+            console.log(`[SessionTracker] Meeting recap ${this.meetingRecaps.length} written (${block.length} lines)`);
         } finally {
-            this.isCompacting = false;
+            this.isRecapping = false;
         }
+        // A backlog (recapLLM set late, or a burst of lines) continues block by block.
+        void this.recapIfDue().catch(() => { /* logged inside */ });
+    }
+
+    /**
+     * The meeting so far as recaps, oldest first, covering everything up to the
+     * last block summarised (lines after it are in the live transcript). Empty
+     * until the first block of RECAP_BLOCK_LINES spoken lines is summarised.
+     */
+    getMeetingRecaps(): ReadonlyArray<{ fromTs: number; toTs: number; lines: number; text: string }> {
+        return this.meetingRecaps;
     }
 }

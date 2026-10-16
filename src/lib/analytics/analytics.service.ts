@@ -2,6 +2,8 @@
 // Works in Electron by dynamically loading the gtag script into the renderer DOM
 // Only requires the public Measurement ID — no API secrets needed
 
+import { answerFailureCause, looksLikeUserStop } from '../funnel/answerFailure.mjs';
+
 // --- Types ---
 
 export type ModelProviderType = 'cloud' | 'local';
@@ -80,11 +82,58 @@ export function detectProviderType(modelName: string): ModelProviderType {
     return 'cloud';
 }
 
+// --- First-party funnel ---
+//
+// The same moments, reported to Natively's own funnel as "this feature was used
+// today" (src/lib/funnel). The main process allows one event per feature per
+// day and nothing but the feature's name, and does nothing at all when Usage
+// statistics is off. Deliberately independent of whether the GA4 script above
+// loaded: a blocked script must not hide what people use.
+
+type FunnelFeature =
+    | 'answer' | 'follow_up' | 'recap' | 'suggest_questions' | 'clarify' | 'brainstorm'
+    | 'chat' | 'search' | 'copy_answer' | 'pdf_export' | 'calendar_connect';
+
+/** The funnel's name for a command, or null for commands that are navigation rather than use. */
+export function funnelFeatureForCommand(commandType: string): FunnelFeature | null {
+    if (commandType === 'what_to_say') return 'answer';
+    if (commandType.startsWith('follow_up_')) return 'follow_up';
+    if (commandType === 'recap' || commandType === 'suggest_questions' || commandType === 'clarify' || commandType === 'brainstorm') return commandType;
+    if (commandType === 'ai_query_search' || commandType === 'literal_search') return 'search';
+    return null;
+}
+
+/**
+ * An answer was asked for and did not come: report the kind of cause, and only
+ * that (src/lib/funnel/answerFailure.mjs). A stopped or cut-short answer is not
+ * a failure and reports nothing. The main process allows one per cause per day,
+ * so calling this twice for one failure (a state updater that runs again)
+ * changes nothing.
+ */
+export function reportAnswerFailed(failure: Parameters<typeof answerFailureCause>[0], raw?: unknown): void {
+    try {
+        // A request the user stopped, or replaced with the next question, is
+        // thrown at the overlay like any other error. It is not a failure.
+        if (raw !== undefined && looksLikeUserStop(raw)) return;
+        const cause = answerFailureCause(failure);
+        if (!cause) return;
+        (window as any).electronAPI?.funnelTrack?.('answer_failed', { cause })?.catch?.(() => { });
+    } catch { /* never into the answer path */ }
+}
+
+function reportFeatureUsed(feature: FunnelFeature | null): void {
+    if (!feature) return;
+    try {
+        (window as any).electronAPI?.funnelTrack?.('feature_used', { feature })?.catch?.(() => { });
+    } catch { /* never into the feature */ }
+}
+
 // --- Service ---
 
 class AnalyticsService {
     private static instance: AnalyticsService;
     private initialized = false;
+    private undetectable = false;
     private sessionStartTime: number = Date.now();
     private assistantStartTime: number | null = null;
     private totalAssistantDuration: number = 0;
@@ -98,8 +147,12 @@ class AnalyticsService {
         return AnalyticsService.instance;
     }
 
+    public setUndetectable(isUndetectable: boolean): void {
+        this.undetectable = isUndetectable;
+    }
+
     public initAnalytics(): void {
-        if (this.initialized) return;
+        if (this.initialized || this.undetectable) return;
 
         try {
             // 1. Initialize dataLayer
@@ -136,7 +189,7 @@ class AnalyticsService {
     // --- Tracking Methods ---
 
     public trackAppOpen(): void {
-        if (!this.initialized) return;
+        if (!this.initialized || this.undetectable) return;
 
         this.trackEvent('app_opened');
 
@@ -148,21 +201,21 @@ class AnalyticsService {
     }
 
     public trackAppClose(): void {
-        if (!this.initialized) return;
+        if (!this.initialized || this.undetectable) return;
 
         this.trackSessionDuration();
         this.trackEvent('app_closed');
     }
 
     public trackAssistantStart(): void {
-        if (!this.initialized) return;
+        if (!this.initialized || this.undetectable) return;
 
         this.assistantStartTime = Date.now();
         this.trackEvent('assistant_started');
     }
 
     public trackAssistantStop(): void {
-        if (!this.initialized) return;
+        if (!this.initialized || this.undetectable) return;
 
         if (this.assistantStartTime) {
             const duration = (Date.now() - this.assistantStartTime) / 1000;
@@ -173,49 +226,60 @@ class AnalyticsService {
     }
 
     public trackModeSelected(mode: AssistantMode): void {
-        if (!this.initialized) return;
+        if (!this.initialized || this.undetectable) return;
 
         this.trackEvent('mode_selected', { mode });
     }
 
     public trackModelUsed(payload: ModelUsedPayload): void {
-        if (!this.initialized) return;
+        if (!this.initialized || this.undetectable) return;
 
         this.trackEvent('model_used', payload);
     }
 
     public trackCopyAnswer(): void {
-        if (!this.initialized) return;
+        reportFeatureUsed('copy_answer');
+        if (!this.initialized || this.undetectable) return;
         this.trackEvent('copy_answer_clicked');
     }
 
+    /** A typed question was sent. This, not a session starting, is "chat was used". */
+    public trackChatQuestionSent(): void {
+        reportFeatureUsed('chat');
+    }
+
     public trackCommandExecuted(commandType: string): void {
-        if (!this.initialized) return;
+        reportFeatureUsed(funnelFeatureForCommand(commandType));
+        if (!this.initialized || this.undetectable) return;
         this.trackEvent('command_executed', { command_type: commandType });
     }
 
     public trackConversationStarted(): void {
-        if (!this.initialized) return;
+        // Not "chat was used": this runs whenever a session starts, so until
+        // 2026-10-06 every meeting reported a chat it never had.
+        if (!this.initialized || this.undetectable) return;
         this.trackEvent('conversation_started');
     }
 
     public trackCalendarConnected(): void {
-        if (!this.initialized) return;
+        reportFeatureUsed('calendar_connect');
+        if (!this.initialized || this.undetectable) return;
         this.trackEvent('calendar_connected');
     }
 
     public trackMeetingStarted(): void {
-        if (!this.initialized) return;
+        if (!this.initialized || this.undetectable) return;
         this.trackEvent('meeting_started');
     }
 
     public trackMeetingEnded(): void {
-        if (!this.initialized) return;
+        if (!this.initialized || this.undetectable) return;
         this.trackEvent('meeting_ended');
     }
 
     public trackPdfExported(): void {
-        if (!this.initialized) return;
+        reportFeatureUsed('pdf_export');
+        if (!this.initialized || this.undetectable) return;
         this.trackEvent('pdf_exported');
     }
 

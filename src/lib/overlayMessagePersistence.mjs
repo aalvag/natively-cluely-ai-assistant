@@ -102,8 +102,9 @@ export function prepareIntelligenceStreamPlaceholderMessages(
 
 /**
  * Apply WTA null-invoke feedback to message rows (cooldown / empty answer path).
+ * `extra` is merged into the feedback row (the overlay marks it as a note).
  */
-export function applyWhatToAnswerNullFeedbackMessages(prev, feedback, idFactory = _defaultIdFactory) {
+export function applyWhatToAnswerNullFeedbackMessages(prev, feedback, idFactory = _defaultIdFactory, extra = {}) {
   if (!Array.isArray(prev)) {
     return [
       {
@@ -112,6 +113,7 @@ export function applyWhatToAnswerNullFeedbackMessages(prev, feedback, idFactory 
         intent: 'what_to_answer',
         text: feedback,
         isStreaming: false,
+        ...extra,
       },
     ];
   }
@@ -124,6 +126,7 @@ export function applyWhatToAnswerNullFeedbackMessages(prev, feedback, idFactory 
       ...updated[openIdx],
       text: feedback,
       isStreaming: false,
+      ...extra,
     };
     return updated;
   }
@@ -135,6 +138,7 @@ export function applyWhatToAnswerNullFeedbackMessages(prev, feedback, idFactory 
       intent: 'what_to_answer',
       text: feedback,
       isStreaming: false,
+      ...extra,
     },
   ];
 }
@@ -156,4 +160,20 @@ export function discardStreamingByIntentMessages(prev, intent = 'what_to_answer'
   const updated = [...prev];
   updated.splice(openIdx, 1);
   return updated;
+}
+
+/**
+ * Remove rows of one intent that were closed with no words in them.
+ *
+ * A quick action overtaken before its first word leaves one: the next action's
+ * placeholder seals every open row (prepareIntelligenceStreamPlaceholderMessages),
+ * and the overtaken action never fills it. It draws nothing, but it stays in
+ * the list as an answer with no text. Only closed rows: an open row's words may
+ * be on screen without being in `text` yet, and that case belongs to
+ * discardStreamingByIntentMessages and its caller's own check.
+ */
+export function dropSealedEmptyByIntentMessages(prev, intent) {
+  if (!Array.isArray(prev)) return [];
+  const isSealedEmpty = (m) => m.role === 'system' && m.intent === intent && !m.isStreaming && !m.text;
+  return prev.some(isSealedEmpty) ? prev.filter((m) => !isSealedEmpty(m)) : prev;
 }

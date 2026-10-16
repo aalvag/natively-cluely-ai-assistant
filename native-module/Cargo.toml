@@ -35,6 +35,9 @@ cidre = { version = "0.11.10", features = ["ca", "cm", "av", "cat", "dispatch", 
 objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = ["NSWindow", "NSResponder"] }
 objc2-foundation = "0.2"
+# Blocks for EventKit's permission completion handler (calendar_events.rs).
+# Already in the lock as objc2's own dependency; same version.
+block2 = "0.5"
 # CGEventTap: session-wide keyboard interception for true Cluely-grade
 # stealth input. The tap captures keystrokes BEFORE they reach the
 # foreground app, so the user can type into Natively while Zoom/browser
@@ -70,5 +73,12 @@ windows = { version = "0.52.0", features = [
     "Win32_UI_Accessibility",
     "Win32_System_LibraryLoader",
     "Win32_Foundation",
+    #   Win32_System_Registry             — the microphone consent store (meeting_signals.rs):
+    #                                       which apps are using the microphone right now.
+    "Win32_System_Registry",
+    #   Win32_System_Variant / Win32_System_Ole — a cached UI Automation property as a
+    #                                       VARIANT (call_tree.rs: a meeting link's address).
+    "Win32_System_Variant",
+    "Win32_System_Ole",
 ] }
 tracing = "0.1.44"

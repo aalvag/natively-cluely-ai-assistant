@@ -133,8 +133,11 @@ describe('worker isolation — source guards', () => {
     // regression: the bounded options are still computed and still passed.
     // Assert the invariant (bounded options reach session_options) rather than
     // one particular way of writing it.
-    assert.match(src, /const\s+sessionOptions\s*=\s*getBoundedOnnxSessionOptions\(\)/,
+    // Since 2026-10-15 the host may raise only the intra-op thread count for
+    // Whisper (init.intraOpThreads); both branches start from the bounded options.
+    assert.match(src, /const\s+sessionOptions\s*=[^;]*getBoundedOnnxSessionOptions\(\)[^;]*;/,
       'bounded ONNX session options must be computed in the worker');
+    assert.doesNotMatch(src, /enableCpuMemArena:\s*true/, 'the thread override must not turn the arena back on');
     assert.match(src, /session_options:\s*(sessionOptions|getBoundedOnnxSessionOptions\(\))/,
       'the bounded options must actually be passed as session_options on the pipeline');
   });
@@ -206,7 +209,14 @@ describe('worker isolation — source guards', () => {
       if (seen.has(name)) return;
       let manifest;
       try { manifest = req.resolve(`${name}/package.json`, { paths: [repoRoot] }); }
-      catch { return; }          // not installed on this platform — never packed
+      catch {
+        // A package with an `exports` map that omits ./package.json (sharp from
+        // 0.35) cannot be resolved by subpath even when installed, so look at the
+        // hoisted location before concluding it is absent.
+        const hoisted = path.join(repoRoot, 'node_modules', ...name.split('/'), 'package.json');
+        if (!fs.existsSync(hoisted)) return;   // not installed on this platform — never packed
+        manifest = hoisted;
+      }
       seen.add(name);
       const j = JSON.parse(fs.readFileSync(manifest, 'utf8'));
       for (const d of Object.keys(j.dependencies ?? {})) walk(d);

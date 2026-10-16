@@ -32,6 +32,11 @@ const ARCH_FAMILY_TARGETS = [
     { family: 'sharp', pkg: (a) => `@img/sharp-darwin-${a}` },
     { family: 'sharp-libvips', pkg: (a) => `@img/sharp-libvips-darwin-${a}` },
     { family: 'sqlite-vec', pkg: (a) => `sqlite-vec-darwin-${a}` },
+    // llama.cpp runtime for GGUF models. Named by backend, not by `darwin-<arch>`.
+    // npm installs only mac-arm64-metal on an Apple-Silicon host, so without
+    // scripts/ensure-node-llama-cpp-mac-deps.js the Intel pack has no runtime
+    // and no GGUF model can load there (getLlama({ build: 'never' })).
+    { family: 'node-llama-cpp', pkg: (a) => (a === 'arm64' ? '@node-llama-cpp/mac-arm64-metal' : '@node-llama-cpp/mac-x64') },
 ];
 
 /**
@@ -135,19 +140,67 @@ function verifyPackedNativeArch(appPath, targetArchName) {
 }
 
 // ─── Helper Disguise Configuration ───
-// Display name used for helper processes in Activity Monitor
-const DISGUISE_BASE = 'CoreServices';
+// Display name used for helper processes in Activity Monitor.
+//
+// Sourced from scripts/disguise-name.cjs (single source of truth) and kept in
+// lockstep with the build-time productName (package.json "build" →
+// "productName"). electron-builder already names the helper bundles +
+// executables "<productName> Helper (X)", and Chromium derives each helper's
+// launch path from the main executable's basename
+// (content::ChildProcessHost::GetChildPath → "<base> Helper (Renderer).app"),
+// so a CONSISTENT name is required across the main executable, CFBundleName and
+// the helper bundles. Stealth is reverted, so that name is the brand
+// ("Natively"); the plist pass below re-asserts it on CFBundleName/
+// CFBundleDisplayName so the metadata matches the on-disk executable.
+// ad-hoc signing is macOS-only, so use the darwin value.
+const DISGUISE_BASE = require('./disguise-name.cjs').darwin;
 
 const HELPER_SUFFIXES = ['', ' (GPU)', ' (Renderer)', ' (Plugin)'];
 
 /**
- * Update the display names inside each helper's Info.plist so Activity Monitor
- * shows "CoreServices Helper" instead of "Natively Helper".
+ * Re-assert the display name on the MAIN app's Info.plist so Finder/Dock/Spotlight
+ * show "Natively". Stealth is reverted, so productName is already the brand and
+ * the whole bundle (executable, CFBundleName, helpers) reads "Natively".
  *
- * IMPORTANT: We only modify CFBundleDisplayName and CFBundleName.
- * We do NOT rename the .app folders or the executable binaries — doing so
- * would break Electron's internal process spawning (Chromium hardcodes the
- * helper paths based on productName).
+ * ONLY CFBundleDisplayName is set here; CFBundleName is LEFT as the builder
+ * default (= productName). Electron/Chromium derives the helper app name from
+ * the main bundle's CFBundleName, so CFBundleName and the helper bundles must
+ * agree — they do, both being "Natively", because productName drives both. Do
+ * NOT hand-set CFBundleName to a value that differs from productName / the
+ * helper bundle names, or Electron fails to find its helper app at launch
+ * (electron_main_delegate_mac.mm "Unable to find helper app" → SIGTRAP at
+ * ElectronMain; this was the v2.9.1 launch crash, from the brand/alias split).
+ * packaging-config.test.mjs guards that this pass does not hand-set CFBundleName.
+ */
+function enforceMainAppDisplayName(appOutDir, appName) {
+    const mainAppPath = path.join(appOutDir, `${appName}.app`);
+    const plistPath = path.join(mainAppPath, 'Contents', 'Info.plist');
+
+    if (!fs.existsSync(plistPath)) {
+        console.log('[Main Display] Main app Info.plist not found, skipping.');
+        return;
+    }
+
+    try {
+        // CFBundleDisplayName = what Finder/Dock/Spotlight shows (BRAND). Safe to brand.
+        execSync(`/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 'Natively'" "${plistPath}"`, { stdio: 'pipe' });
+        // Do NOT touch CFBundleName — it must stay the disguise alias so Electron finds
+        // "<alias> Helper.app". Setting it to the brand is the "Unable to find helper app"
+        // launch crash.
+        console.log('[Main Display] Main app CFBundleDisplayName set to "Natively" (CFBundleName left as the disguise alias)');
+    } catch (err) {
+        console.warn('[Main Display] PlistBuddy warning for main app:', err.message);
+    }
+}
+
+/**
+ * Re-assert the disguised name on each helper's Info.plist so the metadata
+ * (CFBundleName / CFBundleDisplayName) matches the on-disk executable
+ * ("<DISGUISE_BASE> Helper (X)") — no "Natively" left in the bundle.
+ *
+ * The .app folders and executable binaries are already named by
+ * electron-builder from productName; we do NOT rename them here (that would
+ * desync CFBundleExecutable and the signed binary).
  */
 function disguiseHelperPlists(appOutDir, appName) {
     const frameworksDir = path.join(appOutDir, `${appName}.app`, 'Contents', 'Frameworks');
@@ -190,6 +243,9 @@ exports.default = async function (context) {
     }
 
     const appOutDir = context.appOutDir;
+    // The bundle folder is named from productName (now the brand, "Natively").
+    // appName is used as a path component to find the .app and its helper
+    // bundles, so it MUST be the on-disk folder name (productFilename).
     const appName = context.packager.appInfo.productFilename;
     const appPath = path.join(appOutDir, `${appName}.app`);
 
@@ -209,6 +265,7 @@ exports.default = async function (context) {
     // so a later Developer ID signature will cover these edits correctly.
     try {
         disguiseHelperPlists(appOutDir, appName);
+        enforceMainAppDisplayName(appOutDir, appName);
     } catch (error) {
         console.error('[Helper Disguise] Failed to update helper plists:', error);
         // Non-fatal: continue to signing

@@ -12,6 +12,7 @@ export interface ShortcutConfig {
     answer: string[];
     codeHint: string[];
     brainstorm: string[];
+    acceptSuggestion: string[];
     shorten: string[];
     recap: string[];
     scrollUp: string[];
@@ -33,6 +34,8 @@ export interface ShortcutConfig {
     resetCancel: string[];
     takeScreenshot: string[];
     selectiveScreenshot: string[];
+    // Dictation (Settings › Audio): mic to clipboard
+    dictation: string[];
 }
 
 function buildDefaultShortcuts(): ShortcutConfig {
@@ -47,6 +50,7 @@ function buildDefaultShortcuts(): ShortcutConfig {
         answer: [mod, '5'],
         codeHint: [mod, '6'],
         brainstorm: [mod, '7'],
+        acceptSuggestion: [mod, '8'],
         shorten: [],
         recap: [],
         scrollUp: [mod, '↑'],
@@ -65,7 +69,8 @@ function buildDefaultShortcuts(): ShortcutConfig {
         capturePage: [mod, 'Y'],
         resetCancel: [mod, 'R'],
         takeScreenshot: [mod, 'H'],
-        selectiveScreenshot: [mod, shift, 'H']
+        selectiveScreenshot: [mod, shift, 'H'],
+        dictation: [mod, shift, 'D'],
     };
 }
 
@@ -95,6 +100,7 @@ const BACKEND_ID_TO_ACTION: Partial<Record<string, keyof ShortcutConfig>> = {
     'chat:answer': 'answer',
     'chat:codeHint': 'codeHint',
     'chat:brainstorm': 'brainstorm',
+    'chat:acceptSuggestion': 'acceptSuggestion',
     'chat:shorten': 'shorten',
     'chat:recap': 'recap',
     'chat:scrollUp': 'scrollUp',
@@ -117,6 +123,7 @@ const BACKEND_ID_TO_ACTION: Partial<Record<string, keyof ShortcutConfig>> = {
     'general:reset-cancel': 'resetCancel',
     'general:take-screenshot': 'takeScreenshot',
     'general:selective-screenshot': 'selectiveScreenshot',
+    'dictation:toggle': 'dictation',
 };
 
 export const useShortcuts = () => {
@@ -293,6 +300,7 @@ export const useShortcuts = () => {
             case 'answer': backendId = 'chat:answer'; break;
             case 'codeHint': backendId = 'chat:codeHint'; break;
             case 'brainstorm': backendId = 'chat:brainstorm'; break;
+            case 'acceptSuggestion': backendId = 'chat:acceptSuggestion'; break;
             case 'shorten': backendId = 'chat:shorten'; break;
             case 'recap': backendId = 'chat:recap'; break;
             case 'scrollUp': backendId = 'chat:scrollUp'; break;
@@ -314,6 +322,7 @@ export const useShortcuts = () => {
             case 'resetCancel': backendId = 'general:reset-cancel'; break;
             case 'takeScreenshot': backendId = 'general:take-screenshot'; break;
             case 'selectiveScreenshot': backendId = 'general:selective-screenshot'; break;
+            case 'dictation': backendId = 'dictation:toggle'; break;
             default: break;
         }
 

@@ -4,18 +4,18 @@ import { useResolvedTheme } from '../../hooks/useResolvedTheme';
 import { DisclosureChevron } from '../ui/AccordionSection';
 import { SettingsToggle } from './SettingsToggle';
 
-// The parts General, Audio and Sync are built from, as one module, so a pane
+// The parts General, Audio and Companion are built from, as one module, so a pane
 // that adopts the Settings look takes the same measurements rather than a copy
 // of them. Intelligence and Provider performance use it.
 //
-// PhoneMirrorSettings.tsx (Sync) still carries its own copies of these —
-// SyncRow, Switch, BTN, SectionHeading, its tone strings and its motion
+// PhoneMirrorSettings.tsx (Companion) still carries its own copies of these —
+// CompanionRow, Switch, BTN, SectionHeading, its tone strings and its motion
 // vocabulary (Presence, Collapse, useSettledFlag) are the originals this file
-// was lifted from, value for value. Moving Sync onto this module is a pure
+// was lifted from, value for value. Moving Companion onto this module is a pure
 // refactor that was left out of the Intelligence redesign on purpose.
 
 // ── Motion ───────────────────────────────────────────────────────────────
-// Sync's vocabulary, so the two panes move alike: the transitions.dev token
+// Companion's vocabulary, so the two panes move alike: the transitions.dev token
 // scale, as values. framer-motion drives the pieces that have to sequence an
 // exit before an entrance, which a React re-render cannot do with CSS alone.
 // Every state change goes through one of these moves:
@@ -55,8 +55,19 @@ export function useMotionReadyAfter(loaded: boolean): boolean {
   return ready;
 }
 
-/** Height + opacity, the shared Disclosure's move, but silent before hydration. */
-export const Collapse: React.FC<{ open: boolean; children: React.ReactNode }> = ({ open, children }) => {
+/**
+ * Height + opacity, the shared Disclosure's move, but silent before hydration.
+ * In a `space-y-*` stack, pass `className="!mt-0"` and put the gap INSIDE as
+ * top padding: the stack's margin sits outside the animated height, so it would
+ * jump in whole before the fold. `skipStagger` for a direct child of a
+ * `data-settings-stagger` container, whose entrance would otherwise replay.
+ */
+export const Collapse: React.FC<{ open: boolean; className?: string; skipStagger?: boolean; children: React.ReactNode }> = ({
+  open,
+  className,
+  skipStagger,
+  children,
+}) => {
   const ready = React.useContext(SettingsMotionReady);
   const reduce = useReducedMotion();
   return (
@@ -64,6 +75,8 @@ export const Collapse: React.FC<{ open: boolean; children: React.ReactNode }> = 
       {open ? (
         <motion.div
           key="collapse"
+          className={className}
+          data-stagger-skip={skipStagger ? '' : undefined}
           initial={ready ? (reduce ? { opacity: 0 } : { height: 0, opacity: 0 }) : false}
           animate={reduce ? { opacity: 1 } : { height: 'auto', opacity: 1 }}
           exit={reduce ? { opacity: 0 } : { height: 0, opacity: 0 }}
@@ -111,14 +124,19 @@ export const SettingsMenu: React.FC<{
   /** The corner that touches the trigger, e.g. 'top right' for a right-0 menu. */
   origin?: string;
   className?: string;
+  /** For a menu that is a listbox (AI Providers' model and language pickers). */
+  role?: string;
+  ariaLabel?: string;
   children: React.ReactNode;
-}> = ({ open, origin = 'top', className = '', children }) => {
+}> = ({ open, origin = 'top', className = '', role, ariaLabel, children }) => {
   const reduce = useReducedMotion();
   return (
     <AnimatePresence>
       {open ? (
         <motion.div
           key="menu"
+          role={role}
+          aria-label={ariaLabel}
           className={className}
           style={{ transformOrigin: origin }}
           initial={{ opacity: 0, scale: reduce ? 1 : 0.97 }}
@@ -195,10 +213,16 @@ export const Presence: React.FC<{
   id: string | null;
   /** Text only: a block-level swap (a whole description) rather than inline. */
   block?: boolean;
+  /** Icon only: the fixed slot the glyphs cross-fade in. 14px suits a button
+      glyph; a row's 40px tile holds a 20px one (`w-5 h-5`). */
+  slotClassName?: string;
+  /** Readiness for a pane that tracks its own load, in place of a provider. */
+  ready?: boolean;
   className?: string;
   children?: React.ReactNode;
-}> = ({ kind, id, block, className = '', children }) => {
-  const ready = React.useContext(SettingsMotionReady);
+}> = ({ kind, id, block, slotClassName = 'w-3.5 h-3.5', ready: readyProp, className = '', children }) => {
+  const readyCtx = React.useContext(SettingsMotionReady);
+  const ready = readyProp ?? readyCtx;
   const m = presenceMotion(kind, !!useReducedMotion());
   const cls = `${block ? 'block' : m.className} ${className}`;
   // Before hydration: plain markup, no AnimatePresence at all. Gating only the
@@ -211,7 +235,7 @@ export const Presence: React.FC<{
     const Plain = kind === 'control' ? 'div' : 'span';
     const body = id !== null ? <Plain className={cls}>{children}</Plain> : null;
     return kind === 'icon' ? (
-      <span className="relative inline-block w-3.5 h-3.5 shrink-0" aria-hidden="true">
+      <span className={`relative inline-block ${slotClassName} shrink-0`} aria-hidden="true">
         {body}
       </span>
     ) : (
@@ -232,13 +256,45 @@ export const Presence: React.FC<{
     </AnimatePresence>
   );
   return kind === 'icon' ? (
-    <span className="relative inline-block w-3.5 h-3.5 shrink-0" aria-hidden="true">
+    <span className={`relative inline-block ${slotClassName} shrink-0`} aria-hidden="true">
       {presence}
     </span>
   ) : (
     presence
   );
 };
+
+/**
+ * A control's label changing state without resizing the control. Every label
+ * it can show sits invisibly in ONE grid cell, so the control keeps the widest
+ * one's width in whatever font the platform renders (SF Pro and Segoe UI
+ * measure differently, so a fixed min-width is a guess), and the visible label
+ * swaps (Presence "text"). A label that grew on "Testing…" shoved every control
+ * beside it sideways. `sizers` are the labels as they render, with any spinner
+ * swapped for a same-size blank: a hidden `.animate-spin` would still read as
+ * "loading" to GenieModal's snapshot check. Always ready — labels only change
+ * in answer to a click or its result.
+ */
+export const SwapLabel: React.FC<{ id: string; sizers: React.ReactNode[]; children: React.ReactNode }> = ({
+  id,
+  sizers,
+  children,
+}) => (
+  <span className="grid place-items-center">
+    {sizers.map((node, i) => (
+      <span key={i} aria-hidden="true" className="invisible col-start-1 row-start-1">
+        {node}
+      </span>
+    ))}
+    <span className="col-start-1 row-start-1">
+      <SettingsMotionReady.Provider value={true}>
+        <Presence kind="text" id={id}>
+          {children}
+        </Presence>
+      </SettingsMotionReady.Provider>
+    </span>
+  </span>
+);
 
 /**
  * A busy flag that only shows once the work has run long enough to be worth a
@@ -280,12 +336,34 @@ export const SETTINGS_BTN = `${SETTINGS_BTN_BASE} ${SETTINGS_BTN_NEUTRAL}`;
 // Audio's card: anything that opens underneath a row sits in one of these.
 export const SETTINGS_CARD = 'bg-bg-card rounded-xl border border-border-subtle';
 
-// The field look Sync uses for a pairing link, as an <input>.
+// The field look Companion uses for a pairing link, as an <input>.
 export const SETTINGS_INPUT =
   'w-full rounded-lg border border-border-subtle bg-bg-input px-3 py-2 text-xs text-text-primary transition-colors focus:outline-none focus:border-accent-primary disabled:opacity-50';
 
-// Sync's field label ("PAIRING LINK").
+// Companion's field label ("PAIRING LINK").
 export const SETTINGS_FIELD_LABEL = 'text-xs font-medium text-text-secondary uppercase tracking-wide block';
+
+/* A dropdown on the right of a settings row grows with its label, up to
+   PICKER_LABEL_MAX_CHARS characters ("Gemini 3.8 Flash"); capPickerLabel cuts
+   anything longer. Its menu sizes to its options, so a short label like "Auto"
+   still opens a menu wide enough to read the choices in it. */
+export const PICKER_LABEL_MAX_CHARS = 16;
+export const PICKER_MENU_WIDTH = 'min-w-full w-max max-w-[18rem]';
+
+/* The Active Embedding Model and Active Reranker picker boxes carry this
+   attribute and this min-width; the Retrieval page sets the variable to the
+   wider of the two so they match (useMatchedHeroPickers). Anywhere else the
+   variable is unset and each box fits its own label. */
+export const RETRIEVAL_HERO_PICKER_ATTR = 'data-retrieval-hero-picker';
+export const RETRIEVAL_HERO_PICKER_MIN_WIDTH = 'var(--retrieval-hero-picker-w, 0px)';
+
+/** A label longer than `max` characters (spaces included) keeps its first
+ *  max-1 and ends in an ellipsis, so what shows is never more than `max`. */
+export const capPickerLabel = (label: string, max: number = PICKER_LABEL_MAX_CHARS): string => {
+    const chars = Array.from(label);
+    if (chars.length <= max) return label;
+    return `${chars.slice(0, max - 1).join('').trimEnd()}…`;
+};
 
 // Audio's section heading.
 export const SettingsSectionHeading: React.FC<{ title: string; subtitle?: React.ReactNode }> = ({ title, subtitle }) => (
@@ -361,7 +439,7 @@ export const SettingsSwitch: React.FC<{ checked: boolean; onChange: () => void; 
   />
 );
 
-// General's ADVANCED disclosure heading. `count` is Sync's "· 2 on" suffix, so
+// General's ADVANCED disclosure heading. `count` is Companion's "· 2 on" suffix, so
 // a switch turned on inside a closed disclosure is never invisible behind it.
 export const SettingsDisclosureButton: React.FC<{
   open: boolean;
@@ -392,7 +470,7 @@ export type SettingsTone = 'warn' | 'danger' | 'ok';
 
 // Status text. The palette's 300/400 shades are tuned for the dark canvas and
 // fall well under 4.5:1 on the light one, so light takes the 700/800s. Green is
-// the one step darker than Sync's copy: green-700 measured 4.49:1 as bare 12px
+// the one step darker than Companion's copy: green-700 measured 4.49:1 as bare 12px
 // text on the light canvas (a provider grade), so it goes to 800.
 export function useSettingsTones(): Record<SettingsTone, string> & { text: Record<SettingsTone, string> } {
   const isLight = useResolvedTheme() === 'light';
@@ -408,7 +486,7 @@ export function useSettingsTones(): Record<SettingsTone, string> & { text: Recor
   };
 }
 
-// Sync's inline notice. Owns its bottom gap, like every row child.
+// Companion's inline notice. Owns its bottom gap, like every row child.
 // `className` replaces the bottom gap when a notice sits in a spaced stack.
 // An `alert` shakes once as it lands (`.t-notice-shake`, src/index.css), and is
 // re-keyed on `shakeKey` so a DIFFERENT message replays the shake while a
@@ -443,7 +521,7 @@ export const SettingsNotice: React.FC<{
   );
 };
 
-// Sync's footnote under a section.
+// Companion's footnote under a section.
 export const SettingsFootnote: React.FC<{ icon: React.ReactNode; children: React.ReactNode }> = ({ icon, children }) => (
   <p className="flex items-start gap-2 px-1 mt-3 text-xs text-text-secondary">
     <span className="mt-px shrink-0">{icon}</span>

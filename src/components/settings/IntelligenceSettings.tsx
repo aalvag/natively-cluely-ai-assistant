@@ -1,7 +1,7 @@
 import {
   AlertCircle, BookmarkCheck, Brain, Check, Copy, Download, FolderOpen, Gauge, History, Image as ImageIcon,
   ImageDown, Loader2, MessagesSquare, RefreshCw, Repeat2, Route, Save, ScrollText, ShieldAlert,
-  SlidersHorizontal, Tags, Trash2, Wand2, Wifi, WifiOff,
+  SlidersHorizontal, Tags, Trash2, Wand2, Wifi, WifiOff, Workflow,
   // Reply, UserCheck — icons of the two commented-out switches below (conversationMemoryV2, profileTreeV2)
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -76,6 +76,11 @@ const FLAG_META: Record<string, { label: string; desc: string; group: FlagGroup 
   speakerLabelsV1: { label: 'Speaker labels', desc: 'Uses the names you give speakers in your notes and action items.', group: 'notes' },
   // profileTreeV2: { label: 'Extra candidate-voice check', desc: 'One more pass to catch answers that slip out of your first-person voice.', group: 'notes' }, // commented out — see conversationMemoryV2 above
   answerDiversityGuard: { label: 'Repetition guard', desc: 'Rewords a live answer’s opening when it repeats an earlier one.', group: 'notes' },
+  // System-design diagram artifacts (2026-10-01). One switch for both halves — the
+  // diagram contract in the answer prompt and the Mermaid renderer — so there is no
+  // "renderer on, generator off" state. Call sites: electron/llm/diagramPromptSignals.ts
+  // (every prompt path) and src/lib/diagram/diagramRuntime.ts (every surface that draws).
+  systemDesignDiagrams: { label: 'Diagrams and charts', desc: 'Draws diagrams and charts in answers when they help. Off shows them as code.', group: 'notes' },
   // inMeetingSearchV2 / lectureIntelligenceV2 / diagramIntelligence removed (2026-09-25),
   // together with the "Try it" section that was their ONLY caller in the app: those three
   // flags gate nothing but the search-in-meeting / generate-lecture-notes /
@@ -120,6 +125,7 @@ const FLAG_ICON: Record<string, LucideIcon> = {
   // conversationMemoryV2: Reply,   // switch commented out (see FLAG_META)
   // profileTreeV2: UserCheck,      // switch commented out (see FLAG_META)
   answerDiversityGuard: Repeat2,
+  systemDesignDiagrams: Workflow,
   globalSearchV2: History,
   trace: Route,
 };
@@ -163,10 +169,10 @@ const FlagRowView: React.FC<{ row: FlagRow; onToggle: (row: FlagRow) => void }> 
 };
 interface HindsightCfg { baseUrl: string; hasApiKey: boolean; autoStart: boolean; serverCommand: string; llmProvider: string; available: boolean; mode: 'local' | 'cloud'; synthetic: boolean; explicitlyDisabled: boolean; authFailed: boolean }
 
-// Inline copyable command/snippet — Sync's pairing-link field and its Copy button. Used in
+// Inline copyable command/snippet — Companion's pairing-link field and its Copy button. Used in
 // the Hindsight setup card so a non-technical user can grab the install / launch /
 // env-export commands with one click instead of typing them by hand. Copy → Copied is
-// Sync's move too: the glyph cross-fades, the label swaps, the tone eases to green.
+// Companion's move too: the glyph cross-fades, the label swaps, the tone eases to green.
 const CopyBlock: React.FC<{ text: string; label?: string }> = ({ text, label }) => {
   const t = useT();
   const tones = useSettingsTones();
@@ -231,7 +237,7 @@ const ContextDebugSection: React.FC = () => {
   // Clearing is confirmed inline, not with <ConfirmDialog>: that portals to <body>
   // at z-50, and Settings sits inside GenieModal at z-index 300, so the dialog
   // opened BEHIND Settings (verified live 2026-09-25: open, but elementFromPoint at
-  // its centre hit Settings) while its overlay still took the input. Same fix as Sync.
+  // its centre hit Settings) while its overlay still took the input. Same fix as Companion.
   const [confirmClear, setConfirmClear] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -303,17 +309,19 @@ const ContextDebugSection: React.FC = () => {
       description={t('Local logs. Verbose adds document text.')}
       control={levelPicker}
     >
-      {envForced ? (
+      {/* Both notices fold in and out like the log path below, rather than
+          shoving the rows under them (Verbose turns the second one on). */}
+      <Collapse open={!!envForced}>
         <SettingsNotice tone={tones.warn} icon={<ShieldAlert size={14} />}>
           {t('Set by NATIVELY_CONTEXT_DEBUG — the environment variable overrides this setting.')}
         </SettingsNotice>
-      ) : null}
+      </Collapse>
 
-      {cfg.contentInclusion ? (
+      <Collapse open={!!cfg.contentInclusion}>
         <SettingsNotice tone={tones.warn} icon={<ShieldAlert size={14} />}>
           {t('Full local evidence logging is enabled (development build). Logs may contain sensitive personal data.')}
         </SettingsNotice>
-      ) : null}
+      </Collapse>
 
       {/* The log path grows in when logging is switched on and folds away with Off. */}
       <Collapse open={cfg.level !== 'off' && !!logPath}>
@@ -411,7 +419,7 @@ type ConnStatus = 'not-configured' | 'checking' | 'connected' | 'unreachable' | 
 // The badge beside the Hindsight row's title. Only the two healthy/neutral states get
 // one: the Liquid Glass tag has no amber or red tint, and the failure states need a
 // Retry and a sentence, so they grow in as a notice under the row instead.
-//   Connected — Sync's badge pop (500ms bounce in): a connection just made earns it.
+//   Connected — Companion's badge pop (500ms bounce in): a connection just made earns it.
 //   Checking  — quiet (control move, no overshoot), and only once a check has run
 //               ~250ms: a health check that answers in 80ms must not flash a tag.
 const StatusBadge: React.FC<{ status: ConnStatus; testing: boolean }> = ({ status, testing }) => {
@@ -757,11 +765,11 @@ export const IntelligenceSettings: React.FC = () => {
     // Every switch is visible under its category; only diagnostics sit behind a
     // disclosure, at the foot, as General's ADVANCED does.
     //
-    // Built from General's parts, as Sync is: Audio's section heading, General's row
+    // Built from General's parts, as Companion is: Audio's section heading, General's row
     // (40px tile, 14px bold title, 12px description, control), General's secondary
     // button and ADVANCED disclosure, Audio's card for anything that opens under a
     // row, and the Liquid Glass badge/button General and Billing use. There is no
-    // pane title, matching Audio and Sync — the first section heading leads.
+    // pane title, matching Audio and Companion — the first section heading leads.
     <SettingsMotionReady.Provider value={motionReady}>
     <div className="space-y-8 animated fadeIn" data-settings-stagger>
       {/* ── Memory: Hindsight long-term memory, then the memory switches ── */}
@@ -798,7 +806,7 @@ export const IntelligenceSettings: React.FC = () => {
               <Presence kind="control" id={setupControlId}>
                 {setupControlId === 'cta' ? (
                   // The one primary action on the pane, in the Liquid Glass action
-                  // colour Sync's Connect uses.
+                  // colour Companion's Connect uses.
                   <LiquidGlassButton variant="action" className="lg-sm" aria-expanded={showSetup} onClick={() => setShowSetup(true)}>
                     {setupToggleLabel}
                   </LiquidGlassButton>

@@ -8,9 +8,16 @@ import { DatabaseManager, Meeting } from './db/DatabaseManager';
 import { GROQ_SUMMARY_JSON_PROMPT } from './llm';
 import { buildPostCallEnhancements } from './services/post-call/PostCallWorkflow';
 import { MeetingContextAssembler } from './services/meeting/MeetingContextAssembler';
+import { followUpRedraftPlan } from './services/meeting/FollowUpDraftGenerator';
 import { cleanMeetingTitle, isAnswerFragmentTitle, isAnswerShapedGeneration } from './services/meeting/MeetingSummaryV3';
 import { NOTE_CALL_TIMEOUT_MS } from './services/meeting/generateStructured';
 import type { MeetingSummaryTelemetryMeta } from './services/meeting/types';
+import { TranscriptNormalizer } from './services/meeting/TranscriptNormalizer';
+import { buildShortSessionPrompt, countHumanContent, isShortSession, parseShortSessionNotes } from './services/meeting/shortSessionNotes';
+import { notesContextFromParams } from './services/meeting/MeetingContextAssembler';
+import { formatSharedScreensBlock, sharedScreenEntries } from './services/meeting/screenShareNotes';
+import { buildNotesInputs, type NotesInputs } from './services/meeting/notesInputs';
+import { buildV2FallbackPrompts, parseV2SummaryResponse, v2NotesHaveContent } from './services/meeting/v2FallbackNotes';
 import { MeetingMemoryService, buildPersistedMeetingMemory } from './intelligence/MeetingMemoryService';
 import type { MeetingMemoryProvenanceTelemetry } from './intelligence/MeetingMemoryService';
 import { LongTermMemoryService } from './intelligence/memory/LongTermMemoryService';
@@ -18,6 +25,9 @@ import { isIntelligenceFlagEnabled } from './intelligence/intelligenceFlags';
 import { recordAttribution, hindsightModeFor } from './intelligence/IntelligenceAttribution';
 import { telemetryService } from './services/telemetry/TelemetryService';
 import type { ProviderDataScopePolicy } from './llm/ProviderRouter';
+import { LiveMeetingJournal, type LiveJournalSnapshot, type MeetingRecoveryMeta } from './services/meeting/LiveMeetingJournal';
+import { getUserDictionary } from './audio/userDictionary';
+import { isArchivableNotes } from './services/meeting/notesVersions';
 const crypto = require('crypto');
 
 /** Longest a derived fallback title may be, before word-boundary truncation. */
@@ -96,9 +106,11 @@ function deriveDeterministicTitle(parts: { topics: string[]; takeaways: string[]
  */
 export async function generateTitleFromSummary(
     llmHelper: { generateMeetingSummary: (system: string, context: string, groq?: string, opts?: any) => Promise<string> },
-    summary: { title?: string; tldr?: string[]; keyPoints?: string[]; overview?: string; topics?: string[] }
+    summary: { title?: string; tldr?: string[]; keyPoints?: string[]; overview?: string; topics?: string[] },
+    // Who the meeting was with (meetingNotesContext.titleContextHint), 2026-10-15. Optional.
+    contextHint?: string,
 ): Promise<string | null> {
-    return (await generateTitleFromSummaryWithSource(llmHelper, summary)).title;
+    return (await generateTitleFromSummaryWithSource(llmHelper, summary, contextHint)).title;
 }
 
 /** Where a generated title actually came from. `none` = nothing groundable to name. */
@@ -120,7 +132,8 @@ export interface GeneratedTitle {
  */
 export async function generateTitleFromSummaryWithSource(
     llmHelper: { generateMeetingSummary: (system: string, context: string, groq?: string, opts?: any) => Promise<string> },
-    summary: { title?: string; tldr?: string[]; keyPoints?: string[]; overview?: string; topics?: string[] }
+    summary: { title?: string; tldr?: string[]; keyPoints?: string[]; overview?: string; topics?: string[] },
+    contextHint?: string,
 ): Promise<GeneratedTitle> {
     const asFallback = (t: string | null): GeneratedTitle => ({ title: t, source: t ? 'fallback' : 'none' });
     const clean = (arr?: string[]) => (arr || []).map(t => String(t || '').trim()).filter(Boolean);
@@ -155,6 +168,9 @@ export async function generateTitleFromSummaryWithSource(
     const context = [
         takeaways.length ? `Key takeaways:\n${takeaways.map(t => `- ${t}`).join('\n')}` : (overview ? `Overview:\n${overview}` : ''),
         topics.length ? `Topics: ${topics.join(', ')}` : '',
+        // Background only: the grounding check below still reads the notes alone,
+        // so a title built from the invite and nothing in the notes is rejected.
+        typeof contextHint === 'string' && contextHint.trim() ? contextHint.trim().slice(0, 400) : '',
     ].filter(Boolean).join('\n\n');
 
     let generatedTitle = '';
@@ -251,6 +267,108 @@ export function shouldReplaceTitleOnRegenerate(existing: string | null | undefin
     return isDefaultMeetingTitle(existing);
 }
 
+/** The database as the live journal's store; null while the database is unavailable. */
+function liveJournalStore(): import('./services/meeting/LiveMeetingJournal').LiveJournalStore | null {
+    try {
+        const db = DatabaseManager.getInstance();
+        return { write: (row) => db.writeLiveMeeting(row), remove: (id) => db.removeLiveMeeting(id) };
+    } catch {
+        return null;
+    }
+}
+
+/** Longest notes-window text kept for a meeting (the prompts read the first 8,000 characters). */
+const LIVE_USER_NOTES_MAX_CHARS = 50_000;
+
+/** "m:ss", as the meetings list shows a duration. */
+function formatDuration(durationMs: number): string {
+    const minutes = Math.floor(durationMs / 60000);
+    const seconds = Math.floor((durationMs % 60000) / 1000);
+    return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
+}
+
+/**
+ * The user's dictionary (Settings > Audio) as the notes' spelling list, unless
+ * the caller passed one. Undefined when the list is empty, so the prompts stay
+ * exactly as before for users without a dictionary.
+ */
+/** The notes' SHARED SCREENS block for a meeting's saved descriptions; undefined for none. */
+function sharedScreensBlockFor(raw: unknown): string | undefined {
+    let timeZone: string | undefined;
+    try { timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { /* UTC */ }
+    return formatSharedScreensBlock(raw, { timeZone }) || undefined;
+}
+
+function notesVocabulary(explicit?: string[]): string[] | undefined {
+    if (Array.isArray(explicit)) return explicit;
+    const list = getUserDictionary();
+    return list.length > 0 ? list : undefined;
+}
+
+/** What processAndSaveMeeting reads from the session's metadata (Stop's snapshot, or a recovery's). */
+type ProcessMetadata = {
+    title?: string;
+    calendarEventId?: string;
+    calendarEvent?: import('./services/calendar/calendarSessionMatch').CalendarEventSnapshot;
+    callKey?: string;
+    source?: 'manual' | 'calendar';
+    /** A recovered meeting's saved speaking record (the live roster is gone). */
+    callRoster?: { participants: string[]; spans: Array<{ name: string; start: number; end: number }>; count?: number };
+    /** The user's name as the Zoom / Teams window showed it: names "Me" when the calendar gives no name. */
+    callSelfName?: string;
+    /** What others shared on screen, described (ScreenShareContext): context for the notes. */
+    sharedScreens?: import('./services/meeting/ScreenShareContext').SharedScreenEntry[];
+    /** The user's own notes typed during the meeting; the notes are built around them when present. */
+    userNotes?: string;
+    /** The user's spelling list for names and terms. */
+    vocabulary?: string[];
+};
+
+/**
+ * Memory-eligible lines, as Stop counts them (spoken lines; typed chat and
+ * answers are not). Undefined for rows saved before lines carried their origin
+ * (2026-10-04): those are processed as they always were.
+ */
+function countMemoryEligible(transcript: TranscriptSegment[]): number | undefined {
+    if (!transcript.some((seg: any) => typeof seg?.origin === 'string' && seg.origin.length > 0)) return undefined;
+    try {
+        const { isMemoryEligibleSegment } = require('./intelligence/MeetingMemoryService');
+        return transcript.filter((seg: any) => isMemoryEligibleSegment(seg)).length;
+    } catch {
+        return transcript.length;
+    }
+}
+
+/**
+ * The metadata and mode a recovered meeting is processed with: what was saved
+ * with it, and otherwise what its row still holds (the linked calendar event).
+ * Before 2026-10-15 recovery passed nothing, and a recovered meeting lost its
+ * calendar speaker names, its Meet names and its mode.
+ */
+export function recoveryMetadataFor(
+    details: { calendarEventId?: string; calendarEvent?: import('./services/calendar/calendarSessionMatch').CalendarEventSnapshot; source?: 'manual' | 'calendar'; userNotes?: string | null },
+    saved: Partial<MeetingRecoveryMeta> | null,
+): { metadata: ProcessMetadata | null; mode: { id: string; name: string; templateType: string } | null } {
+    const metadata: ProcessMetadata = {};
+    const eventId = saved?.calendarEventId ?? details.calendarEventId;
+    if (eventId) metadata.calendarEventId = eventId;
+    const event = saved?.calendarEvent ?? details.calendarEvent;
+    if (event && event.id === eventId) metadata.calendarEvent = event;
+    if (saved?.title) metadata.title = saved.title;
+    else if (metadata.calendarEvent?.title) metadata.title = metadata.calendarEvent.title;
+    const source = saved?.source ?? details.source;
+    if (source === 'manual' || source === 'calendar') metadata.source = source;
+    if (typeof saved?.callKey === 'string') metadata.callKey = saved.callKey;
+    if (saved?.callRoster && Array.isArray(saved.callRoster.participants) && Array.isArray(saved.callRoster.spans)) metadata.callRoster = saved.callRoster;
+    if (typeof saved?.callSelfName === 'string' && saved.callSelfName.trim()) metadata.callSelfName = saved.callSelfName;
+    if (Array.isArray(saved?.sharedScreens) && saved.sharedScreens.length > 0) metadata.sharedScreens = saved.sharedScreens;
+    // The user's notes from the meeting: the live copy's, else the meeting row's.
+    const userNotes = typeof saved?.userNotes === 'string' && saved.userNotes.trim() ? saved.userNotes : details.userNotes;
+    if (typeof userNotes === 'string' && userNotes.trim()) metadata.userNotes = userNotes;
+    const mode = saved?.mode && typeof saved.mode.id === 'string' ? saved.mode : null;
+    return { metadata: Object.keys(metadata).length > 0 ? metadata : null, mode };
+}
+
 export class MeetingPersistence {
     private session: SessionTracker;
     private llmHelper: LLMHelper;
@@ -258,6 +376,304 @@ export class MeetingPersistence {
     constructor(session: SessionTracker, llmHelper: LLMHelper) {
         this.session = session;
         this.llmHelper = llmHelper;
+        this.liveJournal = new LiveMeetingJournal({
+            store: () => liveJournalStore(),
+            snapshot: () => this.liveSnapshot(),
+        });
+    }
+
+    // ── The running meeting on disk (LiveMeetingJournal) ─────────────────
+    //
+    // The transcript is written as it grows, so a meeting still running when
+    // the app quits, crashes or the OS ends the session is recovered at the
+    // next launch instead of lost. Stop saves the meeting under the journal's
+    // id and removes the live copy.
+    private liveJournal: LiveMeetingJournal;
+    // Meetings whose notes are being written right now, so a recovery pass
+    // never writes them a second time.
+    private processing = new Set<string>();
+    private recovering: Promise<void> | null = null;
+
+    // What the user is typing in the notes window (2026-10-15). Held here, not
+    // in the session's metadata, so a calendar link or a mode change that
+    // replaces the metadata never drops it. Kept across a meeting start: notes
+    // typed just before Start belong to the meeting. Stop takes it.
+    private liveUserNotes = '';
+
+    /** The notes window's text for the running (or next) meeting. */
+    public setLiveUserNotes(text: string): void {
+        const next = typeof text === 'string' ? text.slice(0, LIVE_USER_NOTES_MAX_CHARS) : '';
+        if (next === this.liveUserNotes) return;
+        this.liveUserNotes = next;
+        // Typing is a finished change: on disk within ~2 s, like a final line.
+        this.liveJournal.noteChange(true);
+    }
+
+    public getLiveUserNotes(): string {
+        return this.liveUserNotes;
+    }
+
+    /** A meeting started (main: startMeetingTransition). */
+    public beginLiveMeeting(startedAt: number = Date.now()): string {
+        // The meeting's clock starts here. It was left at the last reset (the
+        // previous Stop, or app launch), so a saved meeting's start and length
+        // included the idle time before it (2026-10-15).
+        this.session.markMeetingStart(startedAt);
+        const id = crypto.randomUUID();
+        this.liveJournal.begin(id, startedAt);
+        // AI interactions past what memory keeps go to disk once each, so a
+        // meeting with thousands of answers loses none (2026-10-16). Same
+        // privacy rule as the journal: nothing is written for a meeting that
+        // must not be kept.
+        this.session.setUsageOverflowSink?.((entries) => {
+            if (this.liveJournal.meetingId !== id || this.mustNotPersist()) return;
+            try { DatabaseManager.getInstance().appendLiveUsageOverflow(id, entries); }
+            catch (e) { console.warn('[MeetingPersistence] could not write older AI answers to disk:', (e as Error)?.message); }
+        });
+        return id;
+    }
+
+    /** The running meeting's AI interactions that left memory (oldest first). Read before its live row is removed. */
+    private liveUsageOverflow(): any[] {
+        const id = this.liveJournal.meetingId;
+        if (!id) return [];
+        try { return DatabaseManager.getInstance().getLiveUsageOverflow(id); } catch { return []; }
+    }
+
+    /** A line or answer was added to the session; `final`: a finished line. */
+    public noteLiveChange(final: boolean): void {
+        this.liveJournal.noteChange(final);
+    }
+
+    /**
+     * Write the running meeting now, synchronously (quit, OS session end). It
+     * is NOT processed here: the next launch writes its notes. Returns whether
+     * a row was written.
+     */
+    public flushLiveMeeting(endedBy: 'quit' | 'os_session_end'): boolean {
+        return this.liveJournal.flush(endedBy);
+    }
+
+    public get liveMeetingId(): string | null {
+        return this.liveJournal.meetingId;
+    }
+
+    // Told each time a meeting's notes are saved or regenerated, so search can
+    // index the summary at the one moment it exists. An instance field, not a
+    // module-level registry: the build bundles each entry file separately, so
+    // module state is not shared between them.
+    private notesSavedListener: ((meetingId: string) => void) | null = null;
+
+    public setNotesSavedListener(listener: ((meetingId: string) => void) | null): void {
+        this.notesSavedListener = listener;
+    }
+
+    private notifyNotesSaved(meetingId: string): void {
+        try {
+            this.notesSavedListener?.(meetingId);
+        } catch (e: any) {
+            console.warn('[MeetingPersistence] notes-saved listener threw (non-fatal):', e?.message);
+        }
+    }
+
+    /**
+     * Names for the voice the call left unnamed (`speaker_1`), from the
+     * transcript (speakerNameSuggestions.ts). Applied, like a rename, only
+     * when certain and strongly evidenced; otherwise kept as a suggestion the
+     * Speakers row's rename field starts from. A rename the user made in the
+     * meantime always wins. Never throws.
+     */
+    private async suggestSpeakerNamesAfterSave(
+        meetingId: string,
+        transcript: Array<{ speaker: string; text: string; speakerId?: string }>,
+        labels: Record<string, string> | undefined,
+        participants: string[],
+        calendarEvent: import('./services/calendar/calendarSessionMatch').CalendarEventSnapshot | undefined,
+    ): Promise<void> {
+        try {
+            if (labels?.speaker_1) return;
+            const { isOtherSide } = require('./services/meetingDetection/attributeSpeakers') as typeof import('./services/meetingDetection/attributeSpeakers');
+            const unnamed = transcript.filter((l) => isOtherSide(l.speaker) && !(l.speakerId && labels?.[l.speakerId]));
+            if (unnamed.length < 2) return;
+            const userName = this.calendarUserName();
+            const lines = transcript.flatMap((l) => {
+                if (/^(user|me)$/i.test(l.speaker)) return [{ label: 'Me', text: l.text }];
+                if (!isOtherSide(l.speaker)) return [];
+                const named = l.speakerId ? labels?.[l.speakerId] : undefined;
+                return [{ label: named || 'Speaker 1', text: l.text }];
+            });
+            const invitees = (calendarEvent?.attendees ?? []).filter((a: any) => a?.response !== 'declined' && a?.name).map((a: any) => String(a.name));
+            const others = new Set([...participants, ...invitees].map((n) => n.toLowerCase()));
+            const { suggestSpeakerNames } = require('./services/meeting/speakerNameSuggestions') as typeof import('./services/meeting/speakerNameSuggestions');
+            const result = await suggestSpeakerNames(
+                { lines, targets: ['Speaker 1'], userName, participants, invitees },
+                (system, context) => this.llmHelper.generateMeetingSummary(system, context, system, { timeoutMs: 20_000, purpose: 'extraction' }),
+                { othersKnown: others.size > 0 ? others.size : null },
+            );
+            if (result.suggestions.length === 0) return;
+            const db = DatabaseManager.getInstance();
+            const current: Record<string, string> = (db.getMeetingDetails(meetingId)?.detailedSummary as any)?.speakerLabels || {};
+            if (current.speaker_1) return; // renamed meanwhile
+            const applied = result.apply['Speaker 1'];
+            const next = applied ? { ...current, speaker_1: applied } : current;
+            const speakerSuggestions = result.suggestions.map((s) => ({
+                id: 'speaker_1',
+                name: s.name,
+                certainty: s.certainty,
+                applied: s.name === applied,
+                evidence: s.evidence,
+            }));
+            const { SpeakerLabelService } = require('./services/meeting/SpeakerLabelService');
+            const svc = new SpeakerLabelService();
+            const ok = db.updateSpeakerLabels(meetingId, next, (d: any) => {
+                const renamed = applied ? svc.applyRenamesToSummary(d, d?.speakerLabels, next) : d;
+                return { ...renamed, speakerSuggestions };
+            });
+            console.log(`[MeetingPersistence] speaker name suggestion: ${applied ? 'applied' : 'kept as a suggestion'} (${result.suggestions.length})`);
+            // A name now on the voice is someone the user met (People view).
+            if (ok && applied) this.reindexPeople(meetingId);
+            if (ok) {
+                try {
+                    require('electron').BrowserWindow.getAllWindows().forEach((w: any) => w.webContents.send('meetings-updated'));
+                } catch { /* a closed window is not a failure */ }
+            }
+        } catch (e: any) {
+            console.warn('[MeetingPersistence] speaker name suggestion skipped:', e?.message);
+        }
+    }
+
+    /** Re-read who a meeting was with (People view). Never throws. */
+    protected reindexPeople(meetingId: string): void {
+        try {
+            const { indexMeetingPeople } = require('./services/organise/organiseService') as typeof import('./services/organise/organiseService');
+            indexMeetingPeople(meetingId);
+        } catch { /* the People view re-reads it later */ }
+    }
+
+    /**
+     * The connected calendar account's name, which labels the user's own voice
+     * ("me") in the notes; undefined without a connected calendar. A method so a
+     * test can supply one (the build bundles CalendarManager into this file).
+     */
+    protected calendarUserName(): string | undefined {
+        return followUpSenderName();
+    }
+
+    /**
+     * The connected calendar account (name and address) for the notes' meeting
+     * context: the address splits the invite into the user's colleagues and the
+     * other side. Undefined without a connected calendar. A method so a test can
+     * supply one.
+     */
+    protected calendarAccount(): { name?: string; email?: string } | undefined {
+        try {
+            const { CalendarManager } = require('./services/CalendarManager');
+            const status = CalendarManager.getInstance().getConnectionStatus();
+            if (!status?.connected) return undefined;
+            return {
+                ...(typeof status.name === 'string' ? { name: status.name } : {}),
+                ...(typeof status.email === 'string' ? { email: status.email } : {}),
+            };
+        } catch {
+            return undefined;
+        }
+    }
+
+    /**
+     * The user's current role and company from Profile Intelligence, for the
+     * notes' meeting context. Only when Profile Intelligence is on (knowledge
+     * mode) and the "Profile and history" provider scope is not turned off, the
+     * same gates the live answers use. Undefined otherwise or with no résumé.
+     */
+    protected profileForNotes(): { role?: string; company?: string } | undefined {
+        try {
+            const { SettingsManager } = require('./services/SettingsManager');
+            const sm = SettingsManager.getInstance();
+            const scopes = sm.get('providerDataScopes') as ProviderDataScopePolicy | undefined;
+            if (scopes?.profile_history === false || scopes?.post_call_summary === false) return undefined;
+            const orchestrator = (this.llmHelper as any)?.getKnowledgeOrchestrator?.();
+            const on = typeof orchestrator?.isKnowledgeMode === 'function' ? orchestrator.isKnowledgeMode() : sm.get('knowledgeMode') === true;
+            if (!on) return undefined;
+            const profile = orchestrator?.getProfileData?.();
+            const latest = Array.isArray(profile?.experience) ? profile.experience[0] : undefined;
+            const role = typeof latest?.role === 'string' ? latest.role.trim() : '';
+            const company = typeof latest?.company === 'string' ? latest.company.trim() : '';
+            return role || company ? { ...(role ? { role } : {}), ...(company ? { company } : {}) } : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
+    /**
+     * Titles, companies and the user's notes on the invite's people, from the
+     * People and Companies pages (accepted values only). A method so a test can
+     * supply them.
+     */
+    protected knownPeopleFor(event: import('./services/calendar/calendarSessionMatch').CalendarEventSnapshot): import('./services/meeting/meetingNotesContext').KnownPersonInput[] {
+        try {
+            const { knownPeopleForEvent } = require('./services/organise/organiseService') as typeof import('./services/organise/organiseService');
+            return knownPeopleForEvent(event);
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * After a meeting is saved: who it was with, the folders its rules file it
+     * into, and (when the notes may be written) the titles and companies people
+     * stated, kept as suggestions. Never awaited by the save; never throws.
+     */
+    protected organiseAfterSave(input: Omit<import('./services/organise/organiseService').AfterSaveInput, 'call'>): void {
+        try {
+            const { afterMeetingSaved } = require('./services/organise/organiseService') as typeof import('./services/organise/organiseService');
+            void afterMeetingSaved({
+                ...input,
+                call: (system, context) => this.llmHelper.generateMeetingSummary(system, context, system, { timeoutMs: 25_000, purpose: 'extraction' }),
+            }).then((r) => {
+                if (r.folders.length || r.facts) console.log(`[MeetingPersistence] organise: ${r.people} people, ${r.folders.length} folder(s), ${r.facts} suggested fact(s)`);
+                if (r.folders.length || r.facts) {
+                    try { require('electron').BrowserWindow.getAllWindows().forEach((w: any) => w.webContents.send('meetings-updated')); } catch { /* a closed window is not a failure */ }
+                }
+            }).catch(() => { /* logged inside */ });
+        } catch (e: any) {
+            console.warn('[MeetingPersistence] organise step skipped:', e?.message);
+        }
+    }
+
+    /** Earlier meetings linked to calendar events, for the "last time" lookup. */
+    protected seriesCandidates(beforeMs: number): import('./services/meeting/recurringMeetings').SeriesCandidate[] {
+        try {
+            return DatabaseManager.getInstance().getCalendarLinkedMeetingsSince(beforeMs - 120 * 24 * 60 * 60 * 1000, 200);
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * Everything the notes prompts carry besides the transcript. Never throws:
+     * on any failure the notes are written exactly as they were before this existed.
+     */
+    private notesInputsFor(src: {
+        meetingId: string; title?: string; startMs: number;
+        calendarEvent?: import('./services/calendar/calendarSessionMatch').CalendarEventSnapshot | null;
+        callParticipants?: string[]; userNotes?: string; vocabulary?: string[];
+    }): NotesInputs | null {
+        try {
+            let timeZone: string | undefined;
+            try { timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { /* UTC below */ }
+            return buildNotesInputs({
+                ...src,
+                nowMs: Date.now(),
+                timeZone,
+                user: this.calendarAccount() ?? null,
+                profile: this.profileForNotes() ?? null,
+                seriesCandidates: src.calendarEvent ? this.seriesCandidates(src.startMs) : [],
+                knownPeople: src.calendarEvent ? this.knownPeopleFor(src.calendarEvent) : [],
+            });
+        } catch (e: any) {
+            console.warn('[MeetingPersistence] notes context skipped (non-fatal):', e?.message);
+            return null;
+        }
     }
 
     /**
@@ -272,8 +688,12 @@ export class MeetingPersistence {
 
         // 1. Snapshot valid data BEFORE resetting
         const durationMs = Date.now() - this.session.getSessionStartTime();
+        // Stop takes the notes window's text: it goes to the notes as `userNotes`.
+        const userNotes = this.liveUserNotes.trim() ? this.liveUserNotes : undefined;
+        this.liveUserNotes = '';
         if (durationMs < 1000) {
             console.log("Meeting too short, ignoring.");
+            this.liveJournal.end();
             this.session.reset();
             return null;
         }
@@ -281,20 +701,11 @@ export class MeetingPersistence {
         // Phase 9 — privacy gate: 'never' retention or per-meeting do-not-persist
         // skips persistence entirely. We still emit telemetry (sanitized) so
         // usage analytics work, but NO transcript / NO summary / NO DB row.
-        let doNotPersist = false;
-        try {
-            const { SettingsManager } = require('./services/SettingsManager');
-            const retention = SettingsManager.getInstance().get('meetingRetention');
-            if (retention === 'never') doNotPersist = true;
-            // Per-meeting toggle is read from SessionTracker meeting metadata
-            // (e.g. set via the renderer "Do not persist this meeting" toggle).
-            const meta = this.session.getMeetingMetadata?.();
-            if (meta && (meta as any).doNotPersist === true) doNotPersist = true;
-        } catch (err) {
-            console.error('[MeetingPersistence] Failed to read retention settings, defaulting to discard for safety:', err);
-            doNotPersist = true; // Fail-secure fallback
-        }
+        // Per-meeting toggle is read from SessionTracker meeting metadata
+        // (e.g. set via the renderer "Do not persist this meeting" toggle).
+        const doNotPersist = this.mustNotPersist();
         if (doNotPersist) {
+            this.liveJournal.end();
             console.log('[MeetingPersistence] doNotPersist set — skipping save (no DB row, no summary).');
             try {
                 const { telemetryService } = require('./services/telemetry/TelemetryService');
@@ -319,18 +730,21 @@ export class MeetingPersistence {
         let memoryEligibleCount = 0;
         try {
             const { isMemoryEligibleSegment } = require('./intelligence/MeetingMemoryService');
-            memoryEligibleCount = this.session.getFullTranscript()
+            memoryEligibleCount = this.session.getPersistableTranscript()
                 .filter((seg: any) => isMemoryEligibleSegment(seg)).length;
         } catch (err) {
             // Fail OPEN to the legacy behavior (process everything): a broken
             // eligibility import must not silently discard real meetings.
             console.warn('[MeetingPersistence] eligibility check unavailable — processing normally:', err);
-            memoryEligibleCount = this.session.getFullTranscript().length;
+            memoryEligibleCount = this.session.getPersistableTranscript().length;
         }
 
         const snapshot = {
-            transcript: [...this.session.getFullTranscript()],
-            usage: [...this.session.getFullUsage()],
+            // The whole meeting (2026-10-15): getFullTranscript() was compacted
+            // past 1,800 lines and getFullUsage() kept the last 500 answers, so a
+            // 187-minute meeting was saved with only its last 73 minutes.
+            transcript: [...this.session.getPersistableTranscript()],
+            usage: [...this.liveUsageOverflow(), ...this.session.getPersistableUsage()],
             startTime: this.session.getSessionStartTime(),
             durationMs: durationMs,
             context: this.session.getFullSessionContext(),
@@ -339,7 +753,8 @@ export class MeetingPersistence {
 
         // BUG-04 fix: snapshot metadata BEFORE reset() clears it so the
         // background processAndSaveMeeting worker receives the calendar info.
-        const metadataSnapshot = this.session.getMeetingMetadata();
+        const sessionMetadata = this.session.getMeetingMetadata();
+        const metadataSnapshot = userNotes ? { ...(sessionMetadata || {}), userNotes } : sessionMetadata;
 
         // BUG-MODE-BLEEDING fix: snapshot the active mode BEFORE reset() so the
         // background processAndSaveMeeting worker uses the correct mode's note
@@ -355,11 +770,15 @@ export class MeetingPersistence {
         } catch (modeErr: any) {
             console.warn('[MeetingPersistence] Failed to capture mode snapshot:', modeErr?.message);
         }
+        // Saved with the placeholder, so a crash while the notes are written
+        // still recovers them with the calendar, the call's names and the mode.
+        const recoveryMeta = this.captureRecoveryMeta(metadataSnapshot, modeSnapshot, snapshot.startTime, durationMs);
 
         // 2. Reset state immediately so new meeting can start or UI is clean
         this.session.reset();
 
-        const meetingId = crypto.randomUUID();
+        // The live copy's id, so the saved meeting replaces it (never a second meeting).
+        const meetingId = this.liveJournal.meetingId ?? crypto.randomUUID();
 
         // 4. Initial Save (Placeholder)
         const minutes = Math.floor(durationMs / 60000);
@@ -376,11 +795,19 @@ export class MeetingPersistence {
             transcript: snapshot.transcript,
             usage: snapshot.usage,
             isProcessed: false,
-            summaryStatus: 'queued'
+            summaryStatus: 'queued',
+            recoveryMeta,
+            ...(userNotes ? { userNotes } : {}),
         };
 
         try {
             DatabaseManager.getInstance().saveMeeting(placeholder, snapshot.startTime, durationMs);
+            // Saved: the live copy is no longer needed. (Not on failure: the
+            // live copy is then the only one, and the next launch recovers it.)
+            this.liveJournal.end();
+            // The older answers are in the saved meeting now (read into the
+            // snapshot above), whether or not a live row was ever written.
+            DatabaseManager.getInstance().removeLiveUsageOverflow(meetingId);
             // Notify Frontend
             const wins = require('electron').BrowserWindow.getAllWindows();
             wins.forEach((w: any) => w.webContents.send('meetings-updated'));
@@ -388,14 +815,85 @@ export class MeetingPersistence {
             console.error("Failed to save placeholder", e);
         }
 
+        // One writer per meeting: a recovery pass skips a meeting in this set.
+        this.processing.add(meetingId);
         this.processAndSaveMeeting(snapshot, meetingId, metadataSnapshot, modeSnapshot).catch(err => {
             console.error('[MeetingPersistence] Background processing failed:', err);
-        });
+        }).finally(() => this.processing.delete(meetingId));
 
         // memoryEligibleCount rides along so the caller (main.ts) can skip the
         // RAG chunk/embed step for zero-eligible sessions — the DB re-read that
         // step performs has no provenance columns to decide with.
         return { meetingId, memoryEligibleCount };
+    }
+
+    /**
+     * Retention "never" or the meeting's own do-not-persist: the meeting must
+     * not reach the disk. Fails secure (a settings read that throws = do not keep).
+     */
+    private mustNotPersist(): boolean {
+        try {
+            const { SettingsManager } = require('./services/SettingsManager');
+            const retention = SettingsManager.getInstance().get('meetingRetention');
+            if (retention === 'never') return true;
+            const meta = this.session.getMeetingMetadata?.();
+            return !!(meta && (meta as any).doNotPersist === true);
+        } catch (err) {
+            console.error('[MeetingPersistence] Failed to read retention settings, defaulting to discard for safety:', err);
+            return true;
+        }
+    }
+
+    /** The active mode, as the notes should use it. */
+    private captureModeSnapshot(): { id: string; name: string; templateType: string } | null {
+        try {
+            const { ModesManager } = require('./services/ModesManager');
+            const activeMode = ModesManager.getInstance().getActiveMode();
+            if (activeMode) return { id: activeMode.id, name: activeMode.name, templateType: activeMode.templateType };
+        } catch (modeErr: any) {
+            console.warn('[MeetingPersistence] Failed to capture mode snapshot:', modeErr?.message);
+        }
+        return null;
+    }
+
+    /**
+     * Everything a recovery needs besides the transcript: the metadata Stop
+     * hands processAndSaveMeeting, the mode, and the call's speaking record
+     * (held only in memory by callRoster, so it would be gone after a restart).
+     */
+    private captureRecoveryMeta(metadata: any, mode: { id: string; name: string; templateType: string } | null, startTime: number, durationMs: number): MeetingRecoveryMeta {
+        const meta: MeetingRecoveryMeta = { startTime, durationMs, mode };
+        if (metadata && typeof metadata === 'object') {
+            if (typeof metadata.title === 'string') meta.title = metadata.title;
+            if (typeof metadata.calendarEventId === 'string') meta.calendarEventId = metadata.calendarEventId;
+            if (metadata.calendarEvent && typeof metadata.calendarEvent === 'object') meta.calendarEvent = metadata.calendarEvent;
+            if (metadata.source === 'manual' || metadata.source === 'calendar') meta.source = metadata.source;
+            if (typeof metadata.callSelfName === 'string' && metadata.callSelfName) meta.callSelfName = metadata.callSelfName;
+            if (Array.isArray(metadata.sharedScreens) && metadata.sharedScreens.length > 0) meta.sharedScreens = metadata.sharedScreens;
+            if (typeof metadata.callKey === 'string') {
+                meta.callKey = metadata.callKey;
+                try {
+                    const { callRoster } = require('./services/meetingDetection/callRoster') as typeof import('./services/meetingDetection/callRoster');
+                    const snap = callRoster.snapshot(metadata.callKey, startTime, startTime + durationMs + 30_000);
+                    if (snap.participants.length > 0 || snap.spans.length > 0) meta.callRoster = snap;
+                } catch { /* no roster: names come from the calendar only */ }
+            }
+        }
+        return meta;
+    }
+
+    private liveSnapshot(): LiveJournalSnapshot | null {
+        if (this.mustNotPersist()) return null;
+        const startedAt = this.session.getSessionStartTime();
+        const metadata = this.session.getMeetingMetadata?.();
+        const { startTime: _s, durationMs: _d, ...meta } = this.captureRecoveryMeta(metadata, this.captureModeSnapshot(), startedAt, Date.now() - startedAt);
+        if (this.liveUserNotes.trim()) meta.userNotes = this.liveUserNotes;
+        return {
+            // The whole meeting, as Stop saves it (not the assistant's view).
+            transcript: [...this.session.getPersistableTranscript()],
+            usage: [...this.session.getPersistableUsage()],
+            meta,
+        };
     }
 
     /**
@@ -405,7 +903,7 @@ export class MeetingPersistence {
         data: { transcript: TranscriptSegment[], usage: any[] | undefined, startTime: number, durationMs: number, context: string, memoryEligibleCount?: number },
         meetingId: string,
         // BUG-04 fix: accept metadata snapshot so calendar info is not lost after session.reset()
-        metadata?: { title?: string; calendarEventId?: string; source?: 'manual' | 'calendar' } | null,
+        metadata?: ProcessMetadata | null,
         // BUG-MODE-BLEEDING fix: accept mode snapshot so async summary uses the mode that was
         // active when meeting stopped, not whatever mode is active when async processing runs.
         modeSnapshot?: { id: string; name: string; templateType: string } | null
@@ -415,6 +913,8 @@ export class MeetingPersistence {
         let v3SummaryMeta: MeetingSummaryTelemetryMeta | null = null;
         let generationSucceeded = false;
         let postCallSummaryAllowed = true;
+        // The detected mode, kept for the folder rules that run after the save.
+        let detectedTemplateType: string | undefined;
         // Phase 6 — post_call_summary lifecycle telemetry. Wrapped in try/catch
         // around track calls so a telemetry sink fault never breaks persistence.
         const _postCallStart = Date.now();
@@ -486,13 +986,120 @@ export class MeetingPersistence {
 
         // Use passed-in metadata snapshot (NOT this.session.getMeetingMetadata() which is already cleared)
         let calendarEventId: string | undefined;
+        let calendarEvent: import('./services/calendar/calendarSessionMatch').CalendarEventSnapshot | undefined;
         let source: 'manual' | 'calendar' = 'manual';
 
         if (metadata) {
             if (metadata.title) title = metadata.title;
             if (metadata.calendarEventId) calendarEventId = metadata.calendarEventId;
+            if (metadata.calendarEvent && metadata.calendarEvent.id === calendarEventId) calendarEvent = metadata.calendarEvent;
             if (metadata.source) source = metadata.source;
         }
+
+        // The calendar can name the speakers: the mic is always the user, so with
+        // a connected calendar their account name labels it in EVERY meeting
+        // (it used to happen only for meetings linked to an event, so most
+        // transcripts still said "Me"); a linked 1:1 also names the other voice,
+        // the one other attendee (calendarSpeakerLabels). No calendar name: "Me".
+        // The notes are written from a NAMED COPY of the transcript, so "Priya
+        // will send the deck" rather than "Speaker 1 will…"; the stored
+        // transcript keeps its raw speakers, because the rename map is keyed on
+        // them. The same map is saved as the meeting's speaker labels, exactly as
+        // if the user had typed the names, and under the same "Speaker labels" switch.
+        let calendarLabels: Record<string, string> | null = null;
+        let llmTranscript = data.transcript;
+        // No calendar name: the name the Zoom / Teams window showed as the user's.
+        const appSelfName = typeof metadata?.callSelfName === 'string' && metadata.callSelfName.trim() ? metadata.callSelfName.trim() : undefined;
+        const userName = this.calendarUserName() ?? appSelfName;
+        if ((calendarEvent || userName) && isIntelligenceFlagEnabled('speakerLabelsV1')) {
+            try {
+                const { calendarSpeakerLabels } = require('./services/calendar/calendarSessionMatch') as typeof import('./services/calendar/calendarSessionMatch');
+                calendarLabels = calendarSpeakerLabels(calendarEvent, userName);
+                if (calendarLabels) {
+                    const { SpeakerLabelService } = require('./services/meeting/SpeakerLabelService');
+                    llmTranscript = new SpeakerLabelService().applyLabels(data.transcript, calendarLabels);
+                }
+            } catch (e: any) {
+                console.warn('[MeetingPersistence] calendar speaker names skipped:', e?.message);
+                calendarLabels = null;
+                llmTranscript = data.transcript;
+            }
+        }
+
+        // The call's own record of who spoke (the Meet page's speaking indicator,
+        // via the Companion extension): each other-side line whose speaker is
+        // clear gets that person, in the stored transcript (as a speaker id, so
+        // the notes show the name and a rename applies per person) and in the
+        // notes' named copy; the people in the call are kept with the meeting.
+        // Group calls get names this way, which the calendar alone can't give.
+        // Same "Speaker labels" switch.
+        let storedTranscript = data.transcript;
+        let callLabels: Record<string, string> | null = null;
+        let callConfidence: Record<string, number> | null = null;
+        let callParticipants: string[] = [];
+        if (metadata?.callKey && isIntelligenceFlagEnabled('speakerLabelsV1')) {
+            try {
+                const { nameCallLines } = require('./services/meetingDetection/nameCallLines') as typeof import('./services/meetingDetection/nameCallLines');
+                // A recovered meeting: the app's roster was lost with the old
+                // process, so the call's record comes from what was saved.
+                let roster: import('./services/meetingDetection/callRoster').CallRoster | undefined;
+                if (metadata.callRoster) {
+                    const { CallRoster, callRoster } = require('./services/meetingDetection/callRoster') as typeof import('./services/meetingDetection/callRoster');
+                    if (!callRoster.has(metadata.callKey)) {
+                        roster = new CallRoster();
+                        roster.restore(metadata.callKey, metadata.callRoster, data.startTime, data.startTime + data.durationMs);
+                    }
+                }
+                const named = nameCallLines(data.transcript, metadata.callKey, data.startTime, data.durationMs, roster);
+                if (named) {
+                    storedTranscript = named.transcript;
+                    callParticipants = named.participants;
+                    if (Object.keys(named.labels).length > 0) {
+                        callLabels = named.labels;
+                        callConfidence = named.confidence;
+                        const byLine = named.transcript;
+                        llmTranscript = llmTranscript.map((seg, i) => {
+                            const id = byLine[i]?.speakerId;
+                            return id && named.labels[id] ? { ...seg, speaker: named.labels[id] } : seg;
+                        });
+                    }
+                }
+            } catch (e: any) {
+                console.warn('[MeetingPersistence] call speaker names skipped:', e?.message);
+                storedTranscript = data.transcript;
+                callLabels = null;
+                callConfidence = null;
+                callParticipants = [];
+            }
+        }
+        // People sharing the user's microphone (Settings, Audio): the mic channel
+        // was transcribed with provider diarization, so its lines carry voice ids.
+        // The loudest voice stays "Me"; each other real voice becomes "Speaker N",
+        // numbered past the call's named people (meeting/roomSpeakers.ts). The
+        // same lines are renamed in the notes' copy. Before the strip below,
+        // which would drop the voice ids this reads.
+        try {
+            const { SettingsManager } = require('./services/SettingsManager');
+            if (SettingsManager.getInstance().get('roomSpeakersEnabled') === true) {
+                const { splitRoomSpeakers } = require('./services/meeting/roomSpeakers') as typeof import('./services/meeting/roomSpeakers');
+                const split = splitRoomSpeakers(storedTranscript, { usedIds: Object.keys(callLabels || {}) });
+                if (split.voices > 0) {
+                    storedTranscript = split.transcript;
+                    llmTranscript = llmTranscript.map((seg, i) => (split.renamed.has(i) ? { ...seg, speaker: split.renamed.get(i)! } : seg));
+                    console.log(`[MeetingPersistence] room speakers: ${split.voices} other voice(s) on the microphone`);
+                }
+            }
+        } catch (e: any) {
+            console.warn('[MeetingPersistence] room speakers skipped:', e?.message);
+        }
+
+        // Only the call's named ids are stored: an STT provider's own voice ids
+        // (diarization) stay in-session, as they always have.
+        storedTranscript = storedTranscript.map((seg: any) => {
+            if (!seg?.speakerId || (callLabels && callLabels[seg.speakerId])) return seg;
+            const { speakerId: _unnamed, ...rest } = seg;
+            return rest;
+        });
 
         // Scope gate applies to the entire post-call LLM summary path, not just
         // mode-reference snippets. If denied, V3 is skipped and LLMHelper's existing
@@ -502,6 +1109,30 @@ export class MeetingPersistence {
             const scopePolicy = SettingsManager.getInstance().get('providerDataScopes') as ProviderDataScopePolicy | undefined;
             postCallSummaryAllowed = scopePolicy?.post_call_summary !== false;
         } catch { /* settings unavailable → keep existing default */ }
+
+        // The meeting's people, last time in its series, the user's notes: built
+        // once here (local reads only, no model call) for every notes prompt below.
+        // Only when the notes may be written at all.
+        const notesInputs = postCallSummaryAllowed
+            ? this.notesInputsFor({
+                meetingId,
+                title: metadata?.title,
+                startMs: data.startTime,
+                calendarEvent: calendarEvent ?? null,
+                callParticipants,
+                userNotes: metadata?.userNotes,
+                vocabulary: notesVocabulary(metadata?.vocabulary),
+            })
+            : null;
+        if (notesInputs?.previousMeetingId) console.log(`[MeetingPersistence] Notes will read last time from meeting ${notesInputs.previousMeetingId}.`);
+        const notesContextParams = {
+            meetingContextBlock: notesInputs?.meetingContextBlock,
+            lastTimeBlock: notesInputs?.lastTimeBlock,
+            userNotes: notesInputs?.userNotes,
+            vocabulary: notesInputs?.vocabulary,
+            // What others shared on screen ("Snapshot shared screens"), described.
+            sharedScreensBlock: notesInputs ? sharedScreensBlockFor(metadata?.sharedScreens) : undefined,
+        };
 
         try {
             // Title generation (Task 9) moves to AFTER the notes exist — see
@@ -578,9 +1209,15 @@ export class MeetingPersistence {
             try {
                 if (isIntelligenceFlagEnabled('meetingModeAutoDetect') && data.transcript.length > 2) {
                     const { MeetingModeDetector } = require('./services/meeting/MeetingModeDetector');
+                    // The invite's description and the people on it are signals too
+                    // (they used to be dropped: only the title reached the detector).
                     const detection = new MeetingModeDetector().detect({
                         transcript: data.transcript,
-                        calendarTitle: metadata?.title,
+                        calendarTitle: metadata?.title ?? calendarEvent?.title,
+                        calendarDescription: calendarEvent?.description,
+                        participants: notesInputs?.participantNames ?? [],
+                        participantEmails: notesInputs?.participantEmails ?? [],
+                        userEmail: this.calendarAccount()?.email,
                     });
                     if (detection.confidence > 0 && detection.templateType !== 'general') {
                         let modeId: string | undefined;
@@ -591,6 +1228,7 @@ export class MeetingPersistence {
                             if (match) { modeId = match.id; modeName = match.name; }
                         } catch { /* non-fatal */ }
                         detectedMode = { templateType: detection.templateType, modeId, modeName, confidence: detection.confidence };
+                        detectedTemplateType = detection.templateType;
                         console.log(`[MeetingPersistence] Mode auto-detect: ${detection.templateType} (conf ${detection.confidence})`);
                     }
                 }
@@ -601,13 +1239,48 @@ export class MeetingPersistence {
             // Generate Structured Summary. V3 is the long-context path: it never uses a
             // naïve transcript prefix as the primary summary input. If it fails or is
             // disabled, the existing V2 single-pass path below remains the compatibility fallback.
-            if (data.transcript.length > 2 && isIntelligenceFlagEnabled('meetingSummaryV3') && postCallSummaryAllowed) {
+            // SHORT SESSION (2026-10-04, owner decision): every gate below counts
+            // transcript LINES, so three lines of greeting ran the full pipeline —
+            // an extraction call, two polish calls and a title call — and saved
+            // 6.5 KB of notes about "hi". Below the minimum (see
+            // shortSessionNotes.ts) the notes are written by ONE small call, and
+            // the title is derived from them without a model call.
+            let shortSession = false;
+            let shortSessionNotesWritten = false;
+            if (data.transcript.length > 2 && postCallSummaryAllowed) {
+                try {
+                    const sized = new TranscriptNormalizer().normalize(llmTranscript as any);
+                    shortSession = isShortSession(sized);
+                    if (shortSession) {
+                        const { lines, words } = countHumanContent(sized);
+                        console.log(`[MeetingPersistence] Short session (${lines} lines, ${words} words) — one small notes call, no polish, no title call.`);
+                        DatabaseManager.getInstance().updateSummaryStatus(meetingId, 'queued');
+                        const shortPrompt = buildShortSessionPrompt(notesContextFromParams(notesContextParams));
+                        const raw = sized.text
+                            ? await this.llmHelper.generateMeetingSummary(shortPrompt, sized.text, shortPrompt, { timeoutMs: NOTE_CALL_TIMEOUT_MS })
+                            : '';
+                        const notes = parseShortSessionNotes(raw);
+                        if (notes) {
+                            summaryData = { overview: notes.overview, keyPoints: notes.keyPoints, actionItems: notes.actionItems };
+                            generationSucceeded = true;
+                            shortSessionNotesWritten = true;
+                        }
+                    }
+                } catch (shortErr: any) {
+                    // A failed small call leaves the meeting saved with its
+                    // transcript and no notes; it must not fall through to the
+                    // four-call pipeline this branch exists to avoid.
+                    console.warn('[MeetingPersistence] Short-session notes call failed (non-fatal):', shortErr?.message);
+                }
+            }
+
+            if (!shortSession && data.transcript.length > 2 && isIntelligenceFlagEnabled('meetingSummaryV3') && postCallSummaryAllowed) {
                 const db = DatabaseManager.getInstance();
                 db.updateSummaryStatus(meetingId, 'queued');
                 const assembler = new MeetingContextAssembler(this.llmHelper);
                 const v3StartedMs = Date.now();
                 const assembled = await assembler.assembleSummary({
-                    transcript: data.transcript,
+                    transcript: llmTranscript,
                     title,
                     modeTemplateType: modeSnapshot?.templateType,
                     modeNoteSections,
@@ -625,12 +1298,12 @@ export class MeetingPersistence {
                     },
                     startedAtMs: v3StartedMs,
                     startedAtIso: new Date(v3StartedMs).toISOString(),
-                    // Phase 8 — LLM follow-up draft. Gated by flag; scope already enforced by
-                    // postCallSummaryAllowed (we are inside that branch).
-                    generateFollowUpDraft: isIntelligenceFlagEnabled('followUpDraftV2'),
+                    // No follow-up draft here: it is written on demand, when the user
+                    // clicks Generate on the notes (regenerateFollowUpDraft below).
                     // #1 — constrained LLM Summary polish (note-content-only, gated, safe fallback).
                     polishSummary: isIntelligenceFlagEnabled('meetingSummaryLlmPolish'),
                     onStatusUpdate: status => db.updateSummaryStatus(meetingId, status),
+                    ...notesContextParams,
                 });
                 v3SummaryMeta = assembled.meta;
                 if (assembled.summary) {
@@ -682,100 +1355,39 @@ export class MeetingPersistence {
                 console.warn('[MeetingSummaryV3] post_call_summary scope denied — skipping V3 cloud summary path.');
             }
 
-            if (summaryData.schemaVersion !== 3 && data.transcript.length > 2 && postCallSummaryAllowed) {
-                const baseRules = `RULES:
-- Do NOT invent information not present in the context
-- You MAY infer implied action items or next steps if they are logical consequences of the discussion
-- Do NOT explain or define concepts mentioned
-- Do NOT use filler phrases like "The meeting covered..." or "Discussed various..."
-- Do NOT mention transcripts, AI, or summaries
-- Do NOT sound like an AI assistant
-- Sound like a senior PM's internal notes
+            if (!shortSession && summaryData.schemaVersion !== 3 && data.transcript.length > 2 && postCallSummaryAllowed) {
+                const { summaryPrompt, groqSummaryPrompt } = buildV2FallbackPrompts({
+                    modeNoteSections,
+                    modeContextBlock,
+                    notesContext: notesContextFromParams(notesContextParams),
+                    transcriptChars: llmTranscript.reduce((sum, seg) => sum + String(seg?.text || '').length, 0),
+                    groqGenericPrompt: GROQ_SUMMARY_JSON_PROMPT,
+                });
+                if (modeNoteSections.length > 0) console.log('[MeetingPersistence] Using mode-specific prompt with sections:', modeNoteSections.map(s => s.title));
 
-STYLE: Calm, neutral, professional, skim-friendly. Short bullets, no sub-bullets.`;
-
-                let summaryPrompt: string;
-                let groqSummaryPrompt: string;
-
-                if (modeNoteSections.length > 0) {
-                    // Mode-specific structured notes — sections as object with title keys
-                    const sectionList = modeNoteSections
-                        .map(s => s.description?.trim()
-                            ? `- "${s.title}": ${s.description}`
-                            : `- "${s.title}"`)
-                        .join('\n');
-                    const sectionKeys = modeNoteSections
-                        .map(s => `    "${s.title}": []`)
-                        .join(',\n');
-
-                    summaryPrompt = `You are a silent meeting note-taker. Extract structured notes from the conversation transcript below.
-${modeContextBlock}
-${baseRules}
-
-SECTIONS TO FILL (extract only what is present in the transcript):
-${sectionList}
-
-Return ONLY valid JSON — no markdown fences, no comments, no extra keys. Each section value is an array of concise factual bullet strings taken directly from the conversation. Use [] if a section has no relevant content.
-
-{
-  "overview": "one solid paragraph compressing the ENTIRE meeting without losing anything important - purpose, what was discussed, key outcomes, and where things landed",
-  "sections": {
-${sectionKeys}
-  }
-}`;
-                    console.log('[MeetingPersistence] Using mode-specific prompt with sections:', modeNoteSections.map(s => s.title));
-                    groqSummaryPrompt = summaryPrompt;
-                } else {
-                    // Default generic notes
-                    summaryPrompt = `You are a silent meeting summarizer. Convert this conversation into concise internal meeting notes.
-
-${baseRules}
-
-Return ONLY valid JSON (no markdown code blocks):
-{
-  "overview": "one solid paragraph compressing the ENTIRE meeting without losing anything important - purpose, what was discussed, key outcomes, and where things landed",
-  "keyPoints": ["3-6 specific bullets - each = one concrete topic or point discussed"],
-  "actionItems": ["specific next steps, assigned tasks, or implied follow-ups. If absolutely none found, return empty array"]
-}`;
-                    groqSummaryPrompt = GROQ_SUMMARY_JSON_PROMPT;
-                }
-
-                const fallbackContext = buildBalancedTranscriptContext(data.transcript, 16000);
+                const fallbackContext = buildBalancedTranscriptContext(llmTranscript, 16000);
                 const generatedSummary = await this.llmHelper.generateMeetingSummary(summaryPrompt, fallbackContext, groqSummaryPrompt);
 
                 if (generatedSummary) {
-                    // Strip markdown fences if present
-                    const jsonMatch = generatedSummary.match(/```(?:json)?\n?([\s\S]*?)\n?```/) || [null, generatedSummary];
-                    const jsonStr = (jsonMatch[1] || generatedSummary).trim();
-                    console.log('[MeetingPersistence] LLM summary response received', { length: jsonStr.length });
-                    try {
-                        const parsed = JSON.parse(jsonStr);
-                        if (modeNoteSections.length > 0 && parsed.sections && typeof parsed.sections === 'object') {
-                            // Convert sections object into typed array preserving template order
-                            const sectionsArr: Array<{ title: string; bullets: string[] }> = modeNoteSections
-                                .map(s => ({
-                                    title: s.title,
-                                    bullets: Array.isArray(parsed.sections[s.title]) ? parsed.sections[s.title] as string[] : [],
-                                }));
-                            console.log('[MeetingPersistence] Parsed mode sections:', sectionsArr.map(s => `${s.title}(${s.bullets.length})`));
-                            summaryData = {
-                                overview: parsed.overview,
-                                actionItems: [],
-                                keyPoints: [],
-                                sections: sectionsArr,
-                            };
-                        } else {
-                            if (modeNoteSections.length > 0) {
-                                console.warn('[MeetingPersistence] Mode sections expected but LLM did not return "sections" key. Falling back to generic.');
-                            }
-                            summaryData = parsed;
+                    console.log('[MeetingPersistence] LLM summary response received', { length: generatedSummary.length });
+                    // Reads "overview" and the Groq prompt's old "summary" key alike
+                    // (the fallback used to save Groq's notes with no overview).
+                    const parsed = parseV2SummaryResponse(generatedSummary, modeNoteSections);
+                    if (parsed) {
+                        if (modeNoteSections.length > 0 && !Array.isArray(parsed.sections)) {
+                            console.warn('[MeetingPersistence] Mode sections expected but LLM did not return "sections" key. Falling back to generic.');
                         }
-                        generationSucceeded = Boolean(summaryData?.overview || summaryData?.keyPoints?.length || summaryData?.actionItems?.length || summaryData?.sections?.some((section: any) => Array.isArray(section.bullets) && section.bullets.length > 0));
-                    } catch (e) {
-                        console.error('[MeetingPersistence] Failed to parse summary JSON', { responseLength: jsonStr.length, error: e });
+                        summaryData = parsed;
+                        generationSucceeded = v2NotesHaveContent(summaryData);
+                    } else {
+                        console.error('[MeetingPersistence] Failed to parse summary JSON', { responseLength: generatedSummary.length });
                     }
                 }
-            } else {
+            } else if (data.transcript.length <= 2) {
+                // This used to print for EVERY meeting whose V3 notes had already
+                // succeeded (the branch above is also skipped then), which read
+                // as "the notes were refused" in a log where they had just been
+                // written. Say it only when it is true.
                 console.log("Transcript too short for summary generation.");
             }
 
@@ -785,7 +1397,12 @@ Return ONLY valid JSON (no markdown code blocks):
             // V2 fallback; generateTitleFromSummary handles both shapes. A rejected or
             // failed title leaves `title` at its existing default — never blocks saving.
             if ((!metadata || !metadata.title) && postCallSummaryAllowed) {
-                const generatedTitle = await generateTitleFromSummary(this.llmHelper, summaryData);
+                const generatedTitle = shortSessionNotesWritten
+                    // Short session: name it from the notes just written. No model call.
+                    ? deriveDeterministicTitle({ topics: [], takeaways: summaryData.keyPoints || [], overview: summaryData.overview || '' })
+                    : shortSession
+                        ? null
+                        : await generateTitleFromSummary(this.llmHelper, summaryData, notesInputs?.titleHint);
                 if (generatedTitle) {
                     title = generatedTitle;
                     if (summaryData && summaryData.schemaVersion === 3) summaryData.title = generatedTitle;
@@ -804,7 +1421,9 @@ Return ONLY valid JSON (no markdown code blocks):
                     actionItemsStructured: Array.isArray(summaryData.actionItemsStructured) && summaryData.actionItemsStructured.length > 0
                         ? summaryData.actionItemsStructured
                         : postCallEnhancements.actionItemsStructured,
-                    followUpDraft: summaryData.followUpDraft || postCallEnhancements.followUpDraft,
+                    // No follow-up draft: V3 notes offer Generate, and a saved template
+                    // draft would hide that button. The V2 branch below keeps its
+                    // deterministic draft — V2 has no on-demand route.
                 }
                 : {
                     ...summaryData,
@@ -824,7 +1443,7 @@ Return ONLY valid JSON (no markdown code blocks):
                 if (isIntelligenceFlagEnabled('meetingMemoryV2')) {
                     const record = new MeetingMemoryService().buildMeetingRecord({
                         meetingId,
-                        segments: data.transcript,
+                        segments: llmTranscript,
                         mode: modeSnapshot?.templateType,
                         startedAt: data.startTime,
                         endedAt: data.startTime + data.durationMs,
@@ -836,7 +1455,7 @@ Return ONLY valid JSON (no markdown code blocks):
                     // regardless of what the extractor returned. Defense-in-depth on top
                     // of the extractor's own provenance filter. A zero-audio session of
                     // manual-chat questions + assistant answers persists NO meeting memory.
-                    const persisted = buildPersistedMeetingMemory(data.transcript, record);
+                    const persisted = buildPersistedMeetingMemory(llmTranscript, record);
                     if (persisted.telemetry.zeroEligibleGuardApplied) {
                         console.warn('[MeetingMemoryV2] zero memory-eligible (spoken/STT) transcript segments — persisting EMPTY structured memory. Manual-chat questions and assistant answers are not meeting evidence (Defect B provenance guard).', {
                             meetingId,
@@ -869,6 +1488,23 @@ Return ONLY valid JSON (no markdown code blocks):
             const seconds = ((data.durationMs % 60000) / 1000).toFixed(0);
             const durationStr = `${minutes}:${Number(seconds) < 10 ? '0' : ''}${seconds}`;
 
+            // The calendar's speaker names become the meeting's labels (a rename
+            // the user already made always wins). Regenerate and the follow-up
+            // draft carry speakerLabels forward, as they do the user's own.
+            if (calendarLabels && summaryData && typeof summaryData === 'object' && !summaryData.speakerLabels) {
+                summaryData = { ...summaryData, speakerLabels: calendarLabels };
+            }
+            // The call's names join them (a user's rename of an id still wins),
+            // and the people who were in the call are kept for the notes.
+            if (summaryData && typeof summaryData === 'object') {
+                if (callLabels) summaryData = { ...summaryData, speakerLabels: { ...callLabels, ...(summaryData.speakerLabels || {}) } };
+                if (callConfidence && Object.keys(callConfidence).length > 0) summaryData = { ...summaryData, speakerConfidence: callConfidence };
+                if (callParticipants.length > 0) summaryData = { ...summaryData, callParticipants };
+                // Kept with the meeting so Regenerate writes from the same screens.
+                const screens = sharedScreenEntries(metadata?.sharedScreens);
+                if (screens.length > 0) summaryData = { ...summaryData, sharedScreens: screens };
+            }
+
             const meetingData: Meeting = {
                 id: meetingId,
                 title: title,
@@ -876,9 +1512,10 @@ Return ONLY valid JSON (no markdown code blocks):
                 duration: durationStr,
                 summary: "See detailed summary",
                 detailedSummary: summaryData,
-                transcript: data.transcript,
+                transcript: storedTranscript,
                 usage: data.usage,
                 calendarEventId: calendarEventId,
+                calendarEvent: calendarEvent,
                 source: source,
                 isProcessed: true,
                 summaryStatus: generationSucceeded || data.transcript.length <= 2 ? 'completed' : 'failed'
@@ -890,6 +1527,29 @@ Return ONLY valid JSON (no markdown code blocks):
             // is inside the same try, so that assumption has to be recorded, not
             // inferred — see the guard at the top of the catch.
             meetingSaved = true;
+            if (generationSucceeded) this.notifyNotesSaved(meetingId);
+
+            // The other side's voice still unnamed ("Speaker 1"): one short call
+            // proposes a name from what was said, after the save so the notes
+            // never wait on it. Same "Speaker labels" switch, same data scope as
+            // the notes. See services/meeting/speakerNameSuggestions.ts.
+            if (postCallSummaryAllowed && isIntelligenceFlagEnabled('speakerLabelsV1')
+                && (process.env.NATIVELY_SPEAKER_NAME_SUGGESTIONS || '').toLowerCase() !== 'off') {
+                void this.suggestSpeakerNamesAfterSave(meetingId, storedTranscript, summaryData?.speakerLabels, callParticipants, calendarEvent);
+            }
+
+            // People, folder rules, proposed titles (services/organise). After the
+            // speaker suggestion is queued, so a name it applies is picked up
+            // the next time the People view syncs; the model call here is the
+            // same data scope as the notes.
+            this.organiseAfterSave({
+                meetingId,
+                detectedTemplateType,
+                transcript: storedTranscript,
+                speakerLabels: summaryData?.speakerLabels,
+                userNotes: metadata?.userNotes,
+                allowModel: postCallSummaryAllowed,
+            });
 
             // HINDSIGHT POST-MEETING RETAIN (Phase 13 wiring, behind
             // hindsight_post_meeting_retain_enabled). After the meeting is persisted
@@ -1043,11 +1703,26 @@ Return ONLY valid JSON (no markdown code blocks):
     }
 
     /**
-     * Recover meetings that were started but not fully processed (e.g. app crash)
+     * Recover meetings that were started but not fully processed: a meeting
+     * still running when the app quit, crashed or the OS ended the session (its
+     * live copy, LiveMeetingJournal), and a meeting whose notes were never
+     * written (the placeholder Stop saved). Each is processed with the metadata
+     * Stop would have passed (calendar event, the call's speaking record, the
+     * mode), saved with it. Never twice at once, and never a meeting whose
+     * notes are being written right now.
      */
-    public async recoverUnprocessedMeetings(): Promise<void> {
+    public recoverUnprocessedMeetings(): Promise<void> {
+        if (this.recovering) return this.recovering;
+        this.recovering = this.recoverOnce().finally(() => { this.recovering = null; });
+        return this.recovering;
+    }
+
+    private async recoverOnce(): Promise<void> {
         console.log('[MeetingPersistence] Checking for unprocessed meetings...');
         const db = DatabaseManager.getInstance();
+
+        this.promoteLiveMeetings(db);
+
         const unprocessed = db.getUnprocessedMeetings();
 
         if (unprocessed.length === 0) {
@@ -1058,6 +1733,10 @@ Return ONLY valid JSON (no markdown code blocks):
         console.log(`[MeetingPersistence] Found ${unprocessed.length} unprocessed meetings. recovering...`);
 
         for (const m of unprocessed) {
+            if (this.processing.has(m.id)) {
+                console.log(`[MeetingPersistence] ${m.id}: notes are being written now; not recovering it.`);
+                continue;
+            }
             try {
                 const details = db.getMeetingDetails(m.id);
                 if (!details) continue;
@@ -1070,28 +1749,100 @@ Return ONLY valid JSON (no markdown code blocks):
                     return `[${label}]: ${t.text}`;
                 }).join('\n') || "";
 
+                const saved = db.getMeetingRecoveryMeta(m.id) as Partial<MeetingRecoveryMeta> | null;
                 const parts = (details.duration || '0:00').split(':');
                 // EC-07 fix: guard against malformed duration strings (e.g. corrupted DB row)
                 const mins = parseInt(parts[0]) || 0;
                 const secs = parseInt(parts[1]) || 0;
-                const durationMs = ((mins * 60) + secs) * 1000;
-                const startTime = new Date(details.date).getTime();
+                const durationMs = typeof saved?.durationMs === 'number' && saved.durationMs >= 0 ? saved.durationMs : ((mins * 60) + secs) * 1000;
+                // The true start when it was saved; created_at is when Stop ran.
+                const startTime = typeof saved?.startTime === 'number' && saved.startTime > 0 ? saved.startTime : new Date(details.date).getTime();
 
+                const transcript = details.transcript as TranscriptSegment[];
                 const snapshot = {
-                    transcript: details.transcript as TranscriptSegment[],
+                    transcript,
                     usage: details.usage,
                     startTime: startTime,
                     durationMs: durationMs,
-                    context: context
+                    context: context,
+                    memoryEligibleCount: countMemoryEligible(transcript),
                 };
 
-                await this.processAndSaveMeeting(snapshot, m.id);
-                console.log(`[MeetingPersistence] Recovered meeting ${m.id}`);
+                const { metadata, mode } = recoveryMetadataFor(details, saved);
+                this.processing.add(m.id);
+                try {
+                    await this.processAndSaveMeeting(snapshot, m.id, metadata, mode);
+                } finally {
+                    this.processing.delete(m.id);
+                }
+                console.log(`[MeetingPersistence] Recovered meeting ${m.id}${saved ? ' (with its saved calendar, call and mode details)' : ''}`);
 
             } catch (e) {
                 console.error(`[MeetingPersistence] Failed to recover meeting ${m.id}`, e);
             }
         }
+    }
+
+    /**
+     * Left-over live copies become unprocessed meetings (the loop above then
+     * writes their notes). The running meeting's own copy is never touched; a
+     * copy the user's retention now forbids is deleted; one shorter than a
+     * second, or with nothing in it, is dropped as Stop would drop it.
+     */
+    private promoteLiveMeetings(db: DatabaseManager): void {
+        let rows: ReturnType<DatabaseManager['getLiveMeetings']> = [];
+        try {
+            rows = db.getLiveMeetings();
+        } catch (e) {
+            console.warn('[MeetingPersistence] reading live meetings failed:', (e as Error)?.message);
+            return;
+        }
+        try { db.sweepOrphanUsageOverflow(this.liveJournal.meetingId); } catch { /* next launch */ }
+        if (rows.length === 0) return;
+        let retentionNever = false;
+        try {
+            const { SettingsManager } = require('./services/SettingsManager');
+            retentionNever = SettingsManager.getInstance().get('meetingRetention') === 'never';
+        } catch {
+            retentionNever = true; // fail secure, as Stop does
+        }
+        for (const row of rows) {
+            if (row.id === this.liveJournal.meetingId) continue;
+            const meta = (row.meta || {}) as Partial<MeetingRecoveryMeta>;
+            const durationMs = typeof meta.durationMs === 'number' ? meta.durationMs : Math.max(0, row.updatedAt - row.startedAt);
+            const hasNotes = typeof meta.userNotes === 'string' && meta.userNotes.trim().length > 0;
+            if (retentionNever || durationMs < 1000 || (row.transcript.length === 0 && row.usage.length === 0 && !hasNotes)) {
+                try { db.removeLiveMeeting(row.id); } catch { /* next launch */ }
+                console.log(`[MeetingPersistence] Live meeting ${row.id} dropped (${retentionNever ? 'retention is "never"' : 'nothing to keep'}).`);
+                continue;
+            }
+            const placeholder: Meeting = {
+                id: row.id,
+                title: 'Processing...',
+                date: new Date(row.updatedAt || Date.now()).toISOString(),
+                duration: formatDuration(durationMs),
+                summary: 'Generating summary...',
+                detailedSummary: { actionItems: [], keyPoints: [] },
+                transcript: row.transcript,
+                usage: row.usage,
+                ...(typeof meta.calendarEventId === 'string' ? { calendarEventId: meta.calendarEventId, source: 'calendar' as const } : {}),
+                ...(meta.calendarEvent ? { calendarEvent: meta.calendarEvent } : {}),
+                isProcessed: false,
+                summaryStatus: 'queued',
+                recoveryMeta: { ...meta, startTime: row.startedAt, durationMs, endedBy: meta.endedBy ?? 'crash' },
+                ...(hasNotes ? { userNotes: meta.userNotes } : {}),
+            };
+            try {
+                const created = db.promoteLiveMeeting(placeholder, row.startedAt, durationMs);
+                console.log(`[MeetingPersistence] Live meeting ${row.id} (${row.transcript.length} lines, ended by ${meta.endedBy ?? 'a crash'}) ${created ? 'saved for recovery' : 'was already saved; live copy removed'}.`);
+            } catch (e) {
+                console.error(`[MeetingPersistence] Live meeting ${row.id} could not be saved for recovery`, e);
+            }
+        }
+        try {
+            const wins = require('electron').BrowserWindow.getAllWindows();
+            wins.forEach((w: any) => w.webContents.send('meetings-updated'));
+        } catch { /* non-fatal */ }
     }
 
     /**
@@ -1103,7 +1854,7 @@ Return ONLY valid JSON (no markdown code blocks):
      *
      * Honors providerDataScopes.post_call_summary — if denied, returns false (no cloud call).
      */
-    public async regenerateSavedMeeting(meetingId: string, opts?: { templateType?: string; modeId?: string; tone?: 'professional' | 'warm' | 'concise' | 'friendly' }): Promise<boolean> {
+    public async regenerateSavedMeeting(meetingId: string, opts?: { templateType?: string; modeId?: string; tone?: 'professional' | 'warm' | 'concise' | 'friendly'; userNotes?: string; vocabulary?: string[] }): Promise<boolean> {
         const db = DatabaseManager.getInstance();
         const details = db.getMeetingDetails(meetingId);
         if (!details || !Array.isArray(details.transcript) || details.transcript.length < 3) return false;
@@ -1173,7 +1924,16 @@ Return ONLY valid JSON (no markdown code blocks):
         let transcript = details.transcript as TranscriptSegment[];
         try {
             if (isIntelligenceFlagEnabled('speakerLabelsV1')) {
-                const labels = (details.detailedSummary as any)?.speakerLabels;
+                // A meeting saved before the calendar named "me" in every meeting
+                // has no `me` label: with a connected calendar the regenerated notes
+                // name the user all the same (the Transcript tab shows that name too).
+                const stored = (details.detailedSummary as any)?.speakerLabels;
+                const { calendarSpeakerLabels, modernizeCalendarLabels } = require('./services/calendar/calendarSessionMatch') as typeof import('./services/calendar/calendarSessionMatch');
+                // A `me` the calendar wrote in full before first names regenerates as
+                // the first name (modernizeCalendarLabels); one the user typed stays.
+                const userName = this.calendarUserName();
+                const current = modernizeCalendarLabels(stored, (details as any).calendarEvent, userName) ?? stored;
+                const labels = current?.me ? current : { ...(calendarSpeakerLabels(null, userName) ?? {}), ...(current ?? {}) };
                 if (labels && Object.keys(labels).length > 0) {
                     const { SpeakerLabelService } = require('./services/meeting/SpeakerLabelService');
                     transcript = new SpeakerLabelService().applyLabels(transcript, labels);
@@ -1183,7 +1943,27 @@ Return ONLY valid JSON (no markdown code blocks):
             console.warn('[MeetingPersistence] regenerate speaker labels skipped:', e?.message);
         }
 
+        // The same meeting context the first save had: the invite's people, last
+        // time in the series (as of this meeting, not of today), the user's notes.
+        const savedStartMs = new Date(details.date).getTime();
+        const regenInputs = this.notesInputsFor({
+            meetingId,
+            title: details.title,
+            startMs: Number.isFinite(savedStartMs) ? savedStartMs : Date.now(),
+            calendarEvent: (details as any).calendarEvent ?? null,
+            callParticipants: Array.isArray((details.detailedSummary as any)?.callParticipants) ? (details.detailedSummary as any).callParticipants : [],
+            // The notes the user typed in the meeting, as saved with it; the
+            // caller can pass others.
+            userNotes: opts?.userNotes ?? details.userNotes ?? undefined,
+            vocabulary: notesVocabulary(opts?.vocabulary),
+        });
+
         db.updateSummaryStatus(meetingId, 'queued');
+        // The follow-up draft is on demand: re-draft it against the new notes only when
+        // the user already asked for one, in the tone they last chose. Otherwise the
+        // notes come back with Generate, as they do after a meeting.
+        const followUpPlan = followUpRedraftPlan((details.detailedSummary as any)?.followUpDraft);
+
         try {
             const startedMs = Date.now();
             const assembler = new MeetingContextAssembler(this.llmHelper);
@@ -1201,10 +1981,16 @@ Return ONLY valid JSON (no markdown code blocks):
                 },
                 startedAtMs: startedMs,
                 startedAtIso: new Date(startedMs).toISOString(),
-                generateFollowUpDraft: isIntelligenceFlagEnabled('followUpDraftV2'),
+                generateFollowUpDraft: followUpPlan.redraft && isIntelligenceFlagEnabled('followUpDraftV2'),
                 polishSummary: isIntelligenceFlagEnabled('meetingSummaryLlmPolish'),
-                followUpTone: opts?.tone,
+                followUpTone: opts?.tone ?? followUpPlan.tone,
+                followUpSenderName: followUpPlan.redraft ? followUpSenderFirstName() : undefined,
                 onStatusUpdate: status => db.updateSummaryStatus(meetingId, status),
+                meetingContextBlock: regenInputs?.meetingContextBlock,
+                lastTimeBlock: regenInputs?.lastTimeBlock,
+                userNotes: regenInputs?.userNotes,
+                vocabulary: regenInputs?.vocabulary,
+                sharedScreensBlock: regenInputs ? sharedScreensBlockFor((details.detailedSummary as any)?.sharedScreens) : undefined,
             });
 
             if (!assembled.summary) {
@@ -1221,7 +2007,7 @@ Return ONLY valid JSON (no markdown code blocks):
             // unguarded assignment would overwrite a good existing title with the mechanical
             // one. shouldReplaceTitleOnRegenerate lets a model-generated title through and
             // holds a fallback back unless the current title is empty/placeholder.
-            const regenerated = await generateTitleFromSummaryWithSource(this.llmHelper, v3);
+            const regenerated = await generateTitleFromSummaryWithSource(this.llmHelper, v3, regenInputs?.titleHint);
             // First NON-PLACEHOLDER of [fresh summary title, DB row title]: the reducer
             // fills v3.title with 'Meeting Notes' when the meeting has no name, so a
             // first-non-EMPTY read would hide a good DB title behind that placeholder.
@@ -1244,7 +2030,13 @@ Return ONLY valid JSON (no markdown code blocks):
             if (recall) detailedSummary.crossMeeting = recall;
             const prevMemory = (details.detailedSummary as any)?.meetingMemory;
             if (prevMemory) detailedSummary.meetingMemory = prevMemory;
+            const prevScreens = sharedScreenEntries((details.detailedSummary as any)?.sharedScreens);
+            if (prevScreens.length > 0) detailedSummary.sharedScreens = prevScreens;
+            // The notes being replaced stay as a version the meeting page shows
+            // in its own tab (bounded; DatabaseManager.archiveNotesVersion).
+            if (isArchivableNotes(details.detailedSummary)) db.archiveNotesVersion(meetingId, details.detailedSummary);
             const ok = db.replaceDetailedSummary(meetingId, detailedSummary, { title: v3.title, summaryStatus: 'completed' });
+            if (ok) this.notifyNotesSaved(meetingId);
             try {
                 const wins = require('electron').BrowserWindow.getAllWindows();
                 wins.forEach((w: any) => w.webContents.send('meetings-updated'));
@@ -1258,7 +2050,9 @@ Return ONLY valid JSON (no markdown code blocks):
     }
 
     /**
-     * Regenerate ONLY the follow-up draft for a saved V3 meeting (cheap; no re-summarize).
+     * Write the follow-up draft for a saved V3 meeting, or rewrite it (cheap; no
+     * re-summarize). This is the ONLY place a draft is first written: meetings save
+     * without one and the notes offer Generate, which lands here.
      */
     public async regenerateFollowUpDraft(meetingId: string, tone?: 'professional' | 'warm' | 'concise' | 'friendly'): Promise<boolean> {
         const db = DatabaseManager.getInstance();
@@ -1276,6 +2070,16 @@ Return ONLY valid JSON (no markdown code blocks):
 
         try {
             const { FollowUpDraftGenerator } = require('./services/meeting/FollowUpDraftGenerator');
+            // The user's own voice, when they kept samples and left it on. Derived (one
+            // model call) only when the samples changed since the cached profile.
+            // Off with the template draft (NATIVELY_FOLLOWUP_DRAFT_V2=0): no model call at all.
+            const llmDraft = isIntelligenceFlagEnabled('followUpDraftV2');
+            let styleGuide: string | undefined;
+            try {
+                const { getWritingStyleService, styleModelCall } = require('./services/outputs/outputsIpc');
+                const { styleGuideForDraft } = require('./services/outputs/writingStyle');
+                styleGuide = await styleGuideForDraft(getWritingStyleService(), llmDraft, styleModelCall(this.llmHelper));
+            } catch { styleGuide = undefined; }
             const draft = await new FollowUpDraftGenerator(this.llmHelper).generate({
                 summary: {
                     title: detailed.title,
@@ -1294,6 +2098,10 @@ Return ONLY valid JSON (no markdown code blocks):
                 },
                 mode: detailed.mode?.selectedTemplateType,
                 tone,
+                senderName: followUpSenderFirstName(),
+                styleGuide,
+                // NATIVELY_FOLLOWUP_DRAFT_V2=0 kill switch: the template draft, no LLM call.
+                deterministicOnly: !llmDraft,
             });
             const ok = db.replaceDetailedSummary(meetingId, { ...detailed, followUpDraft: draft });
             try {
@@ -1363,6 +2171,34 @@ function computeCrossMeetingRecall(
 // Build the persisted detailedSummary blob from a MeetingSummaryV3, preserving back-compat
 // V2 bridge fields. Mirrors the inline mapping in processAndSaveMeeting so regenerate and
 // initial save produce identical shapes.
+/**
+ * The user's own name, to sign follow-up drafts with: the Google account connected
+ * for Calendar sync (CalendarManager reads it from that sign-in's id_token). Only
+ * the name is used, never the email. Undefined when Calendar is not connected or
+ * the account carried no name, and the draft is then signed with no name.
+ */
+function followUpSenderName(): string | undefined {
+    try {
+        const { CalendarManager } = require('./services/CalendarManager');
+        const status = CalendarManager.getInstance().getConnectionStatus();
+        return status?.connected && typeof status.name === 'string' ? status.name : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** The sender's first name: what the follow-up email is signed with (and how it
+ *  refers to the user), whatever the mode's signAs — "Evin", not the account's
+ *  "Evin John Ignatious". */
+function followUpSenderFirstName(): string | undefined {
+    try {
+        const { firstNameOf } = require('./services/calendar/calendarSessionMatch') as typeof import('./services/calendar/calendarSessionMatch');
+        return firstNameOf(followUpSenderName()) ?? undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 function buildV3DetailedSummary(v3: import('./services/meeting/types').MeetingSummaryV3, prev?: any): any {
     return {
         ...(prev && typeof prev === 'object' ? { speakerLabels: prev.speakerLabels } : {}),

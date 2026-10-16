@@ -1,10 +1,10 @@
 # Privacy Policy
 
-_Last updated: August 15th 2026_
+_Last updated: October 10th 2026_
 
 This policy describes how **Natively** — the desktop application, the **Natively Pro** licensed features, and the **Natively API** managed service — handles your data. We've tried to write it like a person, not a lawyer.
 
-If anything's unclear, email **natively.contact@gmail.com**. We aim to reply within 24–72 hours on weekdays.
+If anything's unclear, email **privacy@heynatively.com**. We aim to reply within 24–72 hours on weekdays.
 
 ---
 
@@ -13,8 +13,8 @@ If anything's unclear, email **natively.contact@gmail.com**. We aim to reply wit
 Natively is built and operated by a single developer based in **Kochi, Kerala, India**. For the purposes of applicable data-protection law (including India's Digital Personal Data Protection Act, 2023, and the EU General Data Protection Regulation where it applies):
 
 - **Data fiduciary / controller:** Evin John, the developer of Natively.
-- **Contact:** natively.contact@gmail.com
-- **Grievance Officer (India IT Rules 2021):** Evin John — natively.contact@gmail.com — we acknowledge complaints within 72 hours on weekdays and aim to resolve them within 30 days.
+- **Contact:** privacy@heynatively.com
+- **Grievance Officer (India IT Rules 2021):** Evin John — privacy@heynatively.com — we acknowledge complaints within 72 hours on weekdays and aim to resolve them within 30 days.
 
 If you're using Natively on behalf of an organisation (under a bulk or team licence), that organisation is a separate data controller for the data of its own users, and you should also consult its own privacy policy.
 
@@ -28,8 +28,9 @@ We've designed Natively to keep as much of your data on your device as possible.
 - When **Apple Speech** is selected, microphone and system audio are transcribed by Apple's on-device speech framework. The audio is not sent to Natively or a cloud speech provider. macOS may contact Apple to download the selected language's speech asset.
 - When you use a cloud AI, speech-to-text, or search feature, **the relevant text or audio leaves your device only to be processed by the provider you've chosen** (e.g., OpenAI, Anthropic, Google, Groq, Deepgram, ElevenLabs, Azure, IBM, Soniox, Tavily). The result comes back to your device.
 - For **paid products** (Natively Pro, Natively API), we **do** store a small amount of operational data on our servers — your license key, hardware identifier, plan, billing email, and quota counters. We need this to make billing and licensing actually work. We do not store the content you generate.
-- For the **Free Trial**, we additionally store anti-abuse signals (rate-limited IP, trial tokens, basic usage counters).
-- We **do not sell** your data. We **do not use your content to train AI models**. We don't use third-party analytics or marketing trackers inside the desktop app.
+- For the **Free Trial**, we additionally store anti-abuse signals (rate-limited IP, trial tokens, basic usage counters). The trial **starts by itself** the first time you start a meeting with no AI of your own set up, and the meeting overlay tells you when it does. It then runs for 30 minutes on the clock, across meetings. While it runs, your meetings' audio and your questions are processed through the Natively API (§4.4).
+- **Every installation**, paid or not, reports **product-usage events** to our own servers: that the app was opened on a given day, that a meeting was held, which features were used, that a trial was started, that a plan page was opened, and the like. They are **linked to your device and, if you have one, your trial or account**. They cannot contain anything you say, see or type. You can turn them off. See §3.2.1.
+- We **do not sell** your data. We **do not use your content to train AI models**. The desktop app also sends anonymous usage events to **Google Analytics**: that the app was opened or closed, which feature or AI model was used, and how long a session lasted. These events never contain anything you say, see or type, and IP addresses are anonymised. We don't use advertising or marketing trackers inside the desktop app.
 
 The rest of this document explains those flows in detail.
 
@@ -92,9 +93,67 @@ directly. We do not present the two as the same kind of evidence, because they a
 first is a report from software running on your computer, and the second is something our own
 systems executed and measured.
 
+### 3.2.1 Product-usage events — what every installation reports, and who it is linked to
+
+The desktop app reports product-usage events to our own servers, whether or not you have bought
+anything. We use them to follow how people move through the product: who installs it, who holds a
+first meeting, who tries it, who pays, where the others stop, and who comes back. They go to us
+only, not to an analytics company.
+
+**These events are linked to you, not anonymous.** Each one is tied to your device, and, when you
+have a trial or an account, to that trial or account.
+
+| Data | Purpose | Retained for |
+|---|---|---|
+| Hardware identifier (the same device fingerprint used for trials and licences) and a random installation identifier | Recognise the same device across launches and reinstalls, and tell installations apart | 13 months |
+| Your trial or your Natively account, worked out by our server from the trial token or Natively key the app sends with the request (through the account: your billing email and plan) | Know which trial or customer an event belongs to | 13 months |
+| Usage events — the app was opened for the first time; the app was used on a given day; a getting-started step was shown or completed; a meeting started or ended (including one cut short because the app was closed), how many whole minutes it lasted and how many answers it produced; an answer could not be given, and the kind of reason, chosen from a fixed list (for example: no AI is set up, a key was refused, the request timed out) and never the provider's message; which features you used that day; a card or a locked feature was shown, and what you chose; a free trial was started, or could not be and why; a checkout page was opened, and from which screen; a licence key or API key was entered, and whether it was accepted | Understand how the product is used, where people give up, and what leads to a purchase | 13 months |
+| The state of the installation at that moment, as yes/no values — whether it is on a trial, has a plan, has a Pro licence, or uses its own AI keys — with the application version and operating system | Compare those groups | 13 months |
+| Country — a two-letter country code that our server works out from the network address the request arrives from | See roughly where in the world the app is in use, and show it per country on our website (see below) | 13 months |
+
+Every event is a fixed name with fixed choices, whole numbers, or yes/no values. No field in it
+can hold text, so an event cannot contain anything you say, see, type or paste, a file name, a
+meeting title, the name of a model, or a key. A count of answers is a number; the answers are
+never sent. We do not store your IP address with these events.
+
+**Country.** Our server reads the address a request arrives from once, to look up the country in
+a database it keeps on its own disk (IP geolocation by [DB-IP](https://db-ip.com)), and stores the
+two-letter country code with the event. The address is not stored and is not sent to anyone for
+this lookup. Nothing finer than the country is kept: no region, city or network.
+
+**Shown on our website.** Our website shows where the app was open in the last 24 hours. For each
+country it shows a whole percentage and a shade of colour, and never a number of people. Nothing
+about a single installation is published, and nothing is shown at all when fewer than 50
+installations reported in that time.
+
+**Registering the installation.** Before it reports anything, the app registers its installation
+with our server once: it does a short calculation in the background (about a second on most
+computers, never during a meeting) and receives a token that it sends with later events. This
+exists to stop made-up installations being reported to us; it sends nothing about you.
+
+**What gets linked.** Events from one device are joined into one history, so we can see the steps
+one person took. When you start a free trial or use a Natively key, those events are linked to that
+trial or account. When you open a checkout page from the app, the link carries your installation
+identifier and the screen you came from, and Dodo Payments returns both to us with the purchase, so
+a purchase is linked to the installation it started from. Your purchase history is part of the same
+record: the purchase, each renewal, a cancellation, a failed renewal payment, and any refund or
+chargeback, with the product, amount, currency and billing country. It is tied to your account, and
+through your account to the devices it has been used on. This includes free trials and purchases made
+before this version of the app. We can look up one person's history by their email or device when we
+need to, for example to answer a support question.
+
+**Turning it off.** Open **Settings › General › Advanced** and turn off **Usage statistics**. That
+stops these events, discards any that had not been sent yet, and stops the identifier being added
+to checkout links. It is on by default. If you email **privacy@heynatively.com**, we will also
+delete the events already reported for your device and account.
+
+The switch does not change the records described in §3.2 for paid products and the Free Trial
+(the usage ledger, licence activity and the feature activity a licensed app reports). Billing and
+dispute handling depend on those, so they continue while you hold a licence or a plan.
+
 ### 3.3 What payment processors handle
 
-Payments are processed by **Dodo Payments**. Card details, bank details, and similar payment-instrument data are handled by Dodo and are subject to Dodo's privacy policy. We receive transaction metadata from Dodo (order ID, amount, currency, status, billing email) but we do **not** receive or store full card or bank details on our servers.
+Payments are processed by **Dodo Payments**. Card details, bank details, and similar payment-instrument data are handled by Dodo and are subject to Dodo's privacy policy. We receive transaction metadata from Dodo (order ID, amount, currency, status, billing email, and the installation identifier and screen name the app attached to the checkout link — see §3.2.1) but we do **not** receive or store full card or bank details on our servers.
 
 ### 3.4 What software updates send
 
@@ -108,6 +167,26 @@ This is the standard data sent by any GitHub-hosted update check and is governed
 ### 3.5 Phone Mirror (Beta)
 
 When you pair the desktop app with a phone via the Phone Mirror beta feature, a short-lived pairing token is generated and used to establish the connection. The session content (the mirrored screen and notifications) is **not** stored on our servers. You are responsible for the security of any device you pair and for the network on which the pairing happens.
+
+### 3.6 Google Calendar (optional)
+
+Connecting Google Calendar is optional. If you connect it, Natively asks Google for **read-only** access to your name and email address (to show which account is connected), the list of calendars you have turned on, and the events on those calendars. Natively cannot add, change, or delete anything in your calendar.
+
+We use this data only for the calendar features you see in the app:
+
+- showing your upcoming meetings, with a Join button that opens the meeting link stored in the event;
+- linking a session you start to the calendar event it belongs to, so the saved notes carry that meeting's title, time, and attendees;
+- naming the speakers in your notes: your own first name and, in a one-to-one meeting, the other attendee's first name;
+- filling in the recipients of a follow-up email, which opens as a draft in your own Gmail. Natively never sends email for you.
+
+The app fetches calendar data directly from Google to your device. The sign-in tokens are encrypted with your operating system's secure storage, and the details of an event are kept on your device with the meeting they belong to. Your calendar events are **not** stored on a Natively-operated server. Two things derived from this data leave your device:
+
+- When Natively writes notes, answers, or a follow-up for a meeting, the text it sends to the AI provider you have chosen (see section 4.2; this can be Natively AI) can include the meeting's title and those speaker first names.
+- To show attendee pictures, the app asks Gravatar for an image using a SHA-256 hash of each attendee's email address. The address itself is not sent.
+
+**Limited Use.** Natively's use and transfer of information received from Google APIs adheres to the [Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy), including the Limited Use requirements. The use of raw or derived user data received from Workspace APIs will adhere to the Google User Data Policy, including the Limited Use requirements. We do not use Google user data, whether raw, aggregated, or derived, to create, train, or improve foundational or generalized AI or machine-learning models, and we do not transfer it to anyone for that purpose. We do not sell it or use it for advertising.
+
+You can disconnect at any time in Settings › Calendar, which deletes the stored tokens from your device. You can also remove Natively's access from your [Google Account](https://myaccount.google.com/permissions).
 
 ---
 
@@ -157,6 +236,8 @@ The search feature (where enabled) calls **Tavily** or, where you've configured 
 ### 4.4 Natively-managed services
 
 When you use the **Natively API** (instead of BYOK), your inputs flow through our infrastructure to one or more of the providers listed above, and the response flows back. We do **not** persist the content of these requests. We do log request metadata (timestamp, plan, quota usage, status) for billing, abuse prevention, and quality monitoring; that metadata is retained for up to 90 days.
+
+The **free trial** uses the Natively API in the same way. It starts by itself when you start a meeting and have no AI of your own set up (no provider key, no local model, no Natively key), and lasts 30 minutes from that moment, whether that is one meeting or several. The welcome screen says this before your first meeting, and the meeting overlay says it again at the moment the trial starts, with a button that opens AI Providers so you can use your own keys instead. If you have set up your own AI, no trial is started.
 
 ---
 
@@ -219,7 +300,7 @@ You have the following rights in respect of personal data we hold about you:
 - **Object** — you can object to processing that relies on legitimate interest (e.g., anti-abuse).
 - **Complain** — you can lodge a complaint with the relevant data-protection authority (in India, the Data Protection Board under the DPDP Act 2023; in the EU/UK, your local supervisory authority).
 
-To exercise any of these rights, email **natively.contact@gmail.com** with your order ID and a description of your request. We aim to respond within **30 days**.
+To exercise any of these rights, email **privacy@heynatively.com** with your order ID and a description of your request. We aim to respond within **30 days**.
 
 If you're in California, you may have additional rights under the California Consumer Privacy Act (CCPA) — including the right to know, the right to delete, and the right to opt out of "sale" of personal information. **We do not sell personal information.** You can exercise CCPA rights by emailing the same address.
 
@@ -259,8 +340,8 @@ We don't make adverse changes (e.g., expanding what we collect or share) without
 
 For privacy questions, data-rights requests, complaints, or anything else covered by this policy:
 
-**Email:** natively.contact@gmail.com
+**Email:** privacy@heynatively.com
 
-**Grievance Officer:** Evin John — natively.contact@gmail.com — acknowledgements within 72 hours on weekdays, resolution targets of 30 days.
+**Grievance Officer:** Evin John — privacy@heynatively.com — acknowledgements within 72 hours on weekdays, resolution targets of 30 days.
 
 We may not respond on weekends or Indian public holidays — if you write in over a weekend, please expect a reply early the following week.

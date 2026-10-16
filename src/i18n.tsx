@@ -4,6 +4,11 @@ import { RU_GENERATED2 } from './i18n.ru.generated2';
 import { ZH_GENERATED } from './i18n.zh.generated';
 import { JA_GENERATED } from './i18n.ja.generated';
 import { ES_GENERATED } from './i18n.es.generated';
+import { ONBOARDING_RU, ONBOARDING_ZH, ONBOARDING_JA, ONBOARDING_ES } from './i18n.onboarding';
+import { DIRECT_ASSIST_RU, DIRECT_ASSIST_ZH, DIRECT_ASSIST_JA, DIRECT_ASSIST_ES } from './i18n.directAssist';
+import { CREDENTIAL_STORES_RU, CREDENTIAL_STORES_ZH, CREDENTIAL_STORES_JA, CREDENTIAL_STORES_ES } from './i18n.credentialStores';
+import { TRIAL_NOTICE_RU, TRIAL_NOTICE_ZH, TRIAL_NOTICE_JA, TRIAL_NOTICE_ES } from './i18n.trial';
+import { ASSIST_RU, ASSIST_ZH, ASSIST_JA, ASSIST_ES } from './i18n.assist';
 
 // ─── Lightweight in-house i18n ────────────────────────────────────────────────
 // No external dependency. `t(englishText)` returns the translation for the
@@ -22,6 +27,17 @@ export type Lang = 'en' | 'ru' | 'zh' | 'ja' | 'es';
 const STORAGE_KEY = 'natively_lang';
 const SUPPORTED_LANGS: Lang[] = ['en', 'ru', 'zh', 'ja', 'es'];
 
+// Each language named in itself, never passed through t(): a language picker
+// must read the same in every interface language, or someone who switched to
+// Russian by mistake has to find "English" spelled as «Английский».
+export const LANG_NATIVE_NAMES: Record<Lang, string> = {
+    en: 'English',
+    ru: 'Русский',
+    zh: '中文',
+    ja: '日本語',
+    es: 'Español',
+};
+
 function isSupportedLang(v: string | null): v is Lang {
     return v !== null && (SUPPORTED_LANGS as string[]).includes(v);
 }
@@ -34,6 +50,11 @@ function isSupportedLang(v: string | null): v is Lang {
 const RU: Record<string, string> = {
     ...RU_GENERATED,
     ...RU_GENERATED2,
+    ...ONBOARDING_RU,
+    ...DIRECT_ASSIST_RU,
+    ...CREDENTIAL_STORES_RU,
+    ...TRIAL_NOTICE_RU,
+    ...ASSIST_RU,
     // ── Settings sidebar / navigation ──
     'General': 'Основные',
     'AI Providers': 'AI-провайдеры',
@@ -41,7 +62,7 @@ const RU: Record<string, string> = {
     'Calendar': 'Календарь',
     'Audio': 'Звук',
     'Keybinds': 'Горячие клавиши',
-    'Sync': 'Синхронизация',
+    'Companion': 'Компаньон',
     'Intelligence': 'Интеллект',
     'Setup & Help': 'Настройка и помощь',
     'About': 'О программе',
@@ -142,6 +163,7 @@ const RU: Record<string, string> = {
     'Transcript': 'Транскрипт',
     'Risks / Blockers': 'Риски / Блокеры',
     'Follow-up draft': 'Черновик письма',
+    'Follow-up email': 'Письмо по итогам встречи',
     'Follow-up Draft': 'Черновик письма',
     'Next Steps': 'Следующие шаги',
     'Coaching': 'Коучинг',
@@ -187,6 +209,18 @@ const RU: Record<string, string> = {
     'Support Development': 'Поддержать разработку',
     'Natively is independent source-available software.': 'Natively — независимое ПО с открытым исходным кодом.',
     'Support Project': 'Поддержать проект',
+    // Settings > About, the affiliate row (2026-10-14).
+    'Affiliate Program': 'Партнёрская программа',
+    'Recommend Natively and earn a commission on every sale.': 'Рекомендуйте Natively и получайте комиссию с каждой продажи.',
+    'Affiliate': 'Партнёрам',
+    // Settings > About, the Reviews section (2026-10-11).
+    'Reviews': 'Отзывы',
+    'Tell us how Natively is working for you.': 'Расскажите, как вам работается с Natively.',
+    'Rate Natively': 'Оценить Natively',
+    'A star rating and a few words, if you like.': 'Оценка в звёздах и, если хотите, пара слов.',
+    'This install has already sent a review. Thank you.': 'С этой установки отзыв уже отправлен. Спасибо.',
+    'Write a review': 'Написать отзыв',
+    'Sent': 'Отправлено',
     'Enter your license key': 'Введите лицензионный ключ',
     'Help & Setup Guide': 'Помощь и настройка',
     'Help Guide': 'Руководство',
@@ -248,7 +282,9 @@ const RU: Record<string, string> = {
     'When enabled, live assistance works but transcripts, summaries, and history are discarded when the meeting ends':
         'Когда включено, живая помощь работает, но транскрипты, резюме и история удаляются по завершении встречи',
     'Do not save meetings': 'Не сохранять встречи',
-    'Verbose debug logging': 'Подробное журналирование',
+    'Debug logging': 'Отладочное журналирование',
+    'Usage statistics': 'Статистика использования',
+    'Sends which features are used and how often. Never what you say, see or type.': 'Отправляет сведения о том, какие функции используются и как часто. То, что вы говорите, видите или печатаете, не отправляется.',
     'Print detailed audio, STT, and pipeline diagnostics': 'Выводить подробную диагностику звука, STT и пайплайна',
     'Interviewer Transcript': 'Транскрипт интервьюера',
     'Show real-time transcription of the interviewer': 'Показывать транскрипцию интервьюера в реальном времени',
@@ -260,6 +296,11 @@ const RU: Record<string, string> = {
 // Chinese — ZH_GENERATED spread first, then hand-authored overrides on any collision.
 const ZH: Record<string, string> = {
     ...ZH_GENERATED,
+    ...ONBOARDING_ZH,
+    ...DIRECT_ASSIST_ZH,
+    ...CREDENTIAL_STORES_ZH,
+    ...TRIAL_NOTICE_ZH,
+    ...ASSIST_ZH,
     'Language': '语言',
     'English': '英语',
     'Russian': '俄语',
@@ -276,6 +317,11 @@ const ZH: Record<string, string> = {
 // overrides win on any key collision.
 const JA: Record<string, string> = {
     ...JA_GENERATED,
+    ...ONBOARDING_JA,
+    ...DIRECT_ASSIST_JA,
+    ...CREDENTIAL_STORES_JA,
+    ...TRIAL_NOTICE_JA,
+    ...ASSIST_JA,
     'Language': '言語',
     'English': '英語',
     'Russian': 'ロシア語',
@@ -291,6 +337,11 @@ const JA: Record<string, string> = {
 // Spanish — ES_GENERATED spread first, then hand-authored overrides on any collision.
 const ES: Record<string, string> = {
     ...ES_GENERATED,
+    ...ONBOARDING_ES,
+    ...DIRECT_ASSIST_ES,
+    ...CREDENTIAL_STORES_ES,
+    ...TRIAL_NOTICE_ES,
+    ...ASSIST_ES,
     'Language': 'Idioma',
     'English': 'Inglés',
     'Russian': 'Ruso',
