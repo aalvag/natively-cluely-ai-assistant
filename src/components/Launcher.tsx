@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useT } from '../i18n';
-import { ToggleLeft, ToggleRight, Search, Calendar, MoreHorizontal, Globe, Clock, ChevronRight, Settings, LayoutGrid, RefreshCw, Eye, EyeOff, Ghost, Plus, Mail, Link as LinkIcon, ChevronDown, Trash2, Bell, Download, DownloadCloud, CheckCircle, AlertCircle, User, UserSearch, Sparkles, ArrowUpRight } from 'lucide-react';
+import { ToggleLeft, ToggleRight, Search, Calendar, ArrowRight, ArrowLeft, MoreHorizontal, Globe, Clock, ChevronRight, Settings, LayoutGrid, RefreshCw, Eye, EyeOff, Ghost, Plus, Mail, Link as LinkIcon, ChevronDown, Trash2, Bell, Download, DownloadCloud, CheckCircle, AlertCircle, User, UserSearch, Sparkles, ArrowUpRight, Loader2 } from 'lucide-react';
 import { generateMeetingPDF } from '../utils/pdfGenerator';
 import icon from "./icon.png";
 import mainui from "../UI_comp/mainui.png";
@@ -96,6 +96,11 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
     const [isCalendarConnected, setIsCalendarConnected] = useState(false);
     const [isRefreshing, setIsRefreshing] = useState(false);
     const [showNotification, setShowNotification] = useState(false);
+    const [audioStatus, setAudioStatus] = useState<{
+        stage: 'idle' | 'initializing_capture' | 'loading_model' | 'downloading' | 'ready';
+        progress?: number;
+        message?: string;
+    }>({ stage: 'idle' });
 
     // Global search state (for AI chat overlay)
     const [isGlobalChatOpen, setIsGlobalChatOpen] = useState(false);
@@ -232,6 +237,47 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
         window.addEventListener('focus', onFocus);
         window.addEventListener('blur', onBlur);
 
+        // Listen for audio initialization and model download progress
+        let removeAudioStatusListener: (() => void) | undefined;
+        if (window.electronAPI?.onAudioInitStatus) {
+            removeAudioStatusListener = window.electronAPI.onAudioInitStatus((data: any) => {
+                if (data.stage === 'ready') {
+                    setAudioStatus({ stage: 'ready', progress: 100, message: data.message || 'Listo • Escuchando' });
+                    setTimeout(() => {
+                        setAudioStatus({ stage: 'idle' });
+                    }, 1800);
+                } else {
+                    setAudioStatus({
+                        stage: data.stage as any,
+                        progress: typeof data.progress === 'number' ? data.progress : undefined,
+                        message: data.message,
+                    });
+                }
+            });
+        }
+
+        let removeWhisperProgressListener: (() => void) | undefined;
+        if (window.electronAPI?.onLocalWhisperDownloadProgress) {
+            removeWhisperProgressListener = window.electronAPI.onLocalWhisperDownloadProgress((data: any) => {
+                setAudioStatus({
+                    stage: 'downloading',
+                    progress: data.progress,
+                    message: `Descargando modelo (${data.progress}%)...`,
+                });
+            });
+        }
+
+        let removeWhisperCompleteListener: (() => void) | undefined;
+        if (window.electronAPI?.onLocalWhisperDownloadComplete) {
+            removeWhisperCompleteListener = window.electronAPI.onLocalWhisperDownloadComplete(() => {
+                setAudioStatus({
+                    stage: 'loading_model',
+                    progress: 80,
+                    message: 'Cargando modelo en memoria...',
+                });
+            });
+        }
+
         // Orchestrator: usage-time accumulator. Tick every 30s while launcher
         // is mounted and the window is foregrounded.
         //
@@ -265,6 +311,9 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
             if (removeMeetingsListener) removeMeetingsListener();
             if (removeUndetectableListener) removeUndetectableListener();
             if (removeMeetingStateListener) removeMeetingStateListener();
+            if (removeAudioStatusListener) removeAudioStatusListener();
+            if (removeWhisperProgressListener) removeWhisperProgressListener();
+            if (removeWhisperCompleteListener) removeWhisperCompleteListener();
             clearInterval(interval);
             window.removeEventListener('focus', onFocus);
             window.removeEventListener('blur', onBlur);
@@ -1105,6 +1154,32 @@ const Launcher: React.FC<LauncherProps> = ({ onStartMeeting, onOpenSettings, onO
                                                             <span className="drop-shadow-[0_1px_1px_rgba(0,0,0,0.1)] text-[20px] leading-none">
                                                                 {t('Meeting ongoing')}
                                                             </span>
+                                                        </motion.div>
+                                                    ) : audioStatus.stage !== 'idle' ? (
+                                                        <motion.div
+                                                            key="loading-audio"
+                                                            initial={{ opacity: 0 }}
+                                                            animate={{ opacity: 1 }}
+                                                            exit={{ opacity: 0, transition: { duration: 0.14, ease: [0.25, 1, 0.5, 1] } }}
+                                                            transition={{ duration: 0.22, ease: [0.25, 1, 0.5, 1] }}
+                                                            className="flex flex-col items-center justify-center gap-1.5 w-full min-w-[210px]"
+                                                        >
+                                                            <div className="flex items-center gap-2">
+                                                                <Loader2 className="w-4 h-4 animate-spin text-white drop-shadow-[0_1px_2px_rgba(0,0,0,0.2)]" />
+                                                                <span className="drop-shadow-[0_1px_1px_rgba(0,0,0,0.1)] text-[17px] leading-none font-medium">
+                                                                    {audioStatus.message || (audioStatus.stage === 'downloading' ? `Descargando modelo: ${audioStatus.progress}%` : t('Iniciando audio...'))}
+                                                                </span>
+                                                            </div>
+                                                            {typeof audioStatus.progress === 'number' && audioStatus.progress > 0 && (
+                                                                <div className="w-full max-w-[170px] h-[4px] bg-black/20 rounded-full overflow-hidden border border-white/20">
+                                                                    <motion.div
+                                                                        className="h-full bg-white rounded-full shadow-[0_0_8px_rgba(255,255,255,0.9)]"
+                                                                        initial={{ width: 0 }}
+                                                                        animate={{ width: `${audioStatus.progress}%` }}
+                                                                        transition={{ duration: 0.2, ease: 'easeOut' }}
+                                                                    />
+                                                                </div>
+                                                            )}
                                                         </motion.div>
                                                     ) : (
                                                         <motion.div

@@ -129,6 +129,18 @@ const buildOptions = {
   banner: {
     js: `try{if(process.env.NATIVELY_UI_EVAL==='1'&&!globalThis.__nativelyDnsPinned){globalThis.__nativelyDnsPinned=1;var __dns=require('dns');var __ol=__dns.lookup.bind(__dns);__dns.lookup=function(h,o,cb){if(typeof o==='function'){cb=o;o={};}if(h==='api.natively.software'){return __dns.resolve4(h,function(e,a){if(e||!a||!a.length)return __ol(h,o,cb);if(o&&o.all)return cb(null,[{address:a[0],family:4}]);return cb(null,a[0],4);});}return __ol(h,o,cb);};console.log('[eval] dns.lookup→resolve4 pinned for api.natively.software');}}catch(__e){try{console.warn('[eval] dns pin banner failed:',__e&&__e.message);}catch(_){}}`,
   },
+  plugins: [
+    ...(!fs.existsSync(premiumDir) ? [{
+      name: 'external-premium-fallback',
+      setup(b) {
+        b.onResolve({ filter: /premium/ }, args => {
+          if (args.kind !== 'entry-point') {
+            return { path: args.path, external: true };
+          }
+        });
+      },
+    }] : []),
+  ],
   logLevel: 'warning',
 };
 
@@ -155,7 +167,60 @@ const copyAssets = () => {
   }
 };
 
+const patchTransformers = () => {
+  const targets = [
+    'node_modules/@huggingface/transformers/dist/transformers.node.mjs',
+    'node_modules/@huggingface/transformers/dist/transformers.node.cjs',
+  ];
+  for (const target of targets) {
+    const full = path.resolve(rootDir, target);
+    if (!fs.existsSync(full)) continue;
+    let content = fs.readFileSync(full, 'utf8');
+    if (!content.includes("session.inputNames.includes('cache_position')")) {
+      const targetStr = "new_model_inputs.use_cache_branch = boolTensor(!!past_key_values);\n    }";
+      const patchStr = `new_model_inputs.use_cache_branch = boolTensor(!!past_key_values);\n    }
+    if (session.inputNames.includes('cache_position') && !new_model_inputs.cache_position) {
+        const cur_len = new_model_inputs.input_ids?.dims?.[1] ?? 1;
+        let past_len = 0;
+        if (past_key_values && past_key_values[0] && past_key_values[0][0]) {
+            past_len = past_key_values[0][0].dims[2] ?? 0;
+        }
+        const positions = new BigInt64Array(cur_len);
+        for (let i = 0; i < cur_len; i++) {
+            positions[i] = BigInt(past_len + i);
+        }
+        new_model_inputs.cache_position = new _utils_tensor_js__WEBPACK_IMPORTED_MODULE_9__.Tensor('int64', positions, [cur_len]);
+    }`;
+      if (content.includes(targetStr)) {
+        content = content.replace(targetStr, patchStr);
+        fs.writeFileSync(full, content, 'utf8');
+        console.log(`[build-electron] Patched cache_position in ${target}`);
+      }
+    }
+    if (!content.includes('// [natively-patch] detached arraybuffer guard')) {
+      const feedTarget = 'const ortFeed = Object.fromEntries(Object.entries(checkedInputs).map(([k, v]) => [k, v.ort_tensor]));';
+      const feedPatch = `// [natively-patch] detached arraybuffer guard
+        const ortFeed = Object.fromEntries(Object.entries(checkedInputs).map(([k, v]) => {
+            let ort = v?.ort_tensor;
+            if (!ort || !ort.data || ort.data.buffer?.detached || ort.data.byteLength === 0) {
+                try {
+                    v = v.clone();
+                    ort = v.ort_tensor;
+                } catch {}
+            }
+            return [k, ort];
+        }));`;
+      if (content.includes(feedTarget)) {
+        content = content.replace(feedTarget, feedPatch);
+        fs.writeFileSync(full, content, 'utf8');
+        console.log(`[build-electron] Patched sessionRun ortFeed safety in ${target}`);
+      }
+    }
+  }
+};
+
 if (WATCH) {
+  patchTransformers();
   context(buildOptions).then(async (ctx) => {
     await ctx.watch();
     copyAssets();
@@ -165,6 +230,7 @@ if (WATCH) {
     console.log('[build-electron] watching for changes...');
   }).catch(onFailure);
 } else {
+  patchTransformers();
   if (CORE_SMOKE) {
     console.log('[build-electron] Core smoke mode: private premium imports are external');
   }

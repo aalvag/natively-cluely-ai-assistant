@@ -951,7 +951,7 @@ async function resolveMacScreenCaptureCapability(context: string, options?: { by
         types: ['screen'],
         thumbnailSize: { width: 1, height: 1 },
       }),
-      15000,
+      2500,
       `screen-capture-probe-timeout-${context}`,
     );
     const sourceCount = sources.filter((source) => source.id.startsWith('screen:')).length;
@@ -1223,6 +1223,7 @@ import { ElevenLabsStreamingSTT } from "./audio/ElevenLabsStreamingSTT"
 import { OpenAIStreamingSTT } from "./audio/OpenAIStreamingSTT"
 import { NativelyProSTT } from "./audio/NativelyProSTT"
 import { NvidiaNimStreamingSTT } from "./audio/NvidiaNimStreamingSTT"
+import { LocalWhisperSTT } from "./audio/LocalWhisperSTT"
 import { AppleSpeechSTT } from "./audio/AppleSpeechSTT"
 import { punctuationSourceFor } from "./llm/punctuationProvenance"
 import { ThemeManager } from "./ThemeManager"
@@ -1230,7 +1231,7 @@ import { RAGManager } from "./rag/RAGManager"
 import { DatabaseManager } from "./db/DatabaseManager"
 
 /** Unified type for all STT providers with optional extended capabilities */
-type STTProvider = (GoogleSTT | RestSTT | DeepgramStreamingSTT | SonioxStreamingSTT | ElevenLabsStreamingSTT | OpenAIStreamingSTT | NativelyProSTT | NvidiaNimStreamingSTT | AppleSpeechSTT) & {
+type STTProvider = (GoogleSTT | RestSTT | DeepgramStreamingSTT | SonioxStreamingSTT | ElevenLabsStreamingSTT | OpenAIStreamingSTT | NativelyProSTT | NvidiaNimStreamingSTT | LocalWhisperSTT | AppleSpeechSTT) & {
   /** Local models return whether a trailing final is now in flight; cloud providers return void. */
   finalize?: () => void | boolean;
   setAudioChannelCount?: (count: number) => void;
@@ -1294,11 +1295,20 @@ let KnowledgeOrchestratorClass: any = null;
 let KnowledgeDatabaseManagerClass: any = null;
 // Phase 1: shared comp-evidence detector for transcript-aware intent routing.
 let textHasCompEvidence: ((text: string) => boolean) | null = null;
+// Routed through the resolver so a local implementation can supply these when
+// the premium submodule is absent. Premium still wins when installed; a null
+// result reproduces the previous catch behaviour exactly (feature disabled).
 try {
-    KnowledgeOrchestratorClass = require('../premium/electron/knowledge/KnowledgeOrchestrator').KnowledgeOrchestrator;
-    KnowledgeDatabaseManagerClass = require('../premium/electron/knowledge/KnowledgeDatabaseManager').KnowledgeDatabaseManager;
-    textHasCompEvidence = require('../premium/electron/knowledge/NegotiationConversationTracker').textHasCompEvidence;
+    const { loadKnowledgeModule } = require('./knowledgeModules');
+    KnowledgeOrchestratorClass = loadKnowledgeModule('KnowledgeOrchestrator')?.KnowledgeOrchestrator ?? null;
+    KnowledgeDatabaseManagerClass = loadKnowledgeModule('KnowledgeDatabaseManager')?.KnowledgeDatabaseManager ?? null;
+    textHasCompEvidence = loadKnowledgeModule('NegotiationConversationTracker')?.textHasCompEvidence ?? null;
 } catch {
+    KnowledgeOrchestratorClass = null;
+    KnowledgeDatabaseManagerClass = null;
+    textHasCompEvidence = null;
+}
+if (!KnowledgeOrchestratorClass) {
     console.log('[Main] Knowledge modules not available — profile intelligence disabled.');
 }
 
@@ -1617,7 +1627,8 @@ export class AppState {
           // (main.ts:1721-1726), not at this preload block — leaving it
           // un-validated here means a corrupt per-channel id would still
           // crash the meeting even though the global gate passes.
-          const FALLBACK = 'Xenova/whisper-tiny.en';
+          const sttLang = CredentialsManager.getInstance().getSttLanguage();
+          const FALLBACK = (sttLang && sttLang !== 'en' && sttLang !== 'en-US') ? 'Xenova/whisper-base' : 'Xenova/whisper-tiny.en';
           const poisoned = modelPreloader.consumePoisonedLoadSentinel?.();
           if (poisoned?.modelId) {
             let resetAny = false;
@@ -2013,6 +2024,7 @@ export class AppState {
           actionId === 'chat:codeHint' ||
           actionId === 'chat:brainstorm' ||
           actionId === 'chat:dynamicAction4' ||
+          actionId === 'chat:auto-type-last-code' ||
           actionId === 'chat:scrollUp' ||
           actionId === 'chat:scrollDown' ||
           actionId === 'chat:scrollLeft' ||
@@ -2026,6 +2038,7 @@ export class AppState {
             'chat:codeHint': 'codeHint',
             'chat:brainstorm': 'brainstorm',
             'chat:dynamicAction4': 'dynamicAction4',
+            'chat:auto-type-last-code': 'autoTypeLastCode',
             'chat:scrollUp': 'scrollUp',
             'chat:scrollDown': 'scrollDown',
             'chat:scrollLeft': 'scrollLeft',
@@ -2544,9 +2557,15 @@ export class AppState {
       const db = DatabaseManager.getInstance();
       const sqliteDb = db.getDb();
 
-      if (sqliteDb && KnowledgeDatabaseManagerClass && KnowledgeOrchestratorClass) {
-        const knowledgeDb = new KnowledgeDatabaseManagerClass(sqliteDb);
-        this.knowledgeOrchestrator = new KnowledgeOrchestratorClass(knowledgeDb);
+      if (sqliteDb && KnowledgeOrchestratorClass) {
+        if (KnowledgeDatabaseManagerClass) {
+          const knowledgeDb = new KnowledgeDatabaseManagerClass(sqliteDb);
+          this.knowledgeOrchestrator = new KnowledgeOrchestratorClass(knowledgeDb);
+        } else {
+          const { ProfileIndex } = require('./localKnowledge/ProfileIndex');
+          const profileIndex = new ProfileIndex(sqliteDb);
+          this.knowledgeOrchestrator = new KnowledgeOrchestratorClass({ profileIndex });
+        }
 
         // Role Insight owns its own tables in the same SQLite file. It needs the
         // raw handle, which KnowledgeDatabaseManager does not expose, so it is
@@ -3465,9 +3484,13 @@ export class AppState {
     } else if (sttProvider === 'apple-speech') {
       stt = new AppleSpeechSTT();
     } else if (sttProvider === 'local-whisper') {
-      const { LocalWhisperSTT } = require('./audio/LocalWhisperSTT');
       const sm = SettingsManager.getInstance();
-      const globalModel = sm.get('localWhisperModel') ?? 'Xenova/whisper-tiny.en';
+      let globalModel = sm.get('localWhisperModel');
+      if (!globalModel) {
+        globalModel = (sttLanguage && sttLanguage !== 'en' && sttLanguage !== 'en-US') ? 'Xenova/whisper-base' : 'Xenova/whisper-tiny.en';
+      } else if (globalModel.endsWith('.en') && sttLanguage && sttLanguage !== 'en' && sttLanguage !== 'en-US') {
+        globalModel = globalModel.replace(/\.en$/, '') || 'Xenova/whisper-base';
+      }
       // Per-channel override: when enabled the two STT instances may load
       // different models (e.g. Moonshine Tiny for mic, Moonshine Base for
       // system audio). Falls back to globalModel if the per-channel slot is
@@ -3479,11 +3502,11 @@ export class AppState {
           : sm.get('localWhisperModelMic');
         if (override) modelId = override;
       }
-      console.log(`[Main] Using LocalWhisperSTT for ${speaker}, model: ${modelId}`);
+      console.log(`[Main] Using LocalWhisperSTT for ${speaker}, model: ${modelId}, language: ${sttLanguage}`);
       const lws = new LocalWhisperSTT(modelId);
       // Channel label disambiguates the two concurrent instances in latency logs.
       lws.setChannel(speaker === 'interviewer' ? 'system' : 'mic');
-      stt = lws as any;
+      stt = lws;
     } else {
       stt = new GoogleSTT(speaker);
     }
@@ -3503,6 +3526,7 @@ export class AppState {
       : stt instanceof ElevenLabsStreamingSTT ? 'elevenlabs'
       : stt instanceof NativelyProSTT ? 'natively'
       : stt instanceof GoogleSTT ? 'google'
+      : stt instanceof LocalWhisperSTT ? 'local-whisper'
       : sttProvider;
 
     // Speaker diarization on the MEETING-AUDIO channel (2026-08-25). That
@@ -3533,15 +3557,34 @@ export class AppState {
       });
     }
 
+    if (stt instanceof LocalWhisperSTT) {
+      stt.on('progress', (ev: { modelId: string; progress: number }) => {
+        this.broadcast('audio-init-status', {
+          stage: 'downloading',
+          progress: ev.progress,
+          modelId: ev.modelId,
+          message: `Descargando modelo de voz (${ev.progress}%)...`,
+        });
+        this.broadcast('local-whisper-download-progress', { modelId: ev.modelId, progress: ev.progress });
+      });
+      stt.on('ready', (ev: { modelId: string }) => {
+        this.broadcast('audio-init-status', {
+          stage: 'ready',
+          progress: 100,
+          modelId: ev.modelId,
+          message: 'Modelo de voz listo',
+        });
+        this.broadcast('local-whisper-download-complete', { modelId: ev.modelId });
+      });
+    }
+
     // Wire Transcript Events
     stt.on('transcript', (segment: { text: string, isFinal: boolean, confidence: number, speakerId?: string }) => {
       // Accept transcripts while a meeting is active OR while we're draining
       // trailing finals after Stop. `_isDraining` covers the ~250 ms grace
       // window between Stop click and STT socket close so the user's last
       // sentence isn't silently dropped.
-      if (!this.isMeetingActive && !this._isDraining) {
-        return;
-      }
+      if (!this.isMeetingActive && !this._isDraining) return;
 
       this.intelligenceManager.handleTranscript({
         speaker: speaker,
@@ -6207,21 +6250,6 @@ export class AppState {
   private startCaptureChannels(context: string): CaptureChannelStartResult {
     const started = { mic: false, system: false };
     try {
-      this.microphoneCapture?.start();
-      this.googleSTT_User?.start();
-      started.mic = true;
-    } catch (err) {
-      console.error(`[Main] ${context}: mic channel failed to start:`, err);
-      this.sendAudioCaptureFailed({
-        channel: 'mic',
-        message: `Microphone failed to start (${(err as Error)?.message || 'unknown error'}). Check that no other app holds the mic — the meeting continues with system audio only.`,
-        attempt: 0,
-        maxAttempts: 0,
-        terminal: true,
-        stuck: false,
-      });
-    }
-    try {
       this.systemAudioCapture?.start();
       this.googleSTT?.start();
       started.system = true;
@@ -6230,6 +6258,21 @@ export class AppState {
       this.sendAudioCaptureFailed({
         channel: 'system',
         message: `System audio failed to start (${(err as Error)?.message || 'unknown error'}). The meeting continues with microphone only.`,
+        attempt: 0,
+        maxAttempts: 0,
+        terminal: true,
+        stuck: false,
+      });
+    }
+    try {
+      this.microphoneCapture?.start();
+      this.googleSTT_User?.start();
+      started.mic = true;
+    } catch (err) {
+      console.error(`[Main] ${context}: mic channel failed to start:`, err);
+      this.sendAudioCaptureFailed({
+        channel: 'mic',
+        message: `Microphone failed to start (${(err as Error)?.message || 'unknown error'}). Check that no other app holds the mic — the meeting continues with system audio only.`,
         attempt: 0,
         maxAttempts: 0,
         terminal: true,
@@ -6491,6 +6534,12 @@ export class AppState {
           console.warn('[Main] Meeting starting WITHOUT audio capture — Ambient AI Chat is ON (Settings > General). Transcript, summary and usage will be empty for this meeting.');
         }
         if (!this._ambientChatEnabled) {
+          this.broadcast('audio-init-status', {
+            stage: 'initializing_capture',
+            progress: 30,
+            message: 'Iniciando captura de audio...',
+          });
+
           // Check for audio configuration preference
           if (metadata?.audio) {
             await this.reconfigureAudio(metadata.audio.inputDeviceId, metadata.audio.outputDeviceId);
@@ -6506,6 +6555,11 @@ export class AppState {
           }
 
           // LAZY INIT: Ensure pipeline is ready (if not reconfigured above)
+          this.broadcast('audio-init-status', {
+            stage: 'loading_model',
+            progress: 60,
+            message: 'Cargando motor de transcripción...',
+          });
           await this.setupSystemAudioPipeline();
           if (!isCurrentMeeting()) {
             abortStaleAudioInit();
@@ -6523,6 +6577,11 @@ export class AppState {
           const channelsStarted = this.startCaptureChannels('startMeeting');
           userSttStartedByInit = channelsStarted.mic;
           systemSttStartedByInit = channelsStarted.system;
+          this.broadcast('audio-init-status', {
+            stage: 'ready',
+            progress: 100,
+            message: 'Listo • Escuchando',
+          });
         } else {
           console.log('[Main] Ambient AI Chat enabled — skipping mic/system audio capture and STT for this session.');
         }
@@ -6555,6 +6614,11 @@ export class AppState {
           console.log(`[Main][debug] Audio pipeline: input=${requestedInput} output=${requestedOutput} backend=${backend} sysRate=${sysRate}Hz micRate=${micRate}Hz`);
         }
         console.log('[Main] Audio pipeline started successfully.');
+        this.broadcast('audio-init-status', {
+          stage: 'ready',
+          progress: 100,
+          message: 'Listo • Escuchando',
+        });
       } catch (err) {
         // An endMeeting()-driven abort (or a generation change) is expected — it is
         // NOT a real audio failure, so we must not surface a "pipeline failed" banner
@@ -7244,6 +7308,21 @@ export class AppState {
   }
 
   public getKnowledgeOrchestrator(): any {
+    if (!this.knowledgeOrchestrator) {
+      try {
+        const db = DatabaseManager.getInstance();
+        const sqliteDb = db.getDb();
+        if (sqliteDb) {
+          const { ProfileIndex } = require('./localKnowledge/ProfileIndex');
+          const { LocalKnowledgeOrchestrator } = require('./localKnowledge/LocalKnowledgeOrchestrator');
+          const profileIndex = new ProfileIndex(sqliteDb);
+          this.knowledgeOrchestrator = new LocalKnowledgeOrchestrator({ profileIndex });
+          console.log('[AppState] Lazy LocalKnowledgeOrchestrator initialized on demand');
+        }
+      } catch (err) {
+        console.error('[AppState] Failed lazy LocalKnowledgeOrchestrator init:', err);
+      }
+    }
     return this.knowledgeOrchestrator;
   }
 

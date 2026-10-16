@@ -207,15 +207,11 @@ export function resolveInferenceConfig(): InferenceConfig {
     const { platform, arch } = process;
 
     if (platform === 'darwin' && arch === 'arm64') {
-        // Apple Silicon — CoreML uses Metal GPU + ANE. Default changed in
-        // 2026-07 from uniform fp32 → mixed per-module (fp32 encoder + q8
-        // decoders), matching every other platform. The q8 decoder is the
-        // dominant speed win and modern CoreML handles the mixed-precision
-        // graph cleanly. A user can override back to fp32 via the
-        // `whisperAppleSiliconDtype` setting if their WER regresses.
         const override = resolveAppleSiliconDtype();
+        const epOverride = process.env.WHISPER_EP;
+        const providers = epOverride === 'coreml' ? ['coreml', 'cpu'] : ['cpu'];
         return {
-            executionProviders: ['coreml', 'cpu'],
+            executionProviders: providers,
             dtype: override ?? WHISPER_SAFE_DTYPE,
         };
     }

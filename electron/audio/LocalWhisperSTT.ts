@@ -354,7 +354,11 @@ export class LocalWhisperSTT extends EventEmitter {
             // so a faster poll costs nothing.
             return { intervalMs: 280, minAudioMs: 560, skipAgreement: true };
         }
-        return { intervalMs: 1500, minAudioMs: 800, skipAgreement: false };
+        const isTiny = (modelId || '').toLowerCase().includes('tiny');
+        if (isTiny) {
+            return { intervalMs: 400, minAudioMs: 250, skipAgreement: true };
+        }
+        return { intervalMs: 600, minAudioMs: 350, skipAgreement: true };
     }
 
     setSampleRate(rate: number): void { this.inputSampleRate = rate; }
@@ -799,8 +803,7 @@ export class LocalWhisperSTT extends EventEmitter {
         }
         this.armStreamingWatchdog();
         this.worker.postMessage(
-            { type: 'transcribe', taskId, audio: copy, language: this.language, streaming: true, nemotronReset, channelId: this.nemotronChannelId },
-            [copy.buffer]
+            { type: 'transcribe', taskId, audio: copy, language: this.language, streaming: true, nemotronReset, channelId: this.nemotronChannelId }
         );
     }
 
@@ -1028,8 +1031,7 @@ export class LocalWhisperSTT extends EventEmitter {
         const taskId = `${streaming ? 's' : 't'}${++this.taskCounter}`;
         const copy = audio.slice();
         this.worker.postMessage(
-            { type: 'transcribe', taskId, audio: copy, language: this.language, streaming, nemotronReset, channelId: this.nemotronChannelId },
-            [copy.buffer]
+            { type: 'transcribe', taskId, audio: copy, language: this.language, streaming, nemotronReset, channelId: this.nemotronChannelId }
         );
     }
 
@@ -1272,6 +1274,11 @@ export class LocalWhisperSTT extends EventEmitter {
                 // The load is alive (per-file download / parse progress) —
                 // a slow but progressing init must not be killed by the deadline.
                 if (!this.workerReady && this.workerReadyTimer) this.scheduleWorkerReadyTimers();
+                this.emit('progress', {
+                    modelId: (msg as any).modelId || this.modelId,
+                    progress: (msg as any).progress,
+                    channelId: (msg as any).channelId,
+                });
                 return;
             }
             if (msg.type === 'ready') {
@@ -1285,6 +1292,7 @@ export class LocalWhisperSTT extends EventEmitter {
                     this.workerSpawnedAt = 0;
                 }
                 this.workerReady = true;
+                this.emit('ready', { modelId: this.modelId });
                 this.flushPending();
                 return;
             }

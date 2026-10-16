@@ -356,6 +356,9 @@ interface ElectronAPI {
   onLocalWhisperDownloadError: (
     callback: (data: { modelId: string; error: string }) => void,
   ) => () => void;
+  onAudioInitStatus: (
+    callback: (data: { stage: string; progress?: number; message?: string; modelId?: string }) => void,
+  ) => () => void;
   localWhisperPreload: (
     modelId?: string,
   ) => Promise<{ success: boolean; reason?: string; error?: string }>;
@@ -456,7 +459,7 @@ interface ElectronAPI {
   generateWhatToSay: (
     question?: string,
     imagePaths?: string[],
-    options?: { promptInstruction?: string; domContext?: string; domContextEnvelope?: unknown },
+    options?: { promptInstruction?: string; domContext?: string; domContextEnvelope?: unknown; conversationContext?: string },
   ) => Promise<{
     answer: string | null;
     question?: string;
@@ -1575,6 +1578,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   phoneMirrorRequestAutoContext: () => ipcRenderer.invoke('phone-mirror:request-auto-context'),
   phoneMirrorPushScreenshot: (screenshotPath?: string) =>
     ipcRenderer.invoke('phone-mirror:push-screenshot', screenshotPath),
+  phoneMirrorAutoType: (code: string, options?: { speed?: 'natural' | 'fast' | 'instant'; tabId?: number }) =>
+    ipcRenderer.invoke('phone-mirror:auto-type', code, options),
+  phoneMirrorStopAutoType: () => ipcRenderer.invoke('phone-mirror:stop-auto-type'),
   // Smart Browser Context v2 — auto-capture settings.
   browserContextGetSettings: () => ipcRenderer.invoke('browser-context:get-settings'),
   browserContextSetSettings: (patch: Record<string, boolean>) =>
@@ -1780,6 +1786,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('local-whisper-download-error', listener);
     return () => ipcRenderer.removeListener('local-whisper-download-error', listener);
   },
+  onAudioInitStatus: (cb: (data: { stage: string; progress?: number; message?: string; modelId?: string }) => void) => {
+    const listener = (_: any, data: any) => cb(data);
+    ipcRenderer.on('audio-init-status', listener);
+    return () => ipcRenderer.removeListener('audio-init-status', listener);
+  },
   localWhisperPreload: (modelId?: string) => ipcRenderer.invoke('local-whisper-preload', modelId),
   localWhisperGetHardware: () => ipcRenderer.invoke('local-whisper-get-hardware'),
 
@@ -1968,7 +1979,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   generateWhatToSay: (
     question?: string,
     imagePaths?: string[],
-    options?: { promptInstruction?: string; domContext?: string; domContextEnvelope?: unknown },
+    options?: { promptInstruction?: string; domContext?: string; domContextEnvelope?: unknown; conversationContext?: string },
   ) => ipcRenderer.invoke('generate-what-to-say', question, imagePaths, options),
   startDirectAssist: (request: DirectAssistRequest) =>
     ipcRenderer.invoke('direct-assist-stream', request),
@@ -3076,6 +3087,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('modes:get-reference-files', modeId),
   modesUploadReferenceFile: (modeId: string) =>
     ipcRenderer.invoke('modes:upload-reference-file', modeId),
+  modesUploadReferenceFolder: (modeId: string) =>
+    ipcRenderer.invoke('modes:upload-reference-folder', modeId),
   modesDeleteReferenceFile: (id: string) => ipcRenderer.invoke('modes:delete-reference-file', id),
   modesGetReferenceFileStatus: (modeId: string) =>
     ipcRenderer.invoke('modes:get-reference-file-status', modeId),

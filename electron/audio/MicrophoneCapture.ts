@@ -7,10 +7,10 @@ import { normalizeSpeechEdge } from './speechEdge';
 // the wrapper must NOT touch macOS CoreAudio HAL: doing so lights the orange menu-bar
 // microphone-in-use indicator, which would be on for the lifetime of the process even
 // though no meeting is active (the user-facing invariant we're protecting here).
-// The native monitor is constructed in start() (the only point at which capture is
-// actually requested) and in the post-stop() pre-warm path (gated on preWarmEnabled).
-const NativeModule: any = loadNativeModule();
-const { MicrophoneCapture: RustMicCapture } = NativeModule || {};
+function getRustMicCapture(): any {
+    const NativeModule: any = loadNativeModule();
+    return NativeModule?.MicrophoneCapture;
+}
 
 export class MicrophoneCapture extends EventEmitter {
     private monitor: any = null;
@@ -48,14 +48,10 @@ export class MicrophoneCapture extends EventEmitter {
     constructor(deviceId?: string | null) {
         super();
         this.deviceId = deviceId || null;
+        const RustMicCapture = getRustMicCapture();
         if (!RustMicCapture) {
             console.error('[MicrophoneCapture] Rust class implementation not found.');
         } else {
-            // LAZY INIT: do NOT construct the native monitor here. Doing so opens
-            // a cpal input stream on macOS and lights the orange menu-bar mic-in-use
-            // indicator — even though no meeting has started. Construction is
-            // deferred to start() (when the user actually needs capture) and to
-            // the gated post-stop() pre-warm path.
             console.log(`[MicrophoneCapture] Initialized wrapper (lazy). Device ID: ${this.deviceId || 'default'}`);
         }
     }
@@ -138,6 +134,7 @@ export class MicrophoneCapture extends EventEmitter {
     public start(): void {
         if (this.isRecording) return;
 
+        const RustMicCapture = getRustMicCapture();
         if (!RustMicCapture) {
             console.error('[MicrophoneCapture] Cannot start: Rust module missing');
             // F-107: see SystemAudioCapture.start() — a silent return here hid
@@ -317,6 +314,7 @@ export class MicrophoneCapture extends EventEmitter {
                 this._teardownPromise = null;
             }
             if (!this.preWarmEnabled) return;
+            const RustMicCapture = getRustMicCapture();
             if (!RustMicCapture) return;
             if (this.monitor) return;  // start() raced ahead and already grabbed a fresh handle
             try {

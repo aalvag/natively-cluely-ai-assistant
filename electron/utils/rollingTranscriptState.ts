@@ -97,7 +97,55 @@ export function mergeRollingTranscriptPartial(prev: string, partialText: string)
   return text;
 }
 
-/** Commit a final segment — replaces matching in-progress tail instead of duplicating. */
+/**
+ * Strips duplicate prefix words from a new transcript chunk if they overlap
+ * with the trailing words of the previous transcript chunk.
+ * Handles variations in punctuation, casing, and word counts (up to 8 words).
+ */
+export function stripOverlappingPrefix(prevText: string, newText: string): string {
+  if (!prevText || !newText) return (newText || '').trim();
+
+  const prevTrimmed = prevText.trim();
+  const newTrimmed = newText.trim();
+  if (!prevTrimmed || !newTrimmed) return newTrimmed;
+
+  const prevWords = prevTrimmed.split(/\s+/);
+  const newWords = newTrimmed.split(/\s+/);
+
+  const cleanWord = (w: string) => w.toLowerCase().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+
+  const maxOverlap = Math.min(8, prevWords.length, newWords.length);
+  let bestOverlapWords = 0;
+
+  for (let k = maxOverlap; k >= 1; k--) {
+    const prevSlice = prevWords.slice(prevWords.length - k).map(cleanWord);
+    const newSlice = newWords.slice(0, k).map(cleanWord);
+
+    let match = true;
+    for (let i = 0; i < k; i++) {
+      if (!prevSlice[i] || !newSlice[i] || prevSlice[i] !== newSlice[i]) {
+        match = false;
+        break;
+      }
+    }
+
+    if (match) {
+      bestOverlapWords = k;
+      break;
+    }
+  }
+
+  if (bestOverlapWords > 0) {
+    if (bestOverlapWords >= newWords.length) {
+      return '';
+    }
+    return newWords.slice(bestOverlapWords).join(' ').trim();
+  }
+
+  return newTrimmed;
+}
+
+/** Commit a final segment — replaces matching in-progress tail and strips boundary overlap. */
 export function mergeRollingTranscriptFinal(prev: string, finalText: string): string {
   const text = finalText.trim();
   if (!text) return prev;
@@ -115,5 +163,9 @@ export function mergeRollingTranscriptFinal(prev: string, finalText: string): st
     return prev;
   }
 
-  return capRollingTranscript(prev ? prev + FINAL_SEPARATOR + text : text);
+  const dedupedText = prev ? stripOverlappingPrefix(prev, text) : text;
+  if (!dedupedText) return prev;
+
+  return capRollingTranscript(prev ? prev + FINAL_SEPARATOR + dedupedText : dedupedText);
 }
+

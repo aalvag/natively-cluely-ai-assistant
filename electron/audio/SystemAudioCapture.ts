@@ -2,10 +2,10 @@ import { EventEmitter } from 'events';
 import { loadNativeModule } from './nativeModuleLoader';
 import { normalizeSpeechEdge } from './speechEdge';
 
-// RustAudioCapture is the native Rust class (napi-rs) that captures system audio.
-// May be null if the .node binary isn't available — constructor logs an error in that case.
-const NativeModule: any = loadNativeModule();
-const { SystemAudioCapture: RustAudioCapture } = NativeModule || {};
+function getRustAudioCapture(): any {
+    const NativeModule: any = loadNativeModule();
+    return NativeModule?.SystemAudioCapture;
+}
 
 export class SystemAudioCapture extends EventEmitter {
     private isRecording: boolean = false;
@@ -14,20 +14,15 @@ export class SystemAudioCapture extends EventEmitter {
     private monitor: any = null;
     private chunkCount: number = 0;
     private sampleRatePollTimers: NodeJS.Timeout[] = [];
-    // See MicrophoneCapture for the full rationale — same idempotent
-    // teardown-tracking pattern. Awaiting stop() guarantees the CoreAudio
-    // Tap / SCK / WASAPI handle has been released before the caller
-    // constructs a new instance or restarts capture.
     private _teardownPromise: Promise<void> | null = null;
 
     constructor(deviceId?: string | null) {
         super();
         this.deviceId = deviceId || null;
+        const RustAudioCapture = getRustAudioCapture();
         if (!RustAudioCapture) {
             console.error('[SystemAudioCapture] Rust class implementation not found.');
         } else {
-            // LAZY INIT: Don't create native monitor here - it causes 1-second audio mute + quality drop
-            // The monitor will be created in start() when the meeting actually begins
             console.log(`[SystemAudioCapture] Initialized (lazy). Device ID: ${this.deviceId || 'default'}`);
         }
     }
@@ -99,6 +94,7 @@ export class SystemAudioCapture extends EventEmitter {
     public start(): void {
         if (this.isRecording) return;
 
+        const RustAudioCapture = getRustAudioCapture();
         if (!RustAudioCapture) {
             console.error('[SystemAudioCapture] Cannot start: Rust module missing');
             // F-107: a bare return here made a missing/wrong-arch native

@@ -83,7 +83,6 @@ function redactSecretsOnlyForTrace<T>(payload: T): unknown {
     try { return require('./utils/redactForLog').redactSecretsOnly(payload); } catch { return payload; }
 }
 
-
 // Mode types
 export type IntelligenceMode = 'idle' | 'assist' | 'what_to_say' | 'follow_up' | 'recap' | 'clarify' | 'manual' | 'follow_up_questions' | 'code_hint' | 'brainstorm';
 
@@ -1617,7 +1616,7 @@ export class IntelligenceEngine extends EventEmitter {
         })();
     }
 
-    async runWhatShouldISay(question?: string, confidence: number = 0.8, imagePaths?: string[], options?: { speculative?: boolean; skipCooldown?: boolean; screenContext?: ScreenContext; promptInstruction?: string; activeSkill?: { id: string; name: string; promptBlock: string }; domContext?: string; forceFresh?: boolean }): Promise<string | null> {
+    async runWhatShouldISay(question?: string, confidence: number = 0.8, imagePaths?: string[], options?: { speculative?: boolean; skipCooldown?: boolean; screenContext?: ScreenContext; promptInstruction?: string; activeSkill?: { id: string; name: string; promptBlock: string }; domContext?: string; forceFresh?: boolean; conversationContext?: string }): Promise<string | null> {
         const answer = await this.runWhatShouldISayInner(question, confidence, imagePaths, options);
         if (!options?.speculative) {
             this.recordLiveTurn(answer, options?.screenContext, question, imagePaths?.length ?? 0, imagePaths);
@@ -1625,7 +1624,7 @@ export class IntelligenceEngine extends EventEmitter {
         return answer;
     }
 
-    private async runWhatShouldISayInner(question?: string, confidence: number = 0.8, imagePaths?: string[], options?: { speculative?: boolean; skipCooldown?: boolean; screenContext?: ScreenContext; promptInstruction?: string; activeSkill?: { id: string; name: string; promptBlock: string }; domContext?: string; forceFresh?: boolean }): Promise<string | null> {
+    private async runWhatShouldISayInner(question?: string, confidence: number = 0.8, imagePaths?: string[], options?: { speculative?: boolean; skipCooldown?: boolean; screenContext?: ScreenContext; promptInstruction?: string; activeSkill?: { id: string; name: string; promptBlock: string }; domContext?: string; forceFresh?: boolean; conversationContext?: string }): Promise<string | null> {
         const now = Date.now();
         // Intelligence OS observe-only trace (Phase 1). Zero-cost NO-OP unless
         // intelligence_trace_enabled is on. Committed at the primary final-answer emit
@@ -2008,6 +2007,11 @@ export class IntelligenceEngine extends EventEmitter {
             }));
 
             let preparedTranscript = prepareTranscriptForWhatToAnswer(transcriptTurns, 12);
+            if (options?.conversationContext && options.conversationContext.trim().length > 0) {
+                preparedTranscript = preparedTranscript && preparedTranscript.trim().length > 0
+                    ? `${options.conversationContext.trim()}\n\n${preparedTranscript}`
+                    : options.conversationContext.trim();
+            }
 
             const temporalContext = buildTemporalContext(
                 contextItems,

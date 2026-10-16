@@ -39,11 +39,76 @@ export type CaptureRequest =
   // `fullPage` (experimental) attaches the full readable text of any non-sensitive
   // page in auto mode — sensitive pages are still hard-blocked downstream.
   // `classifyOnly`/`extraCategories`/`aiApproved` drive the AI-classifier round-trip.
-  | ({ type: 'natively:smart-extract' } & SmartExtractOpts);
+  | ({ type: 'natively:smart-extract' } & SmartExtractOpts)
+  | { type: 'natively:auto-type'; text: string; options?: { speed?: 'natural' | 'fast' | 'instant' } }
+  | { type: 'natively:stop-auto-type' };
 export type CaptureResponse =
   | { ok: true; result: ExtractResult }
   | { ok: true; smart: SmartCaptureResult }
+  | { ok: true; autoType?: { charactersTyped: number; stoppedEarly?: boolean } }
   | { ok: false; error: string };
+
+let activeAutoTypeCancel: (() => void) | null = null;
+
+async function typeSnippet(
+  code: string,
+  options?: { speed?: 'natural' | 'fast' | 'instant' }
+): Promise<{ charactersTyped: number; stoppedEarly?: boolean }> {
+  if (activeAutoTypeCancel) {
+    activeAutoTypeCancel();
+    activeAutoTypeCancel = null;
+  }
+
+  let isCancelled = false;
+  activeAutoTypeCancel = () => { isCancelled = true; };
+
+  const handleKeydown = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      isCancelled = true;
+    }
+  };
+  window.addEventListener('keydown', handleKeydown, { capture: true, once: true });
+
+  const speed = options?.speed || 'natural';
+  let charCount = 0;
+
+  try {
+    for (let i = 0; i < code.length; i++) {
+      if (isCancelled) {
+        return { charactersTyped: charCount, stoppedEarly: true };
+      }
+
+      const char = code[i];
+      // Use execCommand insertText which Monaco, CodeMirror, and textareas natively support
+      document.execCommand('insertText', false, char);
+      charCount++;
+
+      if (speed === 'instant') {
+        continue;
+      }
+
+      // Calculate realistic delay (natural typing cadence)
+      let delay = 20;
+      if (speed === 'fast') {
+        delay = Math.floor(Math.random() * 12 + 6); // 6-18ms
+      } else {
+        // Natural speed: 15-38ms with slight pauses on punctuation & newlines
+        delay = Math.floor(Math.random() * 23 + 15);
+        if (char === '\n') {
+          delay += Math.floor(Math.random() * 80 + 80); // 80-160ms pause on newline
+        } else if (char === ';' || char === '}' || char === '{') {
+          delay += Math.floor(Math.random() * 40 + 30); // 30-70ms pause
+        }
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    return { charactersTyped: charCount, stoppedEarly: false };
+  } finally {
+    window.removeEventListener('keydown', handleKeydown, { capture: true });
+    activeAutoTypeCancel = null;
+  }
+}
 
 const GUARD = '__natively_capture_listener__';
 
@@ -106,6 +171,20 @@ if (!w[GUARD]) {
         if (message.type === 'natively:smart-extract') {
           const smart = runSmartCapture(message);
           sendResponse({ ok: true, smart });
+          return undefined;
+        }
+        if (message.type === 'natively:auto-type') {
+          typeSnippet(message.text, message.options)
+            .then((res) => sendResponse({ ok: true, autoType: res }))
+            .catch((err) => sendResponse({ ok: false, error: String(err) }));
+          return true; // async sendResponse
+        }
+        if (message.type === 'natively:stop-auto-type') {
+          if (activeAutoTypeCancel) {
+            activeAutoTypeCancel();
+            activeAutoTypeCancel = null;
+          }
+          sendResponse({ ok: true });
           return undefined;
         }
       } catch (err) {

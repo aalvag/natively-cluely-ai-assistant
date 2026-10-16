@@ -171,7 +171,55 @@ async function updatePromptCache(promptText: string): Promise<void> {
   }
 }
 
+import * as fs from 'fs';
+import * as path from 'path';
+
+let workerLogPath: string | null = null;
+function initWorkerLogger(cacheDir?: string): void {
+  try {
+    const baseDir = cacheDir || path.join(process.env.HOME || '', 'Library/Application Support/Natively/whisper-models');
+    const logsDir = path.resolve(baseDir, '..', 'logs');
+    if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+    workerLogPath = path.join(logsDir, 'whisper-worker.log');
+  } catch {}
+}
+
+function logWorker(msg: string): void {
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  console.log(msg);
+  if (!workerLogPath) initWorkerLogger();
+  if (workerLogPath) {
+    try {
+      fs.appendFileSync(workerLogPath, line, 'utf8');
+    } catch {}
+  }
+}
+
+let pipelineChain: Promise<void> = Promise.resolve();
+
 if (!parentPort) throw new Error('whisperWorker must be run as a Worker thread');
+
+process.on('uncaughtException', (err: any) => {
+  logWorker(`[WhisperWorker] Uncaught exception: ${err?.stack || err?.message || err}`);
+  console.error('[WhisperWorker] Uncaught exception:', err);
+  try {
+    parentPort?.postMessage({
+      type: 'error',
+      message: err?.message || String(err),
+    });
+  } catch {}
+});
+
+process.on('unhandledRejection', (reason: any) => {
+  logWorker(`[WhisperWorker] Unhandled rejection: ${reason?.stack || reason?.message || reason}`);
+  console.error('[WhisperWorker] Unhandled rejection:', reason);
+  try {
+    parentPort?.postMessage({
+      type: 'error',
+      message: reason?.message || String(reason),
+    });
+  } catch {}
+});
 
 // Loads @huggingface/transformers via a real dynamic import() at runtime.
 // Using new Function prevents TypeScript from rewriting import() → require()
@@ -222,6 +270,8 @@ async function initNemotronChannel(msg: any, channelId: string): Promise<void> {
 
 parentPort.on('message', async (msg: any) => {
   if (msg.type === 'init') {
+    initWorkerLogger(msg.cacheDir);
+    logWorker(`[WhisperWorker] init received for model: ${msg.modelId} (sessionLayout: ${msg.sessionLayout || 'pipeline'})`);
     if (msg.sessionLayout === 'nemotron-rnnt') {
       const channelId: string | undefined = msg.channelId;
       if (!channelId) {
@@ -269,8 +319,9 @@ parentPort.on('message', async (msg: any) => {
     }
     try {
       const { pipeline, env } = await loadTransformers();
-
-      env.cacheDir = msg.cacheDir;
+      if (msg.cacheDir) {
+        env.cacheDir = msg.cacheDir;
+      }
       env.allowRemoteModels = true;
 
       // Apply hardware-specific execution providers (CoreML, DirectML, CUDA, CPU)
@@ -484,97 +535,74 @@ parentPort.on('message', async (msg: any) => {
       return;
     }
     if (!pipe) {
-      parentPort!.postMessage({ type: 'error', message: 'Model not loaded' });
+      logWorker(`[WhisperWorker] Error: Model not loaded for transcribe taskId=${msg.taskId}`);
+      parentPort!.postMessage({ type: 'error', taskId: msg.taskId, message: 'Model not loaded' });
       return;
     }
-    try {
-      let language: string | null = resolveWhisperLanguage(msg.language);
-      const streaming: boolean = !!msg.streaming;
+    pipelineChain = pipelineChain.then(async () => {
+      try {
+        let language: string | null = resolveWhisperLanguage(msg.language);
+        const streaming: boolean = !!msg.streaming;
 
-      // English-only checkpoints (Distil-Whisper + .en variants) have no
-      // multilingual decoder — and transformers.js REJECTS the decoder-prompt
-      // options for them outright. From the installed library source:
-      //
-      //   if (e.is_multilingual) { …lang_to_id / task_to_id… }
-      //   else if (s || r) throw new Error(
-      //     "Cannot specify `task` or `language` for an English-only model…")
-      //
-      // where s = generationConfig.language and r = generationConfig.task. So
-      // BOTH must be omitted, not just one, and this block previously did the
-      // exact opposite: it FORCED language='english' on precisely the models
-      // that forbid it. Every transcription then threw, and because the
-      // streaming loop re-dispatches per audio window the failure repeated
-      // once per chunk — 15,733 identical errors across three days in the
-      // 2026-08-12 production log (10,183 of them in a single day), with the
-      // user's local STT silently producing nothing the whole time.
-      //
-      // Omitting them is not a downgrade: an English-only checkpoint can only
-      // transcribe, and only in English, so there is nothing left to express.
-      //
-      // Derived from MODEL_CATALOG's `multilingual` flag (modelLanguageSupport)
-      // rather than the previous hand-typed id set, which omitted Parakeet CTC
-      // — English-only per NVIDIA's model card, and a CTC pipeline with no
-      // decoder prompt to condition anyway.
-      const isEnglishOnly = isEnglishOnlyLocalModel(loadedModelId);
-      if (isEnglishOnly) {
-        language = null;
+        const isEnglishOnly = isEnglishOnlyLocalModel(loadedModelId);
+        if (isEnglishOnly) {
+          language = null;
+        }
+
+        const opts: any = streaming
+          ? {
+              sampling_rate: 16000,
+              task: 'transcribe',
+              temperature: 0,
+              no_speech_threshold: 0.6,
+              compression_ratio_threshold: 2.4,
+              condition_on_previous_text: false,
+              return_timestamps: false,
+            }
+          : {
+              sampling_rate: 16000,
+              task: 'transcribe',
+              condition_on_previous_text: false,
+              compression_ratio_threshold: 2.4,
+              logprob_threshold: -1.0,
+              no_speech_threshold: 0.6,
+            };
+        if (isEnglishOnly) {
+          delete opts.task;
+        } else if (language) {
+          opts.language = language;
+        }
+
+        if (cachedPromptIds && cachedPromptIds.length > 0 && !isMoonshineModel(loadedModelId)) {
+          opts.prompt_ids = cachedPromptIds;
+        }
+
+        const rawAudio = msg.audio instanceof Float32Array ? msg.audio : new Float32Array(Object.values(msg.audio));
+        const audioInput = new Float32Array(rawAudio.length);
+        audioInput.set(rawAudio);
+
+        const startTime = Date.now();
+        const result = await pipe(audioInput, opts);
+        const elapsed = Date.now() - startTime;
+        const text = result?.text ?? '';
+        logWorker(`[WhisperWorker] transcribed taskId=${msg.taskId} stream=${streaming} lang=${opts.language || 'auto'} len=${audioInput.length} (${elapsed}ms) → "${text}"`);
+
+        parentPort!.postMessage({
+          type: streaming ? 'partial' : 'result',
+          taskId: msg.taskId,
+          text,
+        });
+      } catch (e: any) {
+        logWorker(`[WhisperWorker] transcribe error taskId=${msg.taskId}: ${e?.stack || e?.message || e}`);
+        parentPort!.postMessage({
+          type: 'error',
+          taskId: msg.taskId,
+          message: `Transcription failed: ${e.message}`,
+        });
       }
-
-      // Streaming partial passes use deterministic settings so consecutive
-      // overlapping windows are stable enough for LocalAgreement-2 to
-      // converge on a committed prefix. Final passes also disable
-      // condition_on_previous_text + add Whisper's standard fallback
-      // thresholds to suppress repetition loops on long segments.
-      const opts: any = streaming
-        ? {
-            sampling_rate: 16000,
-            task: 'transcribe',
-            temperature: 0,
-            no_speech_threshold: 0.6,
-            // Whisper's anti-loop check — drops outputs whose token gzip
-            // ratio exceeds 2.4 (typical of "thank you. thank you. thank
-            // you..." hallucinations on near-silent windows). Final pass
-            // uses the same threshold; streaming should match for
-            // consistency in what reaches the user.
-            compression_ratio_threshold: 2.4,
-            condition_on_previous_text: false,
-            return_timestamps: false,
-          }
-        : {
-            sampling_rate: 16000,
-            task: 'transcribe',
-            condition_on_previous_text: false,
-            compression_ratio_threshold: 2.4,
-            logprob_threshold: -1.0,
-            no_speech_threshold: 0.6,
-          };
-      // `task` is set unconditionally in BOTH opts branches above, so an
-      // English-only model must have it stripped here — fixing only the
-      // `language` line would still throw on `task`.
-      if (isEnglishOnly) {
-        delete opts.task;
-      } else if (language) {
-        opts.language = language;
-      }
-
-      // Use the pre-tokenized prompt cache populated by setPrompt messages.
-      // Skip for Moonshine (cached IDs are null in that case anyway).
-      if (cachedPromptIds && cachedPromptIds.length > 0 && !isMoonshineModel(loadedModelId)) {
-        opts.prompt_ids = cachedPromptIds;
-      }
-
-      const result = await pipe(msg.audio, opts);
-      parentPort!.postMessage({
-        type: streaming ? 'partial' : 'result',
-        taskId: msg.taskId,
-        text: result.text ?? '',
-      });
-    } catch (e: any) {
-      parentPort!.postMessage({
-        type: 'error',
-        taskId: msg.taskId,
-        message: `Transcription failed: ${e.message}`,
-      });
-    }
+    }).catch((chainErr) => {
+      logWorker(`[WhisperWorker] pipelineChain error: ${chainErr?.stack || chainErr}`);
+      console.error('[WhisperWorker] pipelineChain error:', chainErr);
+    });
   }
 });

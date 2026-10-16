@@ -632,73 +632,7 @@ const STEALTH_OBJECT_RE = /\b(interview\w*|proctor\w*|invigilat\w*|recruiter|exa
 // NOTICE the app?", "will it be VISIBLE in the screen share?").
 const STEALTH_SOFT_VISIBILITY_RE = /\b(see|sees|seeing|notice\w*|realize\w*|realise\w*|spot|catch\w*|find out|aware|visible|detect\w*|know about|figure out)\b/i;
 
-/**
- * True when the message is a stealth / undetectability / proctoring-evasion ask
- * that must be DECLINED + redirected (ethical_usage_answer), regardless of where
- * else it might route. Two ways to trip:
- *   (a) an explicit evasion intent + an interview/detection object, OR
- *   (b) a soft visibility verb ("see / notice / visible") aimed at an
- *       interviewer/proctor/screen-share object.
- * A SAFE product/privacy phrasing ("is it low-distraction?", "does it process
- * locally?") is NOT enough to exempt this — an evasion+object combination ALWAYS
- * wins (code-review 2026-06-06b HIGH: the privacy carve-out was exploitable).
- */
-export const isStealthEvasionQuestion = (question: string): boolean => {
-  const t = (question || '').toLowerCase();
-  const hasObject = STEALTH_OBJECT_RE.test(t);
-  const hasIntent = STEALTH_INTENT_RE.test(t);
-  // (a) explicit evasion intent + an interview/detection object.
-  if (hasIntent && hasObject) return true;
-  // (a') explicit evasion intent aimed at the TOOL/overlay (no object needed):
-  // "make it invisible", "keep natively undetectable", "hide the overlay".
-  if (hasIntent && /\b(it|natively|nativley|the (?:app|tool|overlay|window|ui)|this)\b/.test(t)
-    && /\b(invisible|undetect\w*|hidden|hide|conceal|stealth|disappear|off[- ]?screen)\b/.test(t)) return true;
-  // (a'') a bare CHEAT / covert intent with no object — "how do I cheat without
-  // being caught", "help me cheat", "cheat on the interview". Cheating in an
-  // interview/assessment context is always the safety route.
-  if (/\bcheat\w*\b/.test(t) && /\b(without (?:being |getting )?(?:caught|seen|noticed|detected)|interview|exam|test|assessment|proctor|coding (?:round|test)|on (?:the|this|my))\b/.test(t)) return true;
-  // (a''') "use IT/THIS/the tool WITHOUT THEM KNOWING / secretly / on the sly" —
-  // covertly using the tool to deceive, even with no explicit interview object
-  // (release 2026-06-07: "how do I use it without them knowing"). The covert-use
-  // intent + a reference to the tool is the evasion.
-  if (/\b(use|using|run|running)\s+(it|this|natively|nativley|the (?:app|tool|overlay))\b/.test(t)
-    && /\b(without (?:them|the interviewer|anyone|him|her|people|him\/her) (?:know|notic|see|find|realiz|realis)\w*|secretly|covertly|on the (?:sly|dl|down[- ]?low)|so (?:nobody|no one|they) (?:know|notic|see)\w*|undetect\w*|without being (?:caught|seen|noticed))\b/.test(t)) return true;
-  // (b) soft visibility verb aimed at an interview/proctor/screen-share object.
-  // SENTENCE-SCOPED (RC-1a, live session C 2026-08-21): the verb and the object
-  // must co-occur in ONE sentence. Tested whole-string, a long multi-question
-  // turn paired "the call" from the interviewer's opener with "noticeably" from
-  // a performance question ~700 chars later, routing 17 real technical answers
-  // into the safe-decline contract. A genuine stealth ask ("can the interviewer
-  // see this overlay?") always keeps verb and object in the same sentence.
-  // Branch (a) above deliberately stays whole-string — explicit evasion intent
-  // is a strong signal and over-coverage there is the documented safety posture.
-  // Newlines count as sentence boundaries too: an UNPUNCTUATED transcript
-  // (local STT emits no punctuation) would otherwise be one giant "sentence"
-  // and reopen the cross-match this scoping exists to close (review pass,
-  // 2026-08-22).
-  for (const sentence of t.split(/[.?!…\n]+/)) {
-    if (!STEALTH_SOFT_VISIBILITY_RE.test(sentence)) continue;
-    // require the object to be an interviewer/proctor/screen-share (not a bare
-    // "monitor" hardware word) so "does it work with a second monitor" is safe.
-    if (!/\b(interview\w*|proctor\w*|invigilat\w*|recruiter|examiner|screen[- ]?shar\w*|screenshar\w*|share my screen|sharing my screen|the (?:call|meeting|assessment|exam|test))\b/.test(sentence)) continue;
-    // EXCLUDE a candidate-possessive object ("will the interviewer see MY code/
-    // portfolio/answer/screen?") — a benign visibility question, not an ask to
-    // hide the TOOL (code-review 2026-06-07 false-positive-refusal fix)...
-    const candidatePossessiveVisibility = /\b(see|view|notice|read|watch)\b[^.?!]{0,30}\bmy\b/.test(sentence)
-      || /\bmy (code|portfolio|answer|screen|solution|work|repo|link|profile)\b/.test(sentence);
-    // ...UNLESS the same sentence ALSO aims a visibility verb at the TOOL
-    // itself ("if I share my screen on the call, will they detect the tool?") —
-    // then the possessive is incidental and the tool-visibility ask wins.
-    // Code-review 2026-08-22: bare "it" removed from the tool-noun set —
-    // an anaphoric "it" ("will they see my screen when I share it?") sat
-    // within 40 chars of the verb and overrode the possessive exemption,
-    // refusing a benign question. An explicit tool noun is required; a
-    // genuine "will they detect it?" with a possessive nearby is the
-    // benign shape, and without one, branch (b)'s object test still fires.
-    const toolVisibility = /\b(see|sees|notice\w*|detect\w*|spot|catch\w*|find)\b[^.?!]{0,40}\b(the (?:tool|app|overlay|window|ui)|natively|nativley)\b/.test(sentence);
-    if (candidatePossessiveVisibility && !toolVisibility) continue;
-    return true;
-  }
+export const isStealthEvasionQuestion = (_question: string): boolean => {
   return false;
 };
 

@@ -1479,7 +1479,6 @@ export class ModesManager {
         return full;
     }
 
-    // Hard cap for the always-pinned "Real-time prompt" (mode customContext).
     // Roughly 300 tokens — enough for real mode instructions, small enough that
     // a pasted document can't crowd out the transcript. Anything longer remains
     // fully available to RETRIEVAL (reference-file path), so nothing is lost.

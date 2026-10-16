@@ -261,6 +261,7 @@ export function loadNativeModule(): NativeModule | null {
         : null;
     const devPath = path.join(appPath, 'native-module', binary);
     const devFallbackPath = path.join(appPath, '..', 'native-module', binary);
+    const cwdPath = path.join(process.cwd(), 'native-module', binary);
 
     // In dev, the packaged path never exists; trying it first produces a
     // scary-looking "Cannot find module" + Require stack on every boot.
@@ -268,8 +269,8 @@ export function loadNativeModule(): NativeModule | null {
     // logs nothing alarming. In packaged builds the asar.unpacked path
     // MUST be tried first — see the comment block above on why.
     const candidates: string[] = isDev
-        ? [devPath, devFallbackPath, ...(packagedPath ? [packagedPath] : [])]
-        : [...(packagedPath ? [packagedPath] : []), devPath, devFallbackPath];
+        ? [devPath, devFallbackPath, cwdPath, ...(packagedPath ? [packagedPath] : [])]
+        : [...(packagedPath ? [packagedPath] : []), devPath, devFallbackPath, cwdPath];
 
     for (const filePath of candidates) {
         try {

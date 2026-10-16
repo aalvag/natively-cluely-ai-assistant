@@ -12,7 +12,7 @@ export interface SpeechSegment {
 }
 
 const WINDOW_SIZE = 480;       // 30ms at 16kHz
-const RMS_THRESHOLD = 0.008;
+const RMS_THRESHOLD = 0.0015;  // ~50 in Int16 scale — captures normal/moderate system audio without dropping
 const HANGOVER_FRAMES = 10;    // ~300ms — must be shorter than Rust SilenceSuppressor hangover (500ms)
 const MIN_SPEECH_FRAMES = 4;   // ~120ms minimum to avoid transcribing tiny noise bursts
 const MAX_SPEECH_MS = 15000;

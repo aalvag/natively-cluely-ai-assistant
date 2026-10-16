@@ -97,3 +97,130 @@ export const ingestModeReferenceFile = async (
     contentSha256,
   };
 };
+
+const IGNORED_DIRECTORY_NAMES = new Set([
+  '.git', '.svn', '.hg', 'node_modules', 'dist', 'build', 'target',
+  '.next', '.nuxt', '.output', '.venv', 'venv', 'env', 'vendor',
+  'coverage', '.turbo', '.cache', '.idea', '.vscode', '__pycache__',
+  '.pytest_cache', '.mypy_cache', 'bin', 'obj',
+]);
+
+const IGNORED_FILE_NAMES = new Set([
+  'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'cargo.lock',
+  'poetry.lock', 'composer.lock', 'gemfile.lock', '.ds_store', 'thumbs.db',
+]);
+
+const MAX_FOLDER_FILES = 200;
+const MAX_FOLDER_TOTAL_BYTES = 50 * 1024 * 1024;
+
+export interface ModeReferenceFolderIngestResult {
+  totalFiles: number;
+  ingestedFiles: ModeReferenceFileIngestResult[];
+  skippedCount: number;
+}
+
+/**
+ * Recursively scans a selected repository or project folder, filtering out build
+ * artifacts and dependencies, and ingests all source code/document files into the mode.
+ */
+export const ingestModeReferenceFolder = async (
+  options: {
+    modeId: string;
+    folderPath: string;
+    onIndexStatus?: (status: 'indexing' | 'done', fileId: string) => void;
+  },
+): Promise<ModeReferenceFolderIngestResult> => {
+  const fs = require('fs') as typeof import('fs');
+  const path = require('path') as typeof import('path');
+  const rootDir = path.resolve(options.folderPath);
+
+  const discoveredPaths: string[] = [];
+  let totalBytes = 0;
+
+  const scanDir = async (currentDir: string): Promise<void> => {
+    if (discoveredPaths.length >= MAX_FOLDER_FILES) return;
+    let entries: import('fs').Dirent[];
+    try {
+      entries = await fs.promises.readdir(currentDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (discoveredPaths.length >= MAX_FOLDER_FILES) break;
+      const fullPath = path.join(currentDir, entry.name);
+      const lowerName = entry.name.toLowerCase();
+
+      if (entry.isDirectory()) {
+        if (!IGNORED_DIRECTORY_NAMES.has(lowerName) && !lowerName.startsWith('.')) {
+          await scanDir(fullPath);
+        }
+      } else if (entry.isFile()) {
+        if (IGNORED_FILE_NAMES.has(lowerName) || lowerName.endsWith('.min.js') || lowerName.endsWith('.map')) {
+          continue;
+        }
+        const ext = path.extname(lowerName);
+        if (SAFE_DOCUMENT_EXTENSIONS.has(ext)) {
+          try {
+            const stat = await fs.promises.stat(fullPath);
+            if (stat.size <= SAFE_DOCUMENT_MAX_BYTES && totalBytes + stat.size <= MAX_FOLDER_TOTAL_BYTES) {
+              totalBytes += stat.size;
+              discoveredPaths.push(fullPath);
+            }
+          } catch {}
+        }
+      }
+    }
+  };
+
+  await scanDir(rootDir);
+
+  const manager = ModesManager.getInstance();
+  const ingestedFiles: ModeReferenceFileIngestResult[] = [];
+  let skippedCount = 0;
+
+  for (const filePath of discoveredPaths) {
+    try {
+      const extracted = await extractSafeDocumentText(filePath);
+      const relPath = path.relative(rootDir, filePath).replace(/\\/g, '/');
+      const contentSha256 = crypto.createHash('sha256').update(extracted.content).digest('hex');
+
+      const file = manager.addReferenceFile({
+        modeId: options.modeId,
+        fileName: relPath, // Store relative path for rich contextual matching
+        content: extracted.content,
+        pageCount: extracted.pageCount,
+        extractedPageCount: extracted.extractedPageCount,
+      });
+
+      options.onIndexStatus?.('indexing', file.id);
+      void (async () => {
+        try {
+          await manager.indexReferenceFile(file);
+        } catch (error: any) {
+          console.warn('[ModeReferenceFileIngestion] folder file index failed:', error?.message);
+        } finally {
+          options.onIndexStatus?.('done', file.id);
+        }
+      })();
+
+      ingestedFiles.push({
+        id: file.id,
+        fileName: relPath,
+        content: extracted.content,
+        pageCount: extracted.pageCount,
+        extractedPageCount: extracted.extractedPageCount,
+        binarySha256: extracted.binarySha256,
+        contentSha256,
+      });
+    } catch {
+      skippedCount++;
+    }
+  }
+
+  return {
+    totalFiles: ingestedFiles.length,
+    ingestedFiles,
+    skippedCount,
+  };
+};

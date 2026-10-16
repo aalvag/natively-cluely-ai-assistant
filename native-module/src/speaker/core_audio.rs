@@ -47,20 +47,27 @@ impl SpeakerInput {
             ));
         }
 
-        // 1. Find the target output device
+        // 1. Find the target output device (must have output streams)
         let output_device = match device_id {
             Some(ref uid) if !uid.is_empty() && uid != "default" => {
                 let requested_uid = strip_audio_suffix(uid);
                 let devices = ca::System::devices()?;
-                match devices.into_iter().find(|d| {
-                    d.uid()
-                        .map(|u| strip_audio_suffix(&u.to_string()).eq_ignore_ascii_case(requested_uid))
-                        .unwrap_or(false)
-                }) {
-                    Some(device) => device,
+                // First try exact UID match with output buffers, then stripped UID with output buffers
+                let found = devices.iter().find(|d| {
+                    let has_output = d.output_stream_cfg().map(|c| c.number_buffers() > 0).unwrap_or(false);
+                    has_output && d.uid().map(|u| u.to_string().eq_ignore_ascii_case(uid)).unwrap_or(false)
+                }).or_else(|| {
+                    devices.iter().find(|d| {
+                        let has_output = d.output_stream_cfg().map(|c| c.number_buffers() > 0).unwrap_or(false);
+                        has_output && d.uid().map(|u| strip_audio_suffix(&u.to_string()).eq_ignore_ascii_case(requested_uid)).unwrap_or(false)
+                    })
+                });
+
+                match found {
+                    Some(device) => *device,
                     None => {
                         println!(
-                            "[CoreAudioTap] Requested output UID '{}' not found; falling back to default output device",
+                            "[CoreAudioTap] Requested output UID '{}' not found or has no output streams; falling back to default output device",
                             uid
                         );
                         ca::System::default_output_device()?

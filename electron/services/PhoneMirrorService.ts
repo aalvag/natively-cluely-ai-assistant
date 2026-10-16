@@ -549,6 +549,34 @@ export class PhoneMirrorService {
   }
 
   /**
+   * Auto-Type code into the active browser tab (simulated human typing).
+   */
+  autoTypeCode(text: string, options?: { speed?: 'natural' | 'fast' | 'instant'; tabId?: number }): Promise<{ ok: boolean; reason?: string }> {
+    const target = this.pickExtensionClient();
+    if (!target) return Promise.resolve({ ok: false, reason: 'no-extension' });
+    try {
+      target.send(JSON.stringify({ type: 'auto-type', text, options }));
+      return Promise.resolve({ ok: true });
+    } catch (_) {
+      return Promise.resolve({ ok: false, reason: 'send-failed' });
+    }
+  }
+
+  /**
+   * Stop any in-progress auto-typing.
+   */
+  stopAutoType(): Promise<{ ok: boolean }> {
+    const target = this.pickExtensionClient();
+    if (!target) return Promise.resolve({ ok: false });
+    try {
+      target.send(JSON.stringify({ type: 'stop-auto-type' }));
+      return Promise.resolve({ ok: true });
+    } catch (_) {
+      return Promise.resolve({ ok: false });
+    }
+  }
+
+  /**
    * Smart Browser Context v2 — ask the active extension to AUTO-attach context
    * just before an answer. The extension classifies the active tab IN the page
    * and only posts a structured envelope to /dom when its local policy permits

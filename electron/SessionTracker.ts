@@ -4,6 +4,7 @@
 
 import { RecapLLM } from './llm';
 import { isVerboseLogging } from './verboseLog';
+import { stripOverlappingPrefix } from './utils/rollingTranscriptState';
 import type { AttemptId, TurnIdentity } from './llm/turnIdentity';
 
 // Canned-fallback phrases that mean the model gave up entirely, not phrases
@@ -332,18 +333,21 @@ export class SessionTracker {
         if (!segment.final) return null;
 
         const role = this.mapSpeakerToRole(segment.speaker);
-        const text = segment.text.trim();
+        const rawText = segment.text.trim();
+
+        if (!rawText) return null;
+
+        // Deduplicate: strip boundary overlap from prior turn of same role
+        const lastItem = this.contextItems[this.contextItems.length - 1];
+        let text = rawText;
+        if (lastItem && lastItem.role === role) {
+            if (lastItem.text === rawText) {
+                return null; // Exact duplicate
+            }
+            text = stripOverlappingPrefix(lastItem.text, rawText);
+        }
 
         if (!text) return null;
-
-        // Deduplicate: check if this exact item already exists
-        const lastItem = this.contextItems[this.contextItems.length - 1];
-        if (lastItem &&
-            lastItem.role === role &&
-            Math.abs(lastItem.timestamp - segment.timestamp) < 500 &&
-            lastItem.text === text) {
-            return null;
-        }
 
         this.contextItems.push({
             role,

@@ -1062,7 +1062,7 @@ export class CredentialsManager {
     }
 
     public getGroqSttApiKey(): string | undefined {
-        return this.credentials.groqSttApiKey;
+        return this.credentials.groqSttApiKey || this.credentials.groqApiKey;
     }
 
     public getGroqSttModel(): string {
@@ -1070,7 +1070,7 @@ export class CredentialsManager {
     }
 
     public getOpenAiSttApiKey(): string | undefined {
-        return this.credentials.openAiSttApiKey;
+        return this.credentials.openAiSttApiKey || this.credentials.openaiApiKey;
     }
 
     public getOpenAiSttBaseUrl(): string | undefined {
@@ -1795,9 +1795,13 @@ export class CredentialsManager {
             console.log(`[CredentialsManager] ${reason} — reset default model to Gemini Flash-Lite`);
         }
         if (this.credentials.sttProvider === 'natively') {
-            this.credentials.sttProvider = 'none';
-            changed.sttProvider = 'none';
-            console.log(`[CredentialsManager] ${reason} — reset STT provider to none`);
+            const fallback = (this.credentials.groqSttApiKey || this.credentials.groqApiKey) ? 'groq'
+                : (this.credentials.openAiSttApiKey || this.credentials.openaiApiKey) ? 'openai'
+                : this.credentials.deepgramApiKey ? 'deepgram'
+                : 'local-whisper';
+            this.credentials.sttProvider = fallback;
+            changed.sttProvider = fallback;
+            console.log(`[CredentialsManager] ${reason} — reset STT provider to ${fallback}`);
         }
         // The reranker lives in SettingsManager, not in credentials, so this
         // reaches across. It has to: this same function is what runs when a key

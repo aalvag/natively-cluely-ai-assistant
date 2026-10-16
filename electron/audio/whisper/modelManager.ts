@@ -115,9 +115,14 @@ export const MODEL_CATALOG_IDS: Set<string> = new Set(MODEL_CATALOG.map(m => m.i
  * Uses electron app.getPath('userData') so models persist across updates.
  */
 export function getModelsDir(): string {
-  // Use require to avoid issues with circular imports / early init
-  const { app } = require('electron');
-  return path.join(app.getPath('userData'), 'whisper-models');
+  try {
+    const { app } = require('electron');
+    if (app?.getPath) {
+      return path.join(app.getPath('userData'), 'whisper-models');
+    }
+  } catch {}
+  const home = process.env.HOME || process.env.USERPROFILE || '/tmp';
+  return path.join(home, 'Library', 'Application Support', 'natively', 'whisper-models');
 }
 
 /**

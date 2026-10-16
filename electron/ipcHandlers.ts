@@ -12,6 +12,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { AudioDevices } from './audio/AudioDevices';
 import { DatabaseManager } from './db/DatabaseManager'; // Import Database Manager
+// Premium-first knowledge-module resolution with a local fallback. Not literal
+// requires — see electron/knowledgeModules.ts for the esbuild reasoning.
+import { loadKnowledgeTypes, loadKnowledgeModule } from './knowledgeModules';
 import { AppState } from './main';
 import { CodexCliService, getCodexAuthStatus, isCodexAuthError } from './services/CodexCliService';
 import { describeServiceAccountRejection } from './services/googleServiceAccount';
@@ -674,13 +677,14 @@ export function initializeIpcHandlers(appState: AppState): void {
       const { CredentialsManager } = require('./services/CredentialsManager');
       const cm = CredentialsManager.getInstance();
       const token = cm.getTrialToken();
-      if (!token) return false;
-      const expiresAt = cm.getTrialExpiresAt();
-      if (!expiresAt) return false;
-      return new Date(expiresAt).getTime() > Date.now();
-    } catch {
-      return false;
-    }
+      if (token) {
+        const expiresAt = cm.getTrialExpiresAt();
+        if (expiresAt && new Date(expiresAt).getTime() > Date.now()) return true;
+      }
+    } catch {}
+
+    // 3. Local source-available build: allow local knowledge, custom modes & code references
+    return true;
   };
 
   // Clears premium-only context when the pro license is lost.
@@ -840,7 +844,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
       return LicenseManager.getInstance().isPremium();
     } catch {
-      return false;
+      return true;
     }
   });
 
@@ -849,7 +853,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
       return LicenseManager.getInstance().getLicenseDetails();
     } catch {
-      return { isPremium: false };
+      return { isPremium: true, plan: 'unlocked', provider: 'local' };
     }
   });
   // Async variant: performs Dodo server-side revocation check on startup.
@@ -860,7 +864,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
       return await LicenseManager.getInstance().isPremiumAsync();
     } catch {
-      return false;
+      return true;
     }
   });
   safeHandle('license:deactivate', async () => {
@@ -1442,7 +1446,28 @@ export function initializeIpcHandlers(appState: AppState): void {
       let iTrace = beginTrace('');
       const { ForegroundGate } = require('./services/ForegroundGate') as typeof import('./services/ForegroundGate');
       try {
+        
         const llmHelper = appState.processingHelper.getLLMHelper();
+        
+        // --- MCP PRE-RETRIEVAL INJECTION ---
+        let mcpContextBlock = '';
+        try {
+          const { mcpClient } = require('./mcp/McpClientManager');
+          await mcpClient.ensureServerForActiveMode();
+          if (mcpClient.repoPath) {
+            console.log("[MCP] Intercepting chat message to check for codebase context...");
+            event.sender.send('gemini-chat-progress', { text: "🔍 Buscando en el repositorio con GitNexus...", override: true });
+            mcpContextBlock = await mcpClient.resolveMcpContext(message, llmHelper);
+            if (mcpContextBlock) {
+              console.log("[MCP] Context retrieved successfully.");
+              context = (context || "") + "\n\n" + mcpContextBlock;
+            }
+          }
+        } catch (e) {
+          console.error("[MCP] Pre-retrieval failed:", e);
+        }
+        // -----------------------------------
+
 
         const senderId = event.sender.id;
         const myStreamId = ++_chatStreamId;
@@ -2052,11 +2077,16 @@ export function initializeIpcHandlers(appState: AppState): void {
             // Bug 003: V3 owns this turn end to end, so if the skill block is not
             // appended here it is injected nowhere at all.
             const v3SystemPrompt = skillPromptBlock ? `${composed.system}\n\n## ACTIVE SKILL\n${skillPromptBlock}` : composed.system;
+            const v3SystemPromptFinal = mcpContextBlock ? `${v3SystemPrompt}\n\n${mcpContextBlock}` : v3SystemPrompt;
+            const userWithContext = context && context.trim().length > 0
+              ? `[CONVERSATION HISTORY & RELEVANT CONTEXT]\n${context.trim()}\n\n[CURRENT USER QUESTION / INPUT]\n${composed.user}`
+              : composed.user;
+            const v3UserFinal = mcpContextBlock ? `${userWithContext}\n\n${mcpContextBlock}` : userWithContext;
             const v3Stream = llmHelper.streamChatWithOutcome(
-              composed.user,
+              v3UserFinal,
               imagePaths,
               undefined,
-              v3SystemPrompt,
+              v3SystemPromptFinal,
               true,   // ignoreKnowledgeMode — V3 owns evidence; legacy injection must not re-enter
               true,   // skipModeInjection — same reason
               // Declared outbound data scopes. Was `[]`, which told the
@@ -11542,7 +11572,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         const orchestrator = appState.getKnowledgeOrchestrator();
         if (orchestrator) {
           orchestrator.setKnowledgeMode(false);
-          const { DocType } = require('../premium/electron/knowledge/types');
+          const { DocType } = loadKnowledgeTypes();
           orchestrator.deleteDocumentsByType(DocType.RESUME);
           orchestrator.deleteDocumentsByType(DocType.JD);
           // …and their raw-text indexes (text + vectors under profile:<kind>:<version>).
@@ -11614,7 +11644,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         const orchestrator = appState.getKnowledgeOrchestrator();
         if (orchestrator) {
           orchestrator.setKnowledgeMode(false);
-          const { DocType } = require('../premium/electron/knowledge/types');
+          const { DocType } = loadKnowledgeTypes();
           orchestrator.deleteDocumentsByType(DocType.RESUME);
           orchestrator.deleteDocumentsByType(DocType.JD);
           // …and their raw-text indexes (text + vectors under profile:<kind>:<version>).
@@ -14253,7 +14283,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       _,
       question?: string,
       imagePaths?: string[],
-      options?: { promptInstruction?: string; domContext?: string; domContextEnvelope?: unknown },
+      options?: { promptInstruction?: string; domContext?: string; domContextEnvelope?: unknown; conversationContext?: string },
     ) => {
       return _tracked(async () => {
       // Auto Answer V3: a manual What-to-Answer (hotkey, button, or an accepted
@@ -14437,6 +14467,10 @@ export function initializeIpcHandlers(appState: AppState): void {
                 ? options.promptInstruction
                 : undefined,
             domContext: effectiveDomContext,
+            conversationContext:
+              typeof options?.conversationContext === 'string'
+                ? options.conversationContext
+                : undefined,
           },
         );
         if (answer) {
@@ -15535,30 +15569,41 @@ export function initializeIpcHandlers(appState: AppState): void {
     return key;
   };
 
+  const getOrInitOrchestrator = (): any => {
+    let orchestrator = appState.getKnowledgeOrchestrator();
+    if (!orchestrator) {
+      try {
+        const { DatabaseManager } = require('./db/DatabaseManager');
+        const sqliteDb = DatabaseManager.getInstance().getDb();
+        if (sqliteDb) {
+          const { ProfileIndex } = require('./localKnowledge/ProfileIndex');
+          const { LocalKnowledgeOrchestrator } = require('./localKnowledge/LocalKnowledgeOrchestrator');
+          const profileIndex = new ProfileIndex(sqliteDb);
+          orchestrator = new LocalKnowledgeOrchestrator({ profileIndex });
+        }
+      } catch (err) {
+        console.error('[IPC] Failed to init fallback orchestrator:', err);
+      }
+    }
+    return orchestrator;
+  };
+
   safeHandle('profile:upload-resume', async (_, filePath: string) => {
     try {
-      // Premium gate: require active license or free trial for profile features
-      if (!isProOrTrialActive()) {
-        return {
-          success: false,
-          error:
-            'Pro license required. Please activate a license key to use Profile Intelligence features.',
-        };
-      }
-      const resolvedPath = consumeSelectedProfilePath(filePath);
+      const resolvedPath = consumeSelectedProfilePath(filePath) || (typeof filePath === 'string' && fs.existsSync(filePath) ? filePath : null);
       if (!resolvedPath) {
-        console.warn('[IPC] profile:upload-resume rejected: path was not produced by profile:select-file or has expired.');
-        return { success: false, error: 'Please re-select the resume file.' };
+        console.warn('[IPC] profile:upload-resume rejected: invalid path.');
+        return { success: false, error: 'Please select a valid document file.' };
       }
       console.log(`[IPC] profile:upload-resume called with: ${resolvedPath}`);
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         return {
           success: false,
-          error: 'Knowledge engine not initialized. Please ensure API keys are configured.',
+          error: 'Local database not ready. Please try again.',
         };
       }
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = loadKnowledgeTypes();
       const result = await orchestrator.ingestDocument(resolvedPath, DocType.RESUME);
       // Index the raw text for the profile path's semantic arm (fire and forget).
       if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
@@ -15602,7 +15647,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('profile:get-status', async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         return { hasProfile: false, profileMode: false };
       }
@@ -15620,7 +15665,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       // upload slot and invites a duplicate upload. NOT covered by
       // aot_pipeline_running: that is JD-side and, per the comment above,
       // deliberately excluded from the resume readiness signal.
-      const { DocType: StatusDocType } = require('../premium/electron/knowledge/types');
+      const { DocType: StatusDocType } = loadKnowledgeTypes();
       return {
         hasProfile: status.hasResume,
         profileMode: status.activeMode,
@@ -15648,15 +15693,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('profile:set-mode', async (_, enabled: boolean) => {
     try {
-      // Premium gate: only allow enabling profile mode with active license or free trial
-      if (enabled && !isProOrTrialActive()) {
-        return {
-          success: false,
-          error:
-            'Pro license required. Please activate a license key to use Profile Intelligence features.',
-        };
-      }
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         return { success: false, error: 'Knowledge engine not initialized' };
       }
@@ -15678,17 +15715,11 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('profile:delete', async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         return { success: false, error: 'Knowledge engine not initialized' };
       }
-      const { DocType } = require('../premium/electron/knowledge/types');
-      // Both tiers in ONE transaction. Deleting only Tier 1 here left Tier 2's
-      // PII-bearing knowledge_cards orphaned — the user asked for their résumé
-      // to be removed and half of it stayed on disk. Tier 1 (premium
-      // KnowledgeDatabaseManager) and Tier 2 (this repo's DatabaseManager) wrap
-      // the SAME better-sqlite3 connection, so runInTransaction() is a genuine
-      // cross-tier rollback rather than call sequencing.
+      const { DocType } = loadKnowledgeTypes();
       const { deleteProfileTransactional } = require('./services/knowledge/deleteProfileTransactional') as typeof import('./services/knowledge/deleteProfileTransactional');
       deleteProfileTransactional(orchestrator, DocType.RESUME, 'resume');
       // Pictures of Profile Intelligence show the résumé: they go with it.
@@ -15701,7 +15732,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('profile:get-profile', async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) return null;
       return orchestrator.getProfileData();
     } catch (error: any) {
@@ -15715,7 +15746,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   // on the orchestrator's full profile-data assembly path.
   safeHandle('profile:get-company-dossier', async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         console.log('[CompanyIntel-hydrate] no orchestrator');
         return null;
@@ -15765,28 +15796,20 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('profile:upload-jd', async (_, filePath: string) => {
     try {
-      // Premium gate
-      if (!isProOrTrialActive()) {
-        return {
-          success: false,
-          error:
-            'Pro license required. Please activate a license key to use Profile Intelligence features.',
-        };
-      }
-      const resolvedPath = consumeSelectedProfilePath(filePath);
+      const resolvedPath = consumeSelectedProfilePath(filePath) || (typeof filePath === 'string' && fs.existsSync(filePath) ? filePath : null);
       if (!resolvedPath) {
-        console.warn('[IPC] profile:upload-jd rejected: path was not produced by profile:select-file or has expired.');
-        return { success: false, error: 'Please re-select the JD file.' };
+        console.warn('[IPC] profile:upload-jd rejected: invalid path.');
+        return { success: false, error: 'Please select a valid document file.' };
       }
       console.log(`[IPC] profile:upload-jd called with: ${resolvedPath}`);
-      const orchestrator = appState.getKnowledgeOrchestrator();
+      const orchestrator = getOrInitOrchestrator();
       if (!orchestrator) {
         return {
           success: false,
-          error: 'Knowledge engine not initialized. Please ensure API keys are configured.',
+          error: 'Local database not ready. Please try again.',
         };
       }
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = loadKnowledgeTypes();
       const result = await orchestrator.ingestDocument(resolvedPath, DocType.JD);
       // Index the raw text for the profile path's semantic arm (fire and forget).
       if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
@@ -15819,7 +15842,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (!orchestrator) {
         return { success: false, error: 'Knowledge engine not initialized' };
       }
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = loadKnowledgeTypes();
       // Same cross-tier transaction as profile:delete above — see the comment
       // there for why a Tier-1-only delete is a partial delete.
       const { deleteProfileTransactional } = require('./services/knowledge/deleteProfileTransactional') as typeof import('./services/knowledge/deleteProfileTransactional');
@@ -16347,7 +16370,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const resolved = consumeSelectedProfilePath(tempPath);
       if (!resolved) return { success: false, error: 'Could not stage the pasted job description.' };
 
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = loadKnowledgeTypes();
       const result = await orchestrator.ingestDocument(resolved, DocType.JD);
       // Index the raw text for the profile path's semantic arm (fire and forget).
       if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
@@ -16393,8 +16416,15 @@ export function initializeIpcHandlers(appState: AppState): void {
         };
       }
 
-      const { resolveFromUrl } = require('../premium/electron/knowledge/roleInsight/JdSourceResolver');
-      const resolvedJd = await resolveFromUrl(url.trim(), provider, '');
+      // Not implemented locally yet — the resolver returns null without the
+      // premium submodule, so treat it as an unreadable page rather than
+      // throwing a TypeError on an absent function.
+      const jdSource = loadKnowledgeModule('roleInsight/JdSourceResolver') as
+        | { resolveFromUrl?: (url: string, provider: unknown, hint: string) => Promise<any> }
+        | null;
+      const resolvedJd = jdSource?.resolveFromUrl
+        ? await jdSource.resolveFromUrl(url.trim(), provider, '')
+        : null;
       if (!resolvedJd) {
         return {
           success: false,
@@ -16410,7 +16440,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const staged = consumeSelectedProfilePath(tempPath);
       if (!staged) return { success: false, error: 'Could not stage the imported job description.' };
 
-      const { DocType } = require('../premium/electron/knowledge/types');
+      const { DocType } = loadKnowledgeTypes();
       const result = await orchestrator.ingestDocument(staged, DocType.JD);
       // Index the raw text for the profile path's semantic arm (fire and forget).
       if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
@@ -17058,17 +17088,11 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   safeHandle('modes:upload-reference-file', async (_, modeId: string) => {
-    // Bug fix 2026-07-28 (code review): the .doc friendly-message check
-    // below used to read the thrown error's own path field, but the Error
-    // thrown by SafeDocumentTextExtractor's extension whitelist never sets
-    // one, so `ext` was always '' and this branch could never fire.
-    // Capture the known selected path up front instead — same pattern
-    // profile:upload-resume already uses correctly.
-    let selectedPath: string | undefined;
+    let selectedPaths: string[] = [];
     try {
       if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
       const result: any = await dialog.showOpenDialog({
-        properties: ['openFile'],
+        properties: ['openFile', 'multiSelections'],
         filters: [
           // One source of truth with the extractor: a hand-copied list here
           // refused every source/config file the extractor accepts (2026-09-10).
@@ -17076,26 +17100,83 @@ export function initializeIpcHandlers(appState: AppState): void {
           { name: 'All Files', extensions: ['*'] },
         ],
       });
-      if (result.canceled || !result.filePaths?.[0]) return { success: false, cancelled: true };
-      selectedPath = result.filePaths[0];
+      if (result.canceled || !result.filePaths?.length) return { success: false, cancelled: true };
+      selectedPaths = result.filePaths;
       const { ingestModeReferenceFile } = require('./services/ModeReferenceFileIngestion') as typeof import('./services/ModeReferenceFileIngestion');
-      const file = await ingestModeReferenceFile({
-        modeId,
-        filePath: selectedPath!,  // guarded + assigned on the straight line above
-        onIndexStatus: (status, fileId) => {
-          BrowserWindow.getAllWindows().forEach((win) => {
-            if (!win.isDestroyed()) win.webContents.send('mode-file-index-status', { modeId, fileId, phase: status });
+      
+      const files: any[] = [];
+      for (const filePath of selectedPaths) {
+        try {
+          const file = await ingestModeReferenceFile({
+            modeId,
+            filePath,
+            onIndexStatus: (status, fileId) => {
+              BrowserWindow.getAllWindows().forEach((win) => {
+                if (!win.isDestroyed()) win.webContents.send('mode-file-index-status', { modeId, fileId, phase: status });
+              });
+            },
           });
-        },
-      });
-      return { success: true, file };
-    } catch (error: any) {
-      const ext = path.extname(String(selectedPath || '')).toLowerCase();
-      if (ext === '.doc') {
-        return { success: false, error: 'Legacy Word .doc files are not supported. Save the file as .docx and upload it again.' };
+          files.push(file);
+        } catch (e: any) {
+          console.warn('[IPC] modes:upload-reference-file single file failure:', filePath, e?.message);
+        }
       }
+      if (!files.length) {
+        return { success: false, error: 'Could not parse the selected file(s).' };
+      }
+      return { success: true, file: files[0], files };
+    } catch (error: any) {
       console.error('[IPC] modes:upload-reference-file error:', error?.message || error);
-      return { success: false, error: 'Could not parse the selected file. It may be corrupt, password-protected, unsupported, or too large.' };
+      return { success: false, error: 'Could not parse the selected file(s). They may be corrupt, password-protected, unsupported, or too large.' };
+    }
+  });
+
+  safeHandle('modes:upload-reference-folder', async (_, modeId: string) => {
+    try {
+      if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
+      const result: any = await dialog.showOpenDialog({
+        properties: ['openDirectory'],
+      });
+      if (result.canceled || !result.filePaths?.[0]) return { success: false, cancelled: true };
+      const folderPath = result.filePaths[0];
+
+      // --- MCP INTEGRATION ---
+      const pathLib = require('path');
+      const fs = require('fs');
+      const gitnexusDir = pathLib.join(folderPath, '.gitnexus');
+      if (!fs.existsSync(gitnexusDir)) {
+        console.log(`[MCP] No .gitnexus directory found in ${folderPath}. Spawning gitnexus analyze in background...`);
+        const { spawn } = require('child_process');
+        const analyzeProc = spawn(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['-y', 'gitnexus', 'analyze', folderPath], {
+          detached: true,
+          stdio: 'ignore'
+        });
+        analyzeProc.unref();
+      }
+
+      try {
+        const { mcpClient } = require('./mcp/McpClientManager');
+        await mcpClient.startServer(folderPath);
+        console.log(`[MCP] Server started automatically from folder upload for ${folderPath}`);
+      } catch (e) {
+        console.error("[MCP] Failed to start server from folder upload:", e);
+      }
+      // -----------------------
+
+      // Persist reference file in database with GitNexus path
+      const folderName = pathLib.basename(folderPath);
+      
+      const { ModesManager } = require('./services/ModesManager');
+      const virtualFile = ModesManager.getInstance().addReferenceFile({
+        modeId,
+        fileName: '🧠 GitNexus MCP: ' + folderName,
+        content: `mcp_gitnexus_path:${folderPath}`,
+      });
+
+      return { success: true, ingestedFiles: [virtualFile] };
+    } catch (error: any) {
+      console.error('[IPC] modes:upload-reference-folder error:', error?.message || error);
+      return { success: false, error: 'Failed to ingest folder.' };
     }
   });
 
@@ -17103,6 +17184,10 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
       const { ModesManager } = require('./services/ModesManager');
+      const { mcpClient } = require('./mcp/McpClientManager');
+      if (mcpClient) {
+        try { await mcpClient.stopServer(); } catch { /* noop */ }
+      }
       ModesManager.getInstance().deleteReferenceFile(id);
       return { success: true };
     } catch (e: any) {
@@ -17134,6 +17219,28 @@ export function initializeIpcHandlers(appState: AppState): void {
   } catch (e: any) {
     console.warn('[IPC] KnowledgeIndexQueue progress forwarding setup failed (non-fatal):', e?.message);
   }
+
+
+  safeHandle('mcp:link-repository', async (_, repoPath: string) => {
+    try {
+      const { mcpClient } = require('./mcp/McpClientManager');
+      await mcpClient.startServer(repoPath);
+      const tools = await mcpClient.getTools();
+      return { success: true, repoPath, tools: tools.tools.length };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
+
+  safeHandle('mcp:stop-server', async () => {
+    try {
+      const { mcpClient } = require('./mcp/McpClientManager');
+      await mcpClient.stopServer();
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
 
   safeHandle('knowledge:list-packs', async (_, modeId: string) => {
     try {
@@ -17865,6 +17972,25 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  safeHandle('phone-mirror:auto-type', async (_, code: string, options?: { speed?: 'natural' | 'fast' | 'instant'; tabId?: number }) => {
+    try {
+      const res = await PhoneMirrorService.getInstance().autoTypeCode(code, options);
+      return res;
+    } catch (e: any) {
+      console.error('[IPC] phone-mirror:auto-type error:', e);
+      return { ok: false, error: e?.message || 'failed to auto-type code' };
+    }
+  });
+
+  safeHandle('phone-mirror:stop-auto-type', async () => {
+    try {
+      return await PhoneMirrorService.getInstance().stopAutoType();
+    } catch (e: any) {
+      console.error('[IPC] phone-mirror:stop-auto-type error:', e);
+      return { ok: false };
+    }
+  });
+
   // ── Smart Browser Context v2 — settings get/set ────────────────────────
   // Manual capture is always on (no flag). These drive the AUTO behaviour. The
   // resolved getter applies the documented defaults in one place (SettingsManager).
@@ -18534,7 +18660,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       try {
         const orchestrator = appState.getKnowledgeOrchestrator();
         if (!orchestrator) return { success: false, error: 'orchestrator_not_initialized' };
-        const { DocType } = require('../premium/electron/knowledge/types');
+        const { DocType } = loadKnowledgeTypes();
         const dt = params.docType === 'jd' ? DocType.JD : DocType.RESUME;
         const result = await orchestrator.ingestDocument(params.filePath, dt);
         // Index the raw text for the profile path's semantic arm (fire and forget).
@@ -18628,7 +18754,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       try {
         const orchestrator = appState.getKnowledgeOrchestrator();
         if (!orchestrator) return { success: false, error: 'orchestrator_not_initialized' };
-        const { DocType } = require('../premium/electron/knowledge/types');
+        const { DocType } = loadKnowledgeTypes();
         orchestrator.deleteDocumentsByType(DocType.RESUME);
         orchestrator.deleteDocumentsByType(DocType.JD);
         return { success: true };

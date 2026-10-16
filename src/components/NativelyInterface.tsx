@@ -19,6 +19,7 @@ import {
   SlidersHorizontal,
   X,
   Zap,
+  Loader2,
 } from 'lucide-react';
 import {
   mergeRollingTranscriptFinal,
@@ -162,10 +163,16 @@ const displayLanguageName = (lang: string): string =>
 const CodeBlockChrome = ({ lang, code }: { lang: string; code: string }) => {
   const t = useT();
   const [copied, setCopied] = useState(false);
+  const [autoTyping, setAutoTyping] = useState(false);
+  const [autoTypeSuccess, setAutoTypeSuccess] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoTypeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   useEffect(() => () => {
     if (timer.current) clearTimeout(timer.current);
+    if (autoTypeTimer.current) clearTimeout(autoTypeTimer.current);
   }, []);
+
   const handleCopy = () => {
     const p = navigator.clipboard?.writeText(code);
     if (!p) return;
@@ -175,20 +182,69 @@ const CodeBlockChrome = ({ lang, code }: { lang: string; code: string }) => {
       timer.current = setTimeout(() => setCopied(false), 2000);
     }).catch(() => {});
   };
+
+  const handleAutoType = async () => {
+    if (autoTyping) {
+      await (window as any).electronAPI?.phoneMirrorStopAutoType?.();
+      setAutoTyping(false);
+      return;
+    }
+    setAutoTyping(true);
+    try {
+      const res = await (window as any).electronAPI?.phoneMirrorAutoType?.(code, { speed: 'natural' });
+      if (res?.ok) {
+        setAutoTypeSuccess(true);
+        if (autoTypeTimer.current) clearTimeout(autoTypeTimer.current);
+        autoTypeTimer.current = setTimeout(() => setAutoTypeSuccess(false), 2500);
+      }
+    } catch (_) {}
+    setAutoTyping(false);
+  };
+
   return (
     <div
       className={`absolute top-2 right-2 z-10 flex items-center gap-1.5 pl-2.5 pr-1.5 py-1 rounded-lg backdrop-blur-md opacity-0 group-hover/code:opacity-100 transition-[opacity,background-color] duration-150 ${
-        copied ? 'bg-emerald-500/15' : 'bg-black/55 hover:bg-black/70'
+        copied || autoTypeSuccess ? 'bg-emerald-500/15' : autoTyping ? 'bg-amber-500/20' : 'bg-black/55 hover:bg-black/70'
       }`}
     >
       {lang && (
         <span
-          className="text-[10px] font-mono tracking-wide pointer-events-none"
+          className="text-[10px] font-mono tracking-wide pointer-events-none mr-1"
           style={{ color: VIVID_DARK_LINE_NUMBER_COLOR }}
         >
           {displayLanguageName(lang)}
         </span>
       )}
+      <button
+        type="button"
+        onClick={handleAutoType}
+        title={autoTyping ? t('Stop Typing (Esc)') : autoTypeSuccess ? t('Typed into Editor!') : t('Auto-Type into Browser Editor')}
+        aria-label="Auto-Type code into browser"
+        className={`relative flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium transition-all duration-150 active:scale-95 ${
+          autoTyping
+            ? 'bg-amber-500/30 text-amber-300 border border-amber-500/40 animate-pulse'
+            : autoTypeSuccess
+            ? 'bg-emerald-500/30 text-emerald-300 border border-emerald-500/40'
+            : 'text-white/70 hover:text-white/95 hover:bg-white/10'
+        }`}
+      >
+        {autoTyping ? (
+          <>
+            <Loader2 className="w-3 h-3 animate-spin text-amber-300" />
+            <span>{t('Typing...')}</span>
+          </>
+        ) : autoTypeSuccess ? (
+          <>
+            <Check className="w-3 h-3 text-emerald-400" />
+            <span>{t('Typed!')}</span>
+          </>
+        ) : (
+          <>
+            <Zap className="w-3 h-3 text-orange-400" />
+            <span>{t('Auto-Type')}</span>
+          </>
+        )}
+      </button>
       <button
         type="button"
         onClick={handleCopy}
@@ -578,13 +634,16 @@ interface NativelyInterfaceProps {
 
 const buildConversationContextFromMessages = (items: Message[]): string =>
   items
-    .filter((m) => !(m.role === 'user' && (m.hasScreenshot || m.isQuickActionLabel)))
-    .map(
-      (m) =>
-        `${m.role === 'interviewer' ? 'Interviewer' : m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`,
-    )
-    .slice(-20)
-    .join('\n');
+    .filter((m) => Boolean(m.text && m.text.trim()) && !m.isStreaming)
+    .map((m) => {
+      const role = m.role === 'interviewer' ? 'Interviewer' : m.role === 'user' ? 'User' : 'Assistant';
+      const imgInfo = (m.screenshotPreviews && m.screenshotPreviews.length > 0) || m.hasScreenshot
+        ? ' [Screenshot/Image Attached]'
+        : '';
+      return `${role}${imgInfo}: ${m.text.trim()}`;
+    })
+    .slice(-35)
+    .join('\n\n');
 
 // PERF: HighlightedCode renders a single fenced code block. Hoisted to module
 // scope and wrapped in React.memo so a parent re-render does not re-tokenize
@@ -1298,6 +1357,11 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   >('awaiting-audio');
   const [sttInterviewerError, setSttInterviewerError] = useState<string>('');
   const [sttInterviewerProvider, setSttInterviewerProvider] = useState<string>('');
+  const [audioInitStatus, setAudioInitStatus] = useState<{
+    stage: 'idle' | 'initializing_capture' | 'loading_model' | 'downloading' | 'ready';
+    progress?: number;
+    message?: string;
+  }>({ stage: 'idle' });
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [conversationContext, setConversationContext] = useState<string>('');
@@ -1882,6 +1946,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // handleWhatToSay() can access it even in React 18 concurrent mode (where
   // a plain setTimeout(0) may fire before setAttachedContext flushes).
   const pendingCaptureRef = useRef<{ path: string; preview: string } | null>(null);
+
+  // Session screenshot pool: keeps recent screenshots of the active problem/session
+  // so follow-up questions retain the full visual context of previous captures.
+  const sessionCapturesRef = useRef<Array<{ path: string; preview: string; timestamp: number }>>([]);
 
   // Latent Context State (Screenshots attached but not sent)
   const [attachedContext, setAttachedContext] = useState<Array<{ path: string; preview: string }>>(
@@ -5076,6 +5144,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
   const handleScreenshotAttach = (data: { path: string; preview: string }) => {
     setIsExpanded(true);
+    const item = { ...data, timestamp: Date.now() };
+    sessionCapturesRef.current = [
+      ...sessionCapturesRef.current.filter((s) => s.path !== data.path),
+      item,
+    ].slice(-5);
+
     setAttachedContext((prev) => {
       // Prevent duplicates and cap at 5
       if (prev.some((s) => s.path === data.path)) return prev;
@@ -5098,6 +5172,32 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         setSttInterviewerProvider(data.provider);
         if (data.error) setSttInterviewerError(data.error);
         if (data.state === 'connected' || data.state === 'awaiting-audio') setSttInterviewerError('');
+      }
+    });
+  }, []);
+
+  // Audio Initialization Progress listener (e.g. Whisper model load / download / capture start)
+  useEffect(() => {
+    if (!window.electronAPI?.onAudioInitStatus) return;
+    let autoClearTimer: NodeJS.Timeout | null = null;
+    return window.electronAPI.onAudioInitStatus((data: any) => {
+      if (autoClearTimer) clearTimeout(autoClearTimer);
+      if (data.stage === 'ready') {
+        setAudioInitStatus({ stage: 'ready', progress: 100, message: data.message || 'Listo • Escuchando' });
+        setTimeout(() => {
+          setAudioInitStatus({ stage: 'idle' });
+        }, 2000);
+      } else {
+        setAudioInitStatus({
+          stage: data.stage as any,
+          progress: typeof data.progress === 'number' ? data.progress : undefined,
+          message: data.message,
+        });
+        if (data.stage !== 'downloading') {
+          autoClearTimer = setTimeout(() => {
+            setAudioInitStatus({ stage: 'idle' });
+          }, 3500);
+        }
       }
     });
   }, []);
@@ -6562,6 +6662,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   const resetChatState = useCallback(() => {
     cancelActiveChatStream();
     setMessages([]);
+    sessionCapturesRef.current = [];
+    setAttachedContext([]);
     answerPanelPinnedRef.current = false;
     setAnswerPanelPinned(false);
     lastManualSubmitRef.current = null;
@@ -7274,6 +7376,14 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     if (pending && !currentAttachments.some((s) => s.path === pending.path)) {
       currentAttachments = [...currentAttachments, pending].slice(-5);
     }
+    // Retain multi-screenshot session context (last 15 mins) if no new image was explicitly attached
+    if (currentAttachments.length === 0 && sessionCapturesRef.current.length > 0) {
+      const now = Date.now();
+      const recentValid = sessionCapturesRef.current.filter((s) => now - s.timestamp < 15 * 60 * 1000);
+      if (recentValid.length > 0) {
+        currentAttachments = recentValid.map((s) => ({ path: s.path, preview: s.preview }));
+      }
+    }
 
     if (currentAttachments.length > 0) {
       setAttachedContext([]);
@@ -7447,12 +7557,14 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         console.debug(`[DOM Context] Forwarding captured active-tab DOM structure (${domContext.length} chars)`);
       }
 
+      const conversationContextForSubmit = buildConversationContextFromMessages(messages);
       const options =
-        dynamicPromptInstruction || domContext
+        dynamicPromptInstruction || domContext || conversationContextForSubmit
           ? {
               ...(dynamicPromptInstruction ? { promptInstruction: dynamicPromptInstruction } : {}),
               ...(domContext ? { domContext } : {}),
               ...(domContextEnvelope ? { domContextEnvelope } : {}),
+              ...(conversationContextForSubmit ? { conversationContext: conversationContextForSubmit } : {}),
             }
           : undefined;
 
@@ -7756,6 +7868,29 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       setIsProcessing(false);
     }
   };
+
+  const handleAutoTypeLastCode = async () => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role === 'system' && m.text.includes('```')) {
+        const parts = m.text.split(/(```[\s\S]*?(?:```|$))/g);
+        for (let j = parts.length - 1; j >= 0; j--) {
+          const part = parts[j];
+          if (part.startsWith('```')) {
+            const match = part.match(/```([\w+#-]*)\s+([\s\S]*?)(?:```|$)/);
+            const extracted = match ? match[2].trim() : part.replace(/^```[\w+#-]*\s*/, '').replace(/```$/, '').trim();
+            if (extracted) {
+              try {
+                await (window as any).electronAPI?.phoneMirrorAutoType?.(extracted, { speed: 'natural' });
+              } catch (_) {}
+              return;
+            }
+          }
+        }
+      }
+    }
+  };
+
   useEffect(() => {
     const cleanups: (() => void)[] = [];
 
@@ -8472,7 +8607,21 @@ Provide only the answer, nothing else.`;
   }, [inputValue]);
 
   const handleManualSubmit = async () => {
-    if (!inputValue.trim() && attachedContext.length === 0) return;
+    const pending = pendingCaptureRef.current;
+    let currentAttachments = attachedContext;
+    if (pending && !currentAttachments.some((s) => s.path === pending.path)) {
+      currentAttachments = [...currentAttachments, pending].slice(-5);
+    }
+    // Retain multi-screenshot session context (last 15 mins) if no new image was explicitly attached
+    if (currentAttachments.length === 0 && sessionCapturesRef.current.length > 0) {
+      const now = Date.now();
+      const recentValid = sessionCapturesRef.current.filter((s) => now - s.timestamp < 15 * 60 * 1000);
+      if (recentValid.length > 0) {
+        currentAttachments = recentValid.map((s) => ({ path: s.path, preview: s.preview }));
+      }
+    }
+
+    if (!inputValue.trim() && currentAttachments.length === 0) return;
 
     const rawUserText = inputValue;
     const userText = inputValue.trim();
@@ -8492,11 +8641,12 @@ Provide only the answer, nothing else.`;
     manualSubmitInFlightRef.current = true;
     lastManualSubmitRef.current = { text: userText, atMs: nowMs };
 
-    const currentAttachments = attachedContext;
+    const conversationContextForSubmit = buildConversationContextFromMessages(messages);
 
     // Clear inputs immediately
     setInputValue('');
     setAttachedContext([]);
+    pendingCaptureRef.current = null;
 
     // Seal any in-flight streaming rows from a previous turn before we
     // append the new user message + placeholder. Without this, the rAF
@@ -8519,6 +8669,26 @@ Provide only the answer, nothing else.`;
     );
 
     const userMessageId = genMessageId();
+    const rawDomContext = (window as any).lastCapturedDOM;
+    const domContext =
+      typeof rawDomContext === 'string' && rawDomContext.trim().length > 0
+        ? rawDomContext.substring(0, DOM_CONTEXT_MAX_CHARS)
+        : undefined;
+    const consumedPageMeta = domContext ? capturedMetaRef.current : null;
+
+    // Clear captured DOM on consumption
+    if (typeof (window as any).lastCapturedDOM === 'string') {
+      (window as any).lastCapturedDOM = '';
+    }
+    capturedEnvelopeRef.current = null;
+    capturedMetaRef.current = null;
+    if (domContext) setPageContext(null);
+
+    const effectiveConversationContext = domContext
+      ? (conversationContextForSubmit
+          ? `${conversationContextForSubmit}\n\n--- ACTIVE BROWSER PAGE CONTEXT ---\n${domContext}\n--- END PAGE CONTEXT ---`
+          : `--- ACTIVE BROWSER PAGE CONTEXT ---\n${domContext}\n--- END PAGE CONTEXT ---`)
+      : conversationContextForSubmit;
     setMessages((prev) => [
       ...prev,
       {
@@ -8528,6 +8698,7 @@ Provide only the answer, nothing else.`;
         hasScreenshot: currentAttachments.length > 0,
         screenshotPreview: currentAttachments[0]?.preview,
         screenshotPreviews: currentAttachments.map((a) => a.preview).filter(Boolean),
+        pageContext: consumedPageMeta ?? undefined,
       },
     ]);
 
@@ -8603,7 +8774,6 @@ Provide only the answer, nothing else.`;
     setIsExpanded(true);
     setIsProcessing(true);
     pinAnswerPanel();
-    const conversationContextForSubmit = buildConversationContextFromMessages(messages);
 
     try {
       // No RAG pre-flight here (issue #552). It used to intercept every typed
@@ -8624,7 +8794,7 @@ Provide only the answer, nothing else.`;
       await window.electronAPI.streamGeminiChat(
         userText || 'Analyze this screenshot',
         currentAttachments.length > 0 ? currentAttachments.map((s) => s.path) : undefined,
-        conversationContextForSubmit, // Pass freshly-derived context so "answer this" works
+        effectiveConversationContext, // Pass freshly-derived context + active DOM context
       );
     } catch (err) {
       // R-17: release the claim taken above — see the note at the other call site.
@@ -9200,6 +9370,7 @@ Provide only the answer, nothing else.`;
     handleClarify,
     handleCodeHint,
     handleBrainstorm,
+    handleAutoTypeLastCode,
   });
 
   // Update ref on every render so the event listener always access latest state/props
@@ -9212,6 +9383,7 @@ Provide only the answer, nothing else.`;
     handleClarify,
     handleCodeHint,
     handleBrainstorm,
+    handleAutoTypeLastCode,
   };
 
   useEffect(() => {
@@ -9702,6 +9874,7 @@ Provide only the answer, nothing else.`;
       else if (action === 'clarify') handlers.handleClarify();
       else if (action === 'codeHint') handlers.handleCodeHint();
       else if (action === 'brainstorm') handlers.handleBrainstorm();
+      else if (action === 'autoTypeLastCode') handlers.handleAutoTypeLastCode();
       else if (action === 'scrollUp') inertialScrollRef.current?.kick('vert', -1);
       else if (action === 'scrollDown') inertialScrollRef.current?.kick('vert', 1);
       else if (action === 'scrollLeft') inertialScrollRef.current?.kick('horiz', -1);
@@ -10083,7 +10256,7 @@ Provide only the answer, nothing else.`;
   // Suppressed: mode label pill is not required in the UI.
   // Suppressed: LLM privacy label pill is not required in the UI.
   // Suppressed: vision pill ("Vision: provider") is not required in the UI.
-  const hasStatusPill = shouldShowSttSummaryPill || !!pageContext || !!captureFallback;
+  const hasStatusPill = shouldShowSttSummaryPill || !!pageContext || !!captureFallback || audioInitStatus.stage !== 'idle';
   const statusPillBaseClass = `flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-medium shadow-sm backdrop-blur-xl ${isLightTheme ? 'bg-white/55 border-black/10' : 'bg-black/20 border-white/10'}`;
 
   // Suppress the shell's scale/translate entry animation until it has rendered
@@ -10254,6 +10427,20 @@ Provide only the answer, nothing else.`;
 
               {hasStatusPill && (
               <div className="relative no-drag flex flex-wrap items-center justify-center gap-1.5 px-4 pt-3 pb-1">
+                {audioInitStatus.stage !== 'idle' && (
+                  <div
+                    className={`${statusPillBaseClass} bg-sky-500/15 border-sky-400/30 text-sky-300 animate-pulse`}
+                    title={audioInitStatus.message}
+                  >
+                    <Loader2 className="h-3 w-3 animate-spin opacity-80" />
+                    <span>{audioInitStatus.message || t('Iniciando audio...')}</span>
+                    {typeof audioInitStatus.progress === 'number' && audioInitStatus.progress > 0 && (
+                      <span className="font-mono text-[9px] bg-sky-500/25 px-1.5 py-0.5 rounded-full text-sky-200">
+                        {audioInitStatus.progress}%
+                      </span>
+                    )}
+                  </div>
+                )}
                 {shouldShowSttSummaryPill && (
                   <div
                     className={`${statusPillBaseClass} ${getStatusToneClass(sttSummary.tone)}`}

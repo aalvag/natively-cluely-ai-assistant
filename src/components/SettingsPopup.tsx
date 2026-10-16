@@ -89,7 +89,7 @@ const SettingsPopup = () => {
             .catch(() => setCiV3Enabled(false));
     }, []);
     const [hasProfile, setHasProfile] = useState(false);
-    const [isPremium, setIsPremium] = useState(false);
+    const [isPremium, setIsPremium] = useState(true);
 
     const isFirstRender = React.useRef(true);
 

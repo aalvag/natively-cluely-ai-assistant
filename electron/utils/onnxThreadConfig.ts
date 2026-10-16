@@ -108,14 +108,14 @@ export type OnnxWorkload = 'default' | 'rnnt-decode';
  * Halving logical cores approximates the perf-core count portably (Apple's
  * hw.perflevel0 has no cross-platform equivalent).
  */
-function defaultRnntIntraOpThreads(): number {
+function defaultIntraOpThreads(): number {
     let logical = 4;
     try {
         logical = (require('os') as typeof import('os')).cpus()?.length || 4;
     } catch {
         logical = 4;
     }
-    return Math.max(1, Math.min(4, Math.floor(logical / 2)));
+    return Math.max(2, Math.min(4, Math.floor(logical / 2)));
 }
 
 /**
@@ -127,7 +127,7 @@ function defaultRnntIntraOpThreads(): number {
  * measurements above stay reproducible without a new build.
  */
 export function getBoundedOnnxSessionOptions(workload: OnnxWorkload = 'default'): OnnxThreadBounds {
-    const intraDefault = workload === 'rnnt-decode' ? defaultRnntIntraOpThreads() : 1;
+    const intraDefault = defaultIntraOpThreads();
     return {
         intraOpNumThreads: readIntEnv('NATIVELY_ONNX_INTRA_OP_THREADS', intraDefault),
         interOpNumThreads: readIntEnv('NATIVELY_ONNX_INTER_OP_THREADS', 1),

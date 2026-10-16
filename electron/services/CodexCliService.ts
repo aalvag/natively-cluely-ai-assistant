@@ -628,7 +628,7 @@ export class CodexCliService {
       }
     }
 
-    if (options.serviceTier && options.serviceTier !== 'default') {
+    if (options.serviceTier && options.serviceTier !== 'default' && options.serviceTier !== 'fast') {
       body.service_tier = options.serviceTier;
     }
 

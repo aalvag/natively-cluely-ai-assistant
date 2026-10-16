@@ -16,9 +16,9 @@ export const STANDARD_CLOUD_MODELS: Record<string, {
     },
     openai: {
         hasKeyCheck: (creds) => !!creds?.hasOpenaiKey,
-        ids: ['gpt-5.4'],
-        names: ['GPT 5.4'],
-        descs: ['OpenAI'],
+        ids: ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-5.6', 'gpt-5.5', 'gpt-5.4'],
+        names: ['GPT-5.6 Luna', 'GPT-5.6 Terra', 'GPT-5.6 Sol', 'ChatGPT 5.6', 'ChatGPT 5.5', 'GPT 5.4'],
+        descs: ['OpenAI • Luna (Fast)', 'OpenAI • Terra (Balanced)', 'OpenAI • Sol (Flagship)', 'OpenAI 5.6', 'OpenAI 5.5', 'OpenAI 5.4'],
         pmKey: 'openaiPreferredModel'
     },
     claude: {

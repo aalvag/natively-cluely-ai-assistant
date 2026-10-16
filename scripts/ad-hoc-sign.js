@@ -234,54 +234,29 @@ exports.default = async function (context) {
         return;
     }
 
-    // Optional: shape the ad-hoc build like a hardened-runtime build for local TCC testing.
-    // Off by default because a hardened-runtime ad-hoc build has stricter launch requirements
-    // that cannot be fully verified without a real signing identity. Set NATIVELY_ADHOC_HARDENED=1
-    // to opt in when testing entitlement/permission behavior locally.
     const hardenedOpt = process.env.NATIVELY_ADHOC_HARDENED === '1' ? '--options runtime ' : '';
-
-    // ── Step 2: Ad-hoc sign the application (DEV / local distribution only) ──
-    // Resolve the path to the entitlements file so V8 gets JIT memory permissions
     const entitlementsPath = path.join(context.packager.info.projectDir, 'build', 'entitlements.mac.plist');
-    
-    // ── Step 2a: Sign the main app bundle with --deep first ──
-    // --deep recurses into nested Mach-O binaries (frameworks, helpers, .node files).
-    // It signs them with --sign - only (no custom entitlements on nested items).
-    // We MUST do this before signing the .node files with entitlements, because
-    // --deep would otherwise overwrite the entitlement-signed .node files.
-    console.log(`[Ad-Hoc Signing] Signing main app ${appPath} with entitlements...`);
 
+    // ── Step 2a: Sign unpacked native binaries (.node, .dylib) with entitlements first ──
+    const unpackedDir = path.join(appPath, 'Contents', 'Resources', 'app.asar.unpacked');
+    if (fs.existsSync(unpackedDir)) {
+        try {
+            execSync(`find "${unpackedDir}" -type f \\( -name "*.node" -o -name "*.dylib" \\) -exec codesign --force ${hardenedOpt}--entitlements "${entitlementsPath}" -r="designated => identifier \\"com.electron.meeting-notes\\"" --sign - {} +`, { stdio: 'inherit' });
+        } catch (error) {
+            console.warn('[Ad-Hoc Signing] Warning signing unpacked binaries:', error?.message || error);
+        }
+    }
+
+    // ── Step 2b: Sign the main app bundle with --deep, entitlements and stable Designated Requirement ──
+    // Setting explicit `-r="designated => identifier \"com.electron.meeting-notes\""` binds macOS TCC
+    // permissions to the bundle ID rather than ephemeral binary CDHashes, so permissions survive rebuilds.
+    console.log(`[Ad-Hoc Signing] Signing main app ${appPath} with stable Designated Requirement...`);
     try {
-        // --force: replace existing signature
-        // --deep: sign nested code (frameworks, helpers, .dylib, .node)
-        // --entitlements: attach entitlements to the top-level app bundle
-        // --sign -: ad-hoc signature
-        execSync(`codesign --force --deep ${hardenedOpt}--entitlements "${entitlementsPath}" --sign - "${appPath}"`, { stdio: 'inherit' });
-        console.log('[Ad-Hoc Signing] Successfully signed the application with entitlements.');
+        execSync(`codesign --force --deep ${hardenedOpt}--entitlements "${entitlementsPath}" -r="designated => identifier \\"com.electron.meeting-notes\\"" --sign - "${appPath}"`, { stdio: 'inherit' });
+        console.log('[Ad-Hoc Signing] Successfully signed the application with stable Designated Requirement.');
     } catch (error) {
         console.error('[Ad-Hoc Signing] Failed to sign the application:', error);
         throw error;
-    }
-
-    // ── Step 2b: Re-sign .node binaries with entitlements AFTER --deep ──
-    // codesign --deep re-signs nested .node binaries without entitlements (it only
-    // applies entitlements to the top-level item). We re-sign them here AFTER --deep
-    // so the entitlements (JIT / library-validation) are preserved on the native
-    // module binary. (Screen/system-audio access is pure TCC — no entitlement.)
-    const unpackedNativeDir = path.join(appPath, 'Contents', 'Resources', 'app.asar.unpacked', 'native-module');
-    if (fs.existsSync(unpackedNativeDir)) {
-        const files = fs.readdirSync(unpackedNativeDir);
-        for (const file of files) {
-            if (file.endsWith('.node')) {
-                const nodePath = path.join(unpackedNativeDir, file);
-                console.log(`[Ad-Hoc Signing] Re-signing ${file} with entitlements (post --deep)...`);
-                try {
-                    execSync(`codesign --force ${hardenedOpt}--entitlements "${entitlementsPath}" --sign - "${nodePath}"`, { stdio: 'inherit' });
-                } catch (error) {
-                    console.error(`[Ad-Hoc Signing] Failed to sign ${file}:`, error);
-                }
-            }
-        }
     }
 };
 

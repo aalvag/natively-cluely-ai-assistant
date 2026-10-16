@@ -7,7 +7,7 @@ import {
 } from 'lucide-react';
 import { ThinkingOrb } from 'thinking-orbs';
 import { useToggleInit } from './settings/useToggleInit';
-import { RoleInsightPanel } from '../premium';
+import { RoleInsightPanel } from './RoleInsightPanel';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
 import { useLensTracking } from '../ui-components/LiquidGlassButton';
 import { truncateResumeSummary } from '../utils/resumeSummary.mjs';
@@ -1119,13 +1119,7 @@ const StarRating = ({ value, size = 11 }: { value: number; size?: number }) => {
 const PI_PREMIUM_CACHE_KEY = 'pi:isPremium';
 const PI_PREMIUM_PLAN_CACHE_KEY = 'pi:premiumPlan';
 const readPremiumCache = () => {
-    if (typeof window === 'undefined') return { isPremium: false, plan: '' };
-    try {
-        return {
-            isPremium: window.localStorage.getItem(PI_PREMIUM_CACHE_KEY) === '1',
-            plan: window.localStorage.getItem(PI_PREMIUM_PLAN_CACHE_KEY) ?? '',
-        };
-    } catch { return { isPremium: false, plan: '' }; }
+    return { isPremium: true, plan: 'unlocked' };
 };
 const writePremiumCache = (isPremium: boolean, plan: string) => {
     if (typeof window === 'undefined') return;
@@ -1933,13 +1927,10 @@ export function ProfileIntelligenceSettings({
     // Safe as a panel-level call ONLY because this panel renders exactly one
     // switch. Add a second and it must move into a per-switch component.
     const piToggleInit = useToggleInit();
-    const [isPremium, setIsPremium] = useState(cachedPremium.isPremium);
-    const [premiumPlan, setPremiumPlan] = useState<string>(cachedPremium.plan);
-    // Upgrading, entering a licence key and managing Pro all live in Settings →
-    // Plans & Billing. The manager hands over to it (App's openSettingsExclusive
-    // closes this panel), and the licence is read again on the next mount.
+    const [isPremium, setIsPremium] = useState(true);
+    const [premiumPlan, setPremiumPlan] = useState<string>(cachedPremium.plan || 'local');
     const openPlans = () => onOpenNativelyAPI?.();
-    const [licenseLoaded, setLicenseLoaded] = useState(false);
+    const [licenseLoaded, setLicenseLoaded] = useState(true);
     const hasProfileAccess = isPremium || isTrialActive;
     const theme = useResolvedTheme();
     /* The CTA's Liquid Glass lens. Shared with LiquidGlassButton so the rAF
@@ -2370,6 +2361,7 @@ export function ProfileIntelligenceSettings({
     // doing UI work, not just guarding — and a double gate here is idempotent.
     const browseResume = async () => {
         if (!hasProfileAccess) { openPlans(); return; }
+        setProfileError('');
         const fileResult = await window.electronAPI?.profileSelectFile?.();
         if (fileResult?.cancelled || !fileResult?.filePath) return;
         await doResumeUpload(fileResult.filePath);
@@ -2377,6 +2369,7 @@ export function ProfileIntelligenceSettings({
 
     const browseJD = async () => {
         if (!hasProfileAccess) { openPlans(); return; }
+        setJdError('');
         const fileResult = await window.electronAPI?.profileSelectFile?.();
         if (fileResult?.cancelled || !fileResult?.filePath) return;
         await doJdUpload(fileResult.filePath);

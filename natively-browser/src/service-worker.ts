@@ -857,6 +857,56 @@ async function handleListTabs(reqId: string): Promise<void> {
   }
 }
 
+async function handleAutoType(
+  text: string,
+  options?: { speed?: 'natural' | 'fast' | 'instant'; tabId?: number }
+): Promise<void> {
+  try {
+    let tab: chrome.tabs.Tab | undefined;
+    if (typeof options?.tabId === 'number') {
+      try { tab = await chrome.tabs.get(options.tabId); } catch { tab = undefined; }
+    } else {
+      tab = await resolveCaptureTab();
+    }
+    if (!tab || tab.id == null) {
+      wsSend({ type: 'auto-type-ack', ok: false, error: 'No active browser tab found' });
+      return;
+    }
+
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['content-script.js'],
+      });
+    } catch (_) {}
+
+    chrome.tabs.sendMessage(
+      tab.id,
+      { type: 'natively:auto-type', text, options },
+      (res) => {
+        if (chrome.runtime.lastError) {
+          wsSend({ type: 'auto-type-ack', ok: false, error: chrome.runtime.lastError.message });
+        } else {
+          wsSend({ type: 'auto-type-ack', ok: true, details: res?.autoType });
+        }
+      }
+    );
+  } catch (err) {
+    wsSend({ type: 'auto-type-ack', ok: false, error: String(err) });
+  }
+}
+
+async function handleStopAutoType(): Promise<void> {
+  try {
+    const tab = await resolveCaptureTab();
+    if (tab && tab.id != null) {
+      chrome.tabs.sendMessage(tab.id, { type: 'natively:stop-auto-type' }, () => {
+        // ignore callback
+      });
+    }
+  } catch (_) {}
+}
+
 async function ensureWsConnected(): Promise<void> {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   if (wsConnecting) return;
@@ -892,6 +942,10 @@ async function ensureWsConnected(): Promise<void> {
         });
       } else if (msg.type === 'list-tabs' && typeof msg.reqId === 'string') {
         void handleListTabs(msg.reqId);
+      } else if (msg.type === 'auto-type' && typeof msg.text === 'string') {
+        void handleAutoType(msg.text, msg.options);
+      } else if (msg.type === 'stop-auto-type') {
+        void handleStopAutoType();
       }
       // Ignore phone-targeted StreamEvents (history/token/etc.) — not for us.
     };
