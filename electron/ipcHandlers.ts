@@ -14189,6 +14189,58 @@ export function initializeIpcHandlers(appState: AppState): void {
   // People sharing the microphone (Settings, Audio): diarize the mic channel and
   // split its voices at save (services/meeting/roomSpeakers.ts). Takes effect
   // from the next meeting; the STT instance is built when a meeting starts.
+  // "About you" (Settings): a few lines the meeting notes prompt reads as the user's own bio.
+  safeHandle('user-bio-get', async () => ({ bio: String(SettingsManager.getInstance().get('userBio') ?? '') }));
+  safeHandle('user-bio-set', async (_, bio: unknown) => {
+    if (typeof bio !== 'string') return { success: false, error: 'invalid' };
+    const clean = bio.replace(/\r\n?/g, '\n').trim().slice(0, 600);
+    return SettingsManager.getInstance().set('userBio', clean) ? { success: true, bio: clean } : { success: false, error: 'settings_store_degraded' };
+  });
+  // The notes window's "Attach image": a picture kept with the running meeting
+  // and described for the notes (the same describer shared screens use). Only
+  // the description reaches the notes prompt; the file stays on this machine.
+  safeHandle('live-notes:attach-image', async () => {
+    const { dialog: dlg, app: electronApp } = require('electron') as typeof import('electron');
+    const fsp = require('fs/promises') as typeof import('fs/promises');
+    const pathMod = require('path') as typeof import('path');
+    const meta = appState.getIntelligenceManager().liveMeetingMetadata?.() as { attachedImages?: Array<{ path: string; name?: string; description: string; at: number }> } | null;
+    if (!meta) return { count: 0, message: 'Start a meeting first; attached images go into its notes.' };
+    const picked = await dlg.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'heic'] }] });
+    const src = picked.canceled ? null : picked.filePaths[0];
+    if (!src) return { count: meta.attachedImages?.length ?? 0 };
+    const dir = pathMod.join(electronApp.getPath('userData'), 'meeting-attachments');
+    await fsp.mkdir(dir, { recursive: true });
+    const name = pathMod.basename(src).slice(0, 80);
+    const dest = pathMod.join(dir, `${Date.now()}-${name.replace(/[^\w.-]+/g, '_')}`);
+    await fsp.copyFile(src, dest);
+    let description = '';
+    try {
+      const { transcribeScreenForMemory } = require('./services/screen/screenTranscription');
+      description = String((await transcribeScreenForMemory([dest], 'A picture the user attached to their meeting notes: describe what it shows, including any text, in a few sentences.')) ?? '').trim();
+    } catch { /* kept without a description; the notes just say an image was attached */ }
+    const list = Array.isArray(meta.attachedImages) ? meta.attachedImages : [];
+    list.push({ path: dest, name, description: description || `Image "${name}" (not described)`, at: Date.now() });
+    meta.attachedImages = list.slice(-12);
+    return { count: meta.attachedImages.length };
+  });
+  // The notes window's "Shorten": one line, tightened by the user's model, kept only when it adds nothing.
+  safeHandle('live-notes:shorten-line', async (_, line: unknown) => {
+    const { shortenInput, acceptShortened, SHORTEN_SYSTEM_PROMPT, SHORTEN_TIMEOUT_MS } = require('./services/meeting/noteLineShortener') as typeof import('./services/meeting/noteLineShortener');
+    const input = shortenInput(line);
+    if (!input) return { text: null };
+    try {
+      const raw = await appState.processingHelper.getLLMHelper().generateMeetingSummary(SHORTEN_SYSTEM_PROMPT, `Line: ${input}\nReply:`, SHORTEN_SYSTEM_PROMPT, { timeoutMs: SHORTEN_TIMEOUT_MS, purpose: 'extraction' } as any);
+      return { text: acceptShortened(typeof raw === 'string' ? raw : (raw as any)?.text ?? (raw as any)?.summary ?? '', input) };
+    } catch {
+      return { text: null };
+    }
+  });
+  // Follow the meeting app's microphone (Settings › Audio). Takes effect at the next meeting.
+  safeHandle('follow-mic-device-get', async () => ({ enabled: SettingsManager.getInstance().get('followMeetingAppMicDevice') === true }));
+  safeHandle('follow-mic-device-set', async (_, enabled: unknown) => {
+    if (typeof enabled !== 'boolean') return { success: false, error: 'invalid' };
+    return SettingsManager.getInstance().set('followMeetingAppMicDevice', enabled) ? { success: true } : { success: false, error: 'settings_store_degraded' };
+  });
   safeHandle('room-speakers-get', async () => ({ enabled: SettingsManager.getInstance().get('roomSpeakersEnabled') === true }));
   safeHandle('room-speakers-set', async (_, enabled: unknown) => {
     if (typeof enabled !== 'boolean') return { success: false, error: 'invalid' };
@@ -15423,13 +15475,17 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   safeHandle('update-meeting-summary', async (_, { id, updates }: { id: string; updates: any }) => {
-    return DatabaseManager.getInstance().updateMeetingSummary(id, updates);
+    const result = DatabaseManager.getInstance().updateMeetingSummary(id, updates);
+    // Settings › Connectors: webhooks that asked for note.edited hear about it
+    // (debounced per meeting, so typing does not send a request per keystroke).
+    try { if (result && typeof id === 'string') require('./services/outputs/connectorsDeliveryIpc').connectorsDelivery.notesEdited(id); } catch { /* never blocks a save */ }
+    return result;
   });
 
   // Meeting Notes V3 — regenerate the full structured notes for a saved meeting, optionally
   // with a different mode (templateType) and follow-up tone. Runs the map-reduce pipeline on
   // the stored transcript off the UI thread; honors the post_call_summary data scope.
-  safeHandle('regenerate-meeting-summary', async (_, { id, templateType, modeId, tone }: { id: string; templateType?: string; modeId?: string; tone?: 'professional' | 'warm' | 'concise' | 'friendly' }) => {
+  safeHandle('regenerate-meeting-summary', async (_, { id, templateType, modeId, tone }: { id: string; templateType?: string; modeId?: string; tone?: 'professional' | 'warm' | 'concise' | 'friendly' | 'your_style' }) => {
     if (!id || typeof id !== 'string') return { success: false, error: 'invalid id' };
     if (modeId !== undefined && typeof modeId !== 'string') modeId = undefined;
     if (templateType !== undefined && typeof templateType !== 'string') templateType = undefined;
@@ -15455,7 +15511,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   // Meeting Notes V3 — regenerate ONLY the follow-up draft (cheap; no re-summarize).
-  safeHandle('regenerate-meeting-followup', async (_, { id, tone }: { id: string; tone?: 'professional' | 'warm' | 'concise' | 'friendly' }) => {
+  safeHandle('regenerate-meeting-followup', async (_, { id, tone }: { id: string; tone?: 'professional' | 'warm' | 'concise' | 'friendly' | 'your_style' }) => {
     if (!id || typeof id !== 'string') return { success: false, error: 'invalid id' };
     const mgr = appState.getIntelligenceManager();
     if (!mgr) return { success: false, error: 'intelligence manager unavailable' };
@@ -16239,7 +16295,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const text = await appState.getIntelligenceManager().runLiveHelper(action, { sinceMs });
       if (text) {
         try {
-          const label = action === 'catch_me_up' ? 'What did I miss?' : action === 'define' ? 'Define' : 'Sound smart';
+          const label = action === 'catch_me_up' ? 'What did I miss?' : action === 'define' ? 'Define' : action === 'follow_up_questions' ? 'Follow-up questions' : 'Sound smart';
           PhoneMirrorService.getInstance().publishAssistantMessage(crypto.randomUUID(), text, label);
         } catch (_) {}
       }
@@ -16906,6 +16962,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
     },
   );
+
+  // The default mail app (name + icon) for the follow-up sheet's send menu.
+  safeHandle('mail-app-info', async () => {
+    const { defaultMailApp } = require('./utils/mailApp');
+    return defaultMailApp(process.platform, app).catch(() => null);
+  });
 
   // ==========================================
   // RAG (Retrieval-Augmented Generation) Handlers

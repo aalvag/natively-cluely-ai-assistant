@@ -39,9 +39,18 @@ const REPO_ROOT = resolve(__dirname, '../../..');
 // its CSS custom properties via normal ancestry.
 const GUARDED_FILES = [
   'src/components/SettingsOverlay.tsx',
+  'src/components/settings/AboutYouSettings.tsx',
   'src/components/settings/AIProvidersSettings.tsx',
   'src/components/settings/CalendarSettings.tsx',
   'src/components/settings/ConnectionsSettings.tsx',
+  'src/components/settings/ConnectorMark.tsx',
+  'src/components/settings/connectors/AutoSendSection.tsx',
+  'src/components/settings/connectors/GmailPanel.tsx',
+  'src/components/settings/connectors/McpCard.tsx',
+  'src/components/settings/connectors/WebhooksPanel.tsx',
+  'src/components/settings/connectors/common.tsx',
+  'src/components/settings/connectors/parts.tsx',
+  'src/components/settings/FollowMicDeviceSettings.tsx',
   'src/components/settings/EmbeddingSettings.tsx',
   'src/components/settings/HelpSettings.tsx',
   'src/components/settings/help/HelpGraphics.tsx',

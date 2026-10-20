@@ -21,6 +21,8 @@ import { HelpSettings } from './settings/HelpSettings';
 import { AIProvidersSettings, AIP_CSS, AipModelList, AipPassedCheck } from './settings/AIProvidersSettings';
 import { SpeechDictionarySettings } from './settings/SpeechDictionarySettings';
 import { RoomSpeakersSettings } from './settings/RoomSpeakersSettings';
+import { FollowMicDeviceSettings } from './settings/FollowMicDeviceSettings';
+import { AboutYouSettings } from './settings/AboutYouSettings';
 import { PlansSettings } from './settings/PlansSettings';
 import { PhoneMirrorSettings } from './settings/PhoneMirrorSettings';
 import { RetrievalSettings } from './settings/RetrievalSettings';
@@ -47,7 +49,7 @@ import { useConfirmDialog } from './ui/ConfirmDialog';
 import { ModelSelectorLabel } from './ui/ModelSelectorLabel';
 import { MODEL_SELECTOR_WIDTH } from './ui/modelSelectorLabelText';
 import { Disclosure, DisclosureChevron } from './ui/AccordionSection';
-import { Presence, SettingsMenu, SettingsMotionReady } from './settings/SettingsRow';
+import { Presence, SETTINGS_CARD, SettingsMenu, SettingsMotionReady } from './settings/SettingsRow';
 import { ProfileVisualizer } from '../premium';
 import GlassEffectLayer from './ui/GlassEffectLayer';
 import { GenieModal } from './ui/GenieModal';
@@ -101,7 +103,7 @@ const DISGUISE_TILE_RESTING = {
 // Shared with the main process so the picker cannot offer a model the ipc
 // validator rejects. Pure data module — no node/electron imports.
 import { NVIDIA_NIM_STT_MODELS, DEFAULT_NVIDIA_NIM_STT_MODEL, allowedLanguageKeysForNvidiaModel } from '../../electron/audio/nvidiaNimSttModels';
-import { STT_MODEL_CATALOG, isEnglishOnlySttModel, type SttModelProvider } from '../../electron/audio/sttModelCatalog';
+import { STT_MODEL_CATALOG, isEnglishOnlySttModel, sttModelRejectsLanguage, type SttModelProvider } from '../../electron/audio/sttModelCatalog';
 import { isDefaultOpenAiSttBase } from '../../electron/audio/openaiSttBaseUrl';
 import { isRecognitionLanguageOffered, PARAKEET_ONLY_LANGUAGE_KEYS } from '../../electron/config/languages';
 
@@ -569,11 +571,11 @@ const SETTINGS_NAV_ORDER = [
     'ai-providers',
     'retrieval',
     'audio',
-    'calendar',
-    'connections',
     'skills',
+    'calendar',
     'keybinds',
     'phone-mirror',
+    'connections',
     'intelligence',
     'help',
     'about',
@@ -1493,9 +1495,20 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
     // Parakeet-only languages are hidden unless the active local model lists them.
     // Deepgram's English-only models (Nova-3 Medical, Nova-2 Meeting) answer
     // any other language, or `multi`, with a 400 — measured live 2026-09-26.
+    // The multilingual ones refuse a few languages too (Nova-3 has no
+    // Malayalam, Nova-2 none of the Indian languages but Hindi; 2026-10-16).
+    const deepgramEnglishOnly = sttProvider === 'deepgram' && isEnglishOnlySttModel('deepgram', sttModels.deepgram);
     const deepgramLanguageCapability = useMemo(() => {
-        if (sttProvider !== 'deepgram' || !isEnglishOnlySttModel('deepgram', sttModels.deepgram)) return null;
-        const keys = Object.entries(availableLanguages).filter(([, l]: [string, any]) => l?.group === 'English').map(([k]) => k);
+        if (sttProvider !== 'deepgram') return null;
+        const model = sttModels.deepgram;
+        const englishOnly = isEnglishOnlySttModel('deepgram', model);
+        const entries = Object.entries(availableLanguages) as [string, any][];
+        const keys = entries
+            .filter(([key, l]) => englishOnly
+                ? l?.group === 'English'
+                : key === 'auto' || !sttModelRejectsLanguage('deepgram', model, String(l?.iso639 ?? '')))
+            .map(([k]) => k);
+        if (!englishOnly && keys.length === entries.length) return null;
         return keys.length > 0 ? new Set<string>(keys) : null;
     }, [sttProvider, sttModels.deepgram, availableLanguages]);
 
@@ -1544,9 +1557,13 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
     // session always sends English (DeepgramStreamingSTT.connectLanguage), so
     // an Auto or non-English stored choice shows as the English it gets —
     // not as an empty placeholder with nothing in the list to match.
-    const showsEnglishFallback = (languageLocked || !!deepgramLanguageCapability) && (storedLanguageUnsupported || autoDetectUnavailable);
-    const displayedSttGroup = showsEnglishFallback ? 'English' : selectedSttGroup;
-    const displayedRecognitionLanguage = showsEnglishFallback ? 'english-us' : recognitionLanguage;
+    const showsEnglishFallback = (languageLocked || deepgramEnglishOnly) && (storedLanguageUnsupported || autoDetectUnavailable);
+    // A multilingual Deepgram model sends `multi` for a stored language it has
+    // no model for (DeepgramStreamingSTT.connectLanguage), so that is shown as
+    // the Auto Detect it gets rather than a value missing from the list.
+    const showsAutoFallback = !showsEnglishFallback && sttProvider === 'deepgram' && storedLanguageUnsupported;
+    const displayedSttGroup = showsEnglishFallback ? 'English' : showsAutoFallback ? 'Auto' : selectedSttGroup;
+    const displayedRecognitionLanguage = showsEnglishFallback ? 'english-us' : showsAutoFallback ? 'auto' : recognitionLanguage;
 
     // Helper to get variants for current group
     const currentGroupVariants = Object.entries(availableLanguages)
@@ -2342,15 +2359,14 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                         <div className="w-64 bg-bg-sidebar flex flex-col border-r border-border-subtle">
                             <button
                                 onClick={onClose}
-                                className="self-start ml-2 mt-2 mb-1 p-1.5 rounded-md text-text-tertiary hover:text-text-primary transition-colors"
+                                className="self-start ml-2 mt-2 p-1.5 rounded-md text-text-tertiary hover:text-text-primary transition-colors"
                                 title={t('Close')}
                                 aria-label={t('Close')}
                             >
                                 <X size={15} />
                             </button>
-                            <div className="px-5 pt-2 pb-3 overflow-y-auto flex-1 min-h-0">
-                                <h2 className="mb-0 text-[13px] font-bold uppercase tracking-[0.01em] text-text-primary">{t('Settings')}</h2>
-                                <nav className="mt-2 space-y-1">
+                            <div className="px-5 pt-0 pb-3 overflow-y-auto flex-1 min-h-0">
+                                <nav className="space-y-1" aria-label={t('Settings')}>
                                     <button
                                         onClick={() => setActiveTab('general')}
                                         className={navItemClass(activeTab === 'general')}
@@ -2393,25 +2409,18 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                         <Mic size={16} /> {t('Audio')}
                                     </button>
                                     <button
-                                        onClick={() => setActiveTab('calendar')}
-                                        className={navItemClass(activeTab === 'calendar')}
-                                    >
-                                        {activeTab === 'calendar' && navActivePill}
-                                        <Calendar size={16} /> {t('Calendar')}
-                                    </button>
-                                    <button
-                                        onClick={() => setActiveTab('connections')}
-                                        className={navItemClass(activeTab === 'connections')}
-                                    >
-                                        {activeTab === 'connections' && navActivePill}
-                                        <Plug size={16} /> {t('Connections')}
-                                    </button>
-                                    <button
                                         onClick={() => setActiveTab('skills')}
                                         className={navItemClass(activeTab === 'skills')}
                                     >
                                         {activeTab === 'skills' && navActivePill}
                                         <Folder size={16} /> {t('Skills')}
+                                    </button>
+                                    <button
+                                        onClick={() => setActiveTab('calendar')}
+                                        className={navItemClass(activeTab === 'calendar')}
+                                    >
+                                        {activeTab === 'calendar' && navActivePill}
+                                        <Calendar size={16} /> {t('Calendar')}
                                     </button>
                                     <button
                                         onClick={() => setActiveTab('keybinds')}
@@ -2420,7 +2429,6 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                         {activeTab === 'keybinds' && navActivePill}
                                         <Keyboard size={16} /> {t('Keybinds')}
                                     </button>
-
                                     <button
                                         onClick={() => setActiveTab('phone-mirror')}
                                         className={navItemClass(activeTab === 'phone-mirror')}
@@ -2428,7 +2436,13 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                         {activeTab === 'phone-mirror' && navActivePill}
                                         <Smartphone size={16} /> {t('Companion')}
                                     </button>
-
+                                    <button
+                                        onClick={() => setActiveTab('connections')}
+                                        className={navItemClass(activeTab === 'connections')}
+                                    >
+                                        {activeTab === 'connections' && navActivePill}
+                                        <Plug size={16} /> {t('Connectors')}
+                                    </button>
                                     <button
                                         onClick={() => setActiveTab('intelligence')}
                                         className={navItemClass(activeTab === 'intelligence')}
@@ -2436,8 +2450,6 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                         {activeTab === 'intelligence' && navActivePill}
                                         <Cpu size={16} /> {t('Intelligence')}
                                     </button>
-
-
                                     <button
                                         onClick={() => setActiveTab('help')}
                                         className={navItemClass(activeTab === 'help', 'text-[13px]')}
@@ -2445,7 +2457,6 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                         {activeTab === 'help' && navActivePill}
                                         <HelpCircle size={16} /> {t('Setup & Help')}
                                     </button>
-
                                     <button
                                         onClick={() => setActiveTab('about')}
                                         className={navItemClass(activeTab === 'about')}
@@ -2456,7 +2467,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                 </nav>
                             </div>
 
-                            <div className="mt-auto py-4 px-6 border-t border-border-subtle">
+                            <div className="mt-auto py-4 px-6">
                                 <button
                                     onClick={() => window.electronAPI.quitApp()}
                                     className="w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-red-400 hover:bg-red-500/10 transition-colors flex items-center gap-3"
@@ -4092,7 +4103,9 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                             {/* Language and its Accent share one row: the accent
                                                 is a refinement of the language beside it, and two short
                                                 selects stacked full-width left most of each card empty. */}
-                                            <div className={currentGroupVariants.length > 1 ? 'grid grid-cols-2 gap-4' : ''}>
+                                            {/* On macOS, System Audio Capture sits beside Language, paired
+                                                like Input and Output Device; Accent then drops under Language. */}
+                                            <div className={isMac || currentGroupVariants.length > 1 ? 'grid grid-cols-2 gap-4 items-start' : ''}>
                                                 <CustomSelect
                                                     label={t("Language")}
                                                     value={displayedSttGroup}
@@ -4108,6 +4121,33 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                     disabled={languageLocked}
                                                     badges={appleLanguageBadges?.group}
                                                 />
+
+                                                {/* System Audio Capture (the SCK backend) — macOS only. The ScreenCaptureKit
+                                                    backend is a CoreAudio alternative implemented in the
+                                                    Rust speaker module under #[cfg(target_os="macos")];
+                                                    Windows audio runs via WASAPI loopback so the toggle
+                                                    has no meaning there and routing "sck" as a device id
+                                                    silently breaks system audio (issue #252 audit / F-003). */}
+                                                {isMac && (
+                                                    /* A CustomSelect card like Language beside it (uppercase label,
+                                                       one control). It was a tile/title/switch card titled "SCK
+                                                       Backend" — the internal name — with a two-line description; a
+                                                       picker names both choices and shows which is on. App reads the
+                                                       flag when a meeting starts, so a change applies from the next one. */
+                                                    <CustomSelect
+                                                        label={t('System Audio Capture')}
+                                                        value={useExperimentalSck ? 'sck' : 'coreaudio'}
+                                                        options={[
+                                                            { deviceId: 'coreaudio', label: t('Core Audio (default)') },
+                                                            { deviceId: 'sck', label: 'ScreenCaptureKit' },
+                                                        ].map((o) => ({ ...o, kind: 'audiooutput' as MediaDeviceKind, groupId: '', toJSON: () => ({}) }))}
+                                                        onChange={(id) => {
+                                                            const useSck = id === 'sck';
+                                                            setUseExperimentalSck(useSck);
+                                                            window.localStorage.setItem('useExperimentalSckBackend', useSck ? 'true' : 'false');
+                                                        }}
+                                                    />
+                                                )}
 
                                                 {/* Variant/Accent Selector (Conditional) — greyed out when the
                                                     active local model's language conditioning is region-neutral
@@ -4298,29 +4338,24 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                     <p className="text-xs text-text-secondary">{t('This model transcribes English only.')}</p>
                                                 </div>
                                             )}
-                                            {/* Not while English is fixed: "detected" would be untrue. */}
-                                            {recognitionLanguage === 'auto' && !showsEnglishFallback && (
+                                            {/* Not while English is fixed: "detected" would be untrue. Only
+                                                once a language was actually detected; no placeholder before. */}
+                                            {recognitionLanguage === 'auto' && !showsEnglishFallback && autoDetectedLanguage && (
                                                 <div className="flex gap-2 items-center mt-2 px-1 settings-swap-in">
                                                     <Info size={14} className="text-text-secondary shrink-0" />
                                                     <p className="text-xs text-text-secondary">
-                                                        {autoDetectedLanguage
-                                                            ? (() => {
-                                                                const label = Object.values(availableLanguages).find((l: any) =>
-                                                                    l.bcp47 === autoDetectedLanguage || l.iso639 === autoDetectedLanguage
-                                                                )?.label as string | undefined;
-                                                                return `${t('Auto mode — detected:')} ${label ?? autoDetectedLanguage}`;
-                                                              })()
-                                                            : t('Detected from the first few seconds of audio.')
-                                                        }
+                                                        {(() => {
+                                                            const label = Object.values(availableLanguages).find((l: any) =>
+                                                                l.bcp47 === autoDetectedLanguage || l.iso639 === autoDetectedLanguage
+                                                            )?.label as string | undefined;
+                                                            return `${t('Auto mode — detected:')} ${label ?? autoDetectedLanguage}`;
+                                                        })()}
                                                     </p>
                                                 </div>
                                             )}
                                         </div>
                                     </div>
 
-                                    {/* ── Dictionary Section ── */}
-                                    <SpeechDictionarySettings sttProvider={sttProvider} />
-                                    <RoomSpeakersSettings sttProvider={sttProvider} />
 
                                     {/* ── Audio Configuration Section ── */}
                                     <div>
@@ -4493,42 +4528,8 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                 />
                                             </div>
 
-                                            {/* System Audio Capture (the SCK backend) — macOS only. The ScreenCaptureKit
-                                                backend is a CoreAudio alternative implemented in the
-                                                Rust speaker module under #[cfg(target_os="macos")];
-                                                Windows audio runs via WASAPI loopback so the toggle
-                                                has no meaning there and routing "sck" as a device id
-                                                silently breaks system audio (issue #252 audit / F-003). */}
-                                            {isMac && (
-                                                /* A card like its neighbours: Input Device and Output Device are
-                                                   CustomSelect cards (uppercase label, one control), so the capture
-                                                   method is one too, and the hint under it is the Language card's.
-                                                   It was a tile/title/switch card titled "SCK Backend" — the
-                                                   internal name — with a two-line description; a picker names both
-                                                   choices and shows which is on. App reads the flag when a meeting
-                                                   starts, so a change applies from the next one. */
-                                                <div>
-                                                    <CustomSelect
-                                                        label={t('System Audio Capture')}
-                                                        value={useExperimentalSck ? 'sck' : 'coreaudio'}
-                                                        options={[
-                                                            { deviceId: 'coreaudio', label: t('Core Audio (default)') },
-                                                            { deviceId: 'sck', label: 'ScreenCaptureKit' },
-                                                        ].map((o) => ({ ...o, kind: 'audiooutput' as MediaDeviceKind, groupId: '', toJSON: () => ({}) }))}
-                                                        onChange={(id) => {
-                                                            const useSck = id === 'sck';
-                                                            setUseExperimentalSck(useSck);
-                                                            window.localStorage.setItem('useExperimentalSckBackend', useSck ? 'true' : 'false');
-                                                        }}
-                                                    />
-                                                    <div className="flex gap-2 items-center mt-2 px-1">
-                                                        <Info size={14} className="text-text-secondary shrink-0" />
-                                                        <p className="text-xs text-text-secondary">
-                                                            {t("Try ScreenCaptureKit if the other side isn't transcribed.")}
-                                                        </p>
-                                                    </div>
-                                                </div>
-                                            )}
+                                            {/* ── Dictionary ── under the devices, above the mute row. */}
+                                            <SpeechDictionarySettings sttProvider={sttProvider} />
 
                                             {/* Follow the meeting app's mute: while Zoom, Teams or Meet shows
                                                 you muted, your mic is transcribed as silence. Natively only
@@ -4594,6 +4595,20 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                     />
                                                 </div>
                                             </div>
+
+                                            {/* Room speakers and the meeting app's mic close the page, each in
+                                                its own card like the mute and Dictation rows above. */}
+                                            <div className={SETTINGS_CARD}>
+                                                <RoomSpeakersSettings sttProvider={sttProvider} />
+                                            </div>
+                                            {/* macOS only: macOS 14+ names the device a call app is using.
+                                                Windows reports no device name, so the setting could never take
+                                                effect there (followMicDevice.ts; FollowMicDevice2026_10_16 test). */}
+                                            {isMac && (
+                                                <div className={SETTINGS_CARD}>
+                                                    <FollowMicDeviceSettings />
+                                                </div>
+                                            )}
                                         </div>
                                     </div>
                                 </div>
@@ -4626,7 +4641,10 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                             )}
 
                             {activeTab === 'intelligence' && (
-                                <IntelligenceSettings />
+                                <>
+                                    <AboutYouSettings />
+                                    <IntelligenceSettings />
+                                </>
                             )}
 
                             {activeTab === 'help' && (

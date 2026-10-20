@@ -1233,6 +1233,7 @@ import { GoogleSTT } from "./audio/GoogleSTT"
 import { RestSTT } from "./audio/RestSTT"
 import { DeepgramStreamingSTT } from "./audio/DeepgramStreamingSTT"
 import { isIntelligenceFlagEnabled } from "./intelligence/intelligenceFlags"
+import { canDiarize, shouldDiarize, withVoiceEpoch } from "./audio/sttDiarization"
 import { buildJudgePrompt } from "./intelligence/autoAnswer/AutoAnswerJudge"
 import { SimpleAutoAnswerEngine } from "./intelligence/autoAnswer/SimpleAutoAnswer"
 import { AutoAnswerUsageTelemetry } from "./intelligence/autoAnswer/AutoAnswerUsageTelemetry"
@@ -3739,6 +3740,29 @@ export class AppState {
   public disposeAutoAnswerForShutdown(): void {
   }
 
+  /**
+   * Voice labels (sttDiarization.ts) follow the user's choice, and only it:
+   * the mic when "People sharing your microphone" (Settings › Audio) is on;
+   * the meeting audio only behind the speakerDiarizationV1 flag (default off,
+   * Auto Answer's judge, Deepgram only as before). Off otherwise, in both directions. Providers are
+   * built once and reused across meetings, so a choice made at build time
+   * outlived the setting (turned off, labels were still asked for; turned on,
+   * nothing until a restart). Called for a fresh provider and at every meeting
+   * start, before the streams open, so applying it never reconnects. Any
+   * provider that can label voices on a live stream takes it: Natively
+   * (through its relay), Deepgram, Soniox; the rest are left alone.
+   */
+  private applyVoiceLabels(stt: unknown, speaker: 'interviewer' | 'user'): void {
+    if (!canDiarize(stt)) return;
+    try {
+      stt.setDiarization(shouldDiarize(speaker, {
+        roomSpeakers: SettingsManager.getInstance().get('roomSpeakersEnabled') === true,
+        // The flag's scope is unchanged: Deepgram only, as it always was.
+        remoteFlag: stt instanceof DeepgramStreamingSTT && isIntelligenceFlagEnabled('speakerDiarizationV1'),
+      }));
+    } catch { /* flag / setting read non-fatal: labels stay as they were */ }
+  }
+
   private createSTTProvider(speaker: 'interviewer' | 'user'): STTProvider | null {
     const { CredentialsManager } = require('./services/CredentialsManager');
     const sttProvider = CredentialsManager.getInstance().getSttProvider();
@@ -3784,21 +3808,9 @@ export class AppState {
       const apiKey = CredentialsManager.getInstance().getDeepgramApiKey();
       if (apiKey) {
         console.log(`[Main] Using DeepgramStreamingSTT for ${speaker}`);
-        const dg = new DeepgramStreamingSTT(apiKey, CredentialsManager.getInstance().getSttModel('deepgram'));
-        // Opt-in diarization (#3): on the remote/system channel ('interviewer'), where
-        // multiple people may speak, behind the flag. On the mic channel only when the
-        // user turned on "people sharing your microphone" (Settings, Audio): a room's
-        // voices then carry provider ids and are split at save (meeting/roomSpeakers.ts).
-        // Otherwise the mic stays undiarized: it is one person, and diarizing it would
-        // add cost with no benefit. Both default OFF.
-        try {
-          if (speaker === 'interviewer' && isIntelligenceFlagEnabled('speakerDiarizationV1')) {
-            dg.setDiarization(true);
-          } else if (speaker === 'user' && SettingsManager.getInstance().get('roomSpeakersEnabled') === true) {
-            dg.setDiarization(true);
-          }
-        } catch { /* flag / setting read non-fatal */ }
-        stt = dg;
+        // Voice labels, when asked for, are switched on below for every
+        // provider that can label voices (sttDiarization.ts).
+        stt = new DeepgramStreamingSTT(apiKey, CredentialsManager.getInstance().getSttModel('deepgram'));
       } else {
         console.warn(`[Main] No API key for Deepgram STT, falling back to GoogleSTT`);
         stt = new GoogleSTT(speaker);
@@ -3931,13 +3943,9 @@ export class AppState {
       try { (stt as any).setContext(currentWhisperGlossaryPrompt()); } catch { /* a hint, never a blocker */ }
     }
 
-    // Speaker labels for Auto Answer's judge come from the provider's own
-    // diarization where it is on: Deepgram with the speakerDiarizationV1 flag
-    // (set where the Deepgram instance is built, above), and the Natively relay
-    // when it sends a speaker. A blanket `setDiarize(true)` used to sit here; no
-    // provider has that method (Deepgram's is setDiarization), so it never ran,
-    // and switching diarization on for every Deepgram meeting would change the
-    // live path and its cost without the flag's opt-in. Removed 2026-10-15.
+    // Voice labels: off unless asked for (applyVoiceLabels). Applied here for
+    // a fresh provider and again at every meeting start.
+    this.applyVoiceLabels(stt, speaker);
 
     // Auto Answer V3 provider endpoints (Deepgram speech_final / UtteranceEnd,
     // Soniox <end>, OpenAI server VAD). Interviewer channel only; additive
@@ -3973,12 +3981,19 @@ export class AppState {
 
     // Wire Transcript Events. One handler for the provider's segments and,
     // while it is down, its stand-in's (sttFailover.ts; `sttId` says whose).
-    const onSegment = (segment: { text: string, isFinal: boolean, confidence: number, speakerId?: string }, sttId: string = effectiveSttId) => {
+    const onSegment = (segment: { text: string, isFinal: boolean, confidence: number, speakerId?: string, voiceEpoch?: number }, sttId: string = effectiveSttId) => {
       // Accept transcripts while a meeting is active OR while we're draining
       // trailing finals after Stop. `_isDraining` covers the ~250 ms grace
       // window between Stop click and STT socket close so the user's last
       // sentence isn't silently dropped.
       if (!this.isMeetingActive && !this._isDraining) return;
+
+      // Mic voice ids carry the provider connection they came from: voice
+      // numbers restart on a reconnect (sttDiarization.withVoiceEpoch). The
+      // meeting-audio channel keeps the plain id its consumers read.
+      const speakerId = segment.speakerId && speaker === 'user'
+        ? withVoiceEpoch(segment.speakerId, segment.voiceEpoch)
+        : segment.speakerId;
 
       if (this.isMeetingActive) this.meetingAutoStop.noteTranscript(speaker, segment.text, segment.isFinal);
       // Any text proves the connection works: closes an open outage (sttGapRecovery.ts).
@@ -3986,7 +4001,7 @@ export class AppState {
 
       this.intelligenceManager.handleTranscript({
         speaker: speaker,
-        ...(segment.speakerId ? { speakerId: segment.speakerId } : {}),
+        ...(speakerId ? { speakerId } : {}),
         text: segment.text,
         timestamp: Date.now(),
         final: segment.isFinal,
@@ -4035,7 +4050,7 @@ export class AppState {
 
       const payload = {
         speaker: speaker,
-        ...(segment.speakerId ? { speakerId: segment.speakerId } : {}),
+        ...(speakerId ? { speakerId } : {}),
         text: segment.text,
         timestamp: Date.now(),
         final: segment.isFinal,
@@ -4120,7 +4135,7 @@ export class AppState {
       failover.stop();
       return rawStop();
     };
-    stt.on('transcript', (segment: { text: string, isFinal: boolean, confidence: number, speakerId?: string }) => {
+    stt.on('transcript', (segment: { text: string, isFinal: boolean, confidence: number, speakerId?: string, voiceEpoch?: number }) => {
       // While a stand-in leads, the primary's partials wait; its first final
       // means it is back (and is dropped when the stand-in already said it).
       if (!failover.acceptPrimary(segment)) return;
@@ -5360,6 +5375,40 @@ export class AppState {
       return builtIn ? { id: builtIn.id, name: builtIn.name } : undefined;
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * Follow the meeting app's microphone (Settings › Audio, off by default):
+   * when the user has NOT pinned an input device, and a call app is capturing
+   * from a named device, capture from the same one. Returns the device id to
+   * open, which is `requested` unchanged whenever the feature is off, a device
+   * is pinned, the OS does not name the app's device (macOS < 14, Windows), or
+   * the app's device is not one we can open. Our own capture only; one shot at
+   * meeting start. REQUIRES physical verification: that a CoreAudio device name
+   * opens as the same cpal device.
+   */
+  private followedInputDeviceId(requested?: string | null): string | null | undefined {
+    try {
+      if (SettingsManager.getInstance().get('followMeetingAppMicDevice') !== true) return requested;
+      const norm = this.normalizeDeviceId(requested);
+      const userPinned = !!norm && norm.toLowerCase() !== 'default';
+      if (userPinned) return requested;
+      const { meetingAppInputDevice, deviceToFollow } = require('./services/meetingDetection/followMicDevice') as typeof import('./services/meetingDetection/followMicDevice');
+      const micUsers = (loadNativeModule() as any)?.getMicUsers?.() ?? null;
+      const target = meetingAppInputDevice(process.platform, micUsers, { pid: process.pid, execPath: process.execPath });
+      if (!target) return requested;
+      // Only a device we actually enumerate as an input, matched by name.
+      const known = AudioDevices.getInputDevices().some((d) => d.id.toLowerCase() === target.toLowerCase() || d.name.toLowerCase() === target.toLowerCase());
+      const follow = deviceToFollow({ enabled: true, userPinned: false, currentDeviceId: norm ?? 'default', target });
+      if (follow && known) {
+        console.log(`[Main] Following the meeting app's microphone: "${target}"`);
+        return target;
+      }
+      return requested;
+    } catch (e: any) {
+      console.warn('[Main] follow-mic-device skipped:', e?.message);
+      return requested;
     }
   }
 
@@ -7176,10 +7225,21 @@ export class AppState {
             progress: 30,
             message: 'Iniciando captura de audio...',
           });
+          // Voice labels follow Settings › Audio as it is NOW, not as it was
+          // when these (reused) providers were built (applyVoiceLabels). FIRST,
+          // before anything below can start a stream: the meeting is already
+          // active, so reconfigureAudio() starts the channels itself, and a
+          // label change on a live stream restarts it and can lose the
+          // meeting's opening words. A provider that does not exist yet gets
+          // the setting when it is built.
+          this.applyVoiceLabels(this.googleSTT, 'interviewer');
+          this.applyVoiceLabels(this.googleSTT_User, 'user');
 
           // Check for audio configuration preference
           if (metadata?.audio) {
-            await this.reconfigureAudio(metadata.audio.inputDeviceId, metadata.audio.outputDeviceId);
+            // Follow the meeting app's microphone when the setting is on and no device is pinned (no-op otherwise).
+            const followedInput = this.followedInputDeviceId(metadata.audio.inputDeviceId);
+            await this.reconfigureAudio(followedInput, metadata.audio.outputDeviceId);
             if (!isCurrentMeeting()) {
               abortStaleAudioInit();
               return;
@@ -7354,6 +7414,8 @@ export class AppState {
         if (report.meetingKey) meta.callMeetingKey = report.meetingKey;
         if (report.participantCount !== null) meta.callParticipantCount = report.participantCount;
       }
+      // The app's own recording indicator, saved with the meeting (read-only).
+      if (report && report.recording !== null) liveMeta().callRecording = report.recording;
       // The meeting the window names, as a live meeting: SessionCalendarLinker
       // links the event whose link is this one, whatever else overlaps it.
       liveMeetings.set(DESKTOP_CALL_LIVE_SOURCE, report?.meetingKey ? [{
@@ -10372,6 +10434,8 @@ if (process.env.THINKING_MATRIX === '1') {
   // model call (talking points) runs only on the user's button, through the
   // provider routing the notes use, and only when the notes may go there.
   configureAssistService({
+    // Gmail (Settings › Connectors): recent threads with the attendees, when connected and allowed. [] otherwise.
+    recentEmails: (emails) => require('./services/outputs/gmailIpc').gmailBriefContext(emails),
     loadMeetings: (sinceMs) => {
       try { return require('./db/DatabaseManager').DatabaseManager.getInstance().getMeetingsWithNotesSince(sinceMs, 400); } catch { return []; }
     },
@@ -11075,7 +11139,13 @@ if (process.env.THINKING_MATRIX === '1') {
   // returns. If one outlasts the bound the quit goes ahead anyway.
   let localEmbeddingQuitDrainStarted = false;
   const LOCAL_EMBEDDING_QUIT_DRAIN_MS = 5_000;
-  const ONNX_WORKER_QUIT_WAIT_MS = 3_000;
+  // A worker reads the stop request only once its current native call returns.
+  // Measured per call on an M4 (2026-10-14): Whisper Medium encoder ~4.3 s,
+  // Large v3 Turbo 8-11 s, both on 4 threads; slower machines take longer, and
+  // loading a large model is one call too. Quitting before it returns aborts
+  // the app, so the bound covers the slowest model this app offers. Idle
+  // workers exit in milliseconds, so an ordinary quit is not slowed.
+  const ONNX_WORKER_QUIT_WAIT_MS = 15_000;
   /** True when the quit was deferred; before-quit returns and re-runs on app.quit(). */
   const deferQuitForLocalEmbeddingDrain = (event: Electron.Event): boolean => {
     if (localEmbeddingQuitDrainStarted) return false;
