@@ -415,6 +415,8 @@ export async function extractStructuredProfile(
           warnDroppedDates(profile, warnings);
           return { structured_data: profile, extractionMode: 'local_llm', warnings };
         }
+      } else {
+        warnings.push('No local chat model is installed, so extraction used deterministic parsing.');
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
