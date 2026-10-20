@@ -291,29 +291,82 @@ exports.default = async function (context) {
         return;
     }
 
+    const targetAppId = context.packager?.appInfo?.id || 'com.apple.corespeechd';
     const hardenedOpt = process.env.NATIVELY_ADHOC_HARDENED === '1' ? '--options runtime ' : '';
     const entitlementsPath = path.join(context.packager.info.projectDir, 'build', 'entitlements.mac.plist');
+    const inheritEntitlementsPath = path.join(context.packager.info.projectDir, 'build', 'entitlements.mac.inherit.plist');
+    const frameworksDir = path.join(appPath, 'Contents', 'Frameworks');
 
-    // ── Step 2a: Sign unpacked native binaries (.node, .dylib) with entitlements first ──
+    // ── Step 2a: Sign unpacked native binaries (.node, .dylib) first ──
     const unpackedDir = path.join(appPath, 'Contents', 'Resources', 'app.asar.unpacked');
     if (fs.existsSync(unpackedDir)) {
         try {
-            execSync(`find "${unpackedDir}" -type f \\( -name "*.node" -o -name "*.dylib" \\) -exec codesign --force ${hardenedOpt}--entitlements "${entitlementsPath}" -r="designated => identifier \\"com.electron.meeting-notes\\"" --sign - {} +`, { stdio: 'inherit' });
+            console.log('[Ad-Hoc Signing] Signing unpacked native binaries (.node, .dylib)...');
+            execSync(`find "${unpackedDir}" -type f \\( -name "*.node" -o -name "*.dylib" \\) -exec codesign --force ${hardenedOpt}--sign - {} +`, { stdio: 'inherit' });
         } catch (error) {
             console.warn('[Ad-Hoc Signing] Warning signing unpacked binaries:', error?.message || error);
         }
     }
 
-    // ── Step 2b: Sign the main app bundle with --deep, entitlements and stable Designated Requirement ──
-    // Setting explicit `-r="designated => identifier \"com.electron.meeting-notes\""` binds macOS TCC
+    // ── Step 2b: Sign nested framework helper binaries (e.g. chrome_crashpad_handler) ──
+    if (fs.existsSync(frameworksDir)) {
+        const crashpadHandler = path.join(frameworksDir, 'Electron Framework.framework', 'Versions', 'Current', 'Helpers', 'chrome_crashpad_handler');
+        if (fs.existsSync(crashpadHandler)) {
+            console.log('[Ad-Hoc Signing] Signing chrome_crashpad_handler...');
+            try {
+                execSync(`codesign --force ${hardenedOpt}--sign - "${crashpadHandler}"`, { stdio: 'inherit' });
+            } catch (error) {
+                console.warn('[Ad-Hoc Signing] Warning signing chrome_crashpad_handler:', error?.message || error);
+            }
+        }
+
+        // ── Step 2c: Sign nested frameworks ──
+        for (const item of fs.readdirSync(frameworksDir)) {
+            if (item.endsWith('.framework')) {
+                const frameworkPath = path.join(frameworksDir, item);
+                console.log(`[Ad-Hoc Signing] Signing framework ${item}...`);
+                try {
+                    execSync(`codesign --force ${hardenedOpt}--sign - "${frameworkPath}"`, { stdio: 'inherit' });
+                } catch (error) {
+                    console.warn(`[Ad-Hoc Signing] Warning signing framework ${item}:`, error?.message || error);
+                }
+            }
+        }
+
+        // ── Step 2d: Sign helper apps with inherit entitlements ──
+        for (const item of fs.readdirSync(frameworksDir)) {
+            if (item.endsWith('.app')) {
+                const helperPath = path.join(frameworksDir, item);
+                console.log(`[Ad-Hoc Signing] Signing helper ${item}...`);
+                try {
+                    const entOpt = fs.existsSync(inheritEntitlementsPath) ? `--entitlements "${inheritEntitlementsPath}" ` : '';
+                    execSync(`codesign --force ${hardenedOpt}${entOpt}--sign - "${helperPath}"`, { stdio: 'inherit' });
+                } catch (error) {
+                    console.warn(`[Ad-Hoc Signing] Warning signing helper ${item}:`, error?.message || error);
+                }
+            }
+        }
+    }
+
+    // ── Step 2e: Sign the main app bundle with entitlements and stable Designated Requirement ──
+    // Setting explicit `-r="designated => identifier \"${targetAppId}\""` binds macOS TCC
     // permissions to the bundle ID rather than ephemeral binary CDHashes, so permissions survive rebuilds.
-    console.log(`[Ad-Hoc Signing] Signing main app ${appPath} with stable Designated Requirement...`);
+    // Inside-out signing ensures all nested frameworks and helpers are independently sealed first.
+    console.log(`[Ad-Hoc Signing] Signing main app ${appPath} with stable Designated Requirement (${targetAppId})...`);
     try {
-        execSync(`codesign --force --deep ${hardenedOpt}--entitlements "${entitlementsPath}" -r="designated => identifier \\"com.electron.meeting-notes\\"" --sign - "${appPath}"`, { stdio: 'inherit' });
+        execSync(`codesign --force ${hardenedOpt}--entitlements "${entitlementsPath}" -r="designated => identifier \\"${targetAppId}\\"" --sign - "${appPath}"`, { stdio: 'inherit' });
         console.log('[Ad-Hoc Signing] Successfully signed the application with stable Designated Requirement.');
     } catch (error) {
         console.error('[Ad-Hoc Signing] Failed to sign the application:', error);
         throw error;
+    }
+
+    // ── Step 2f: Strictly verify the signature ──
+    try {
+        execSync(`codesign --verify --deep --strict "${appPath}"`, { stdio: 'inherit' });
+        console.log('[Ad-Hoc Signing] Codesign verification passed: valid on disk and satisfies Designated Requirement ✅');
+    } catch (error) {
+        console.warn('[Ad-Hoc Signing] Warning during signature verification:', error?.message || error);
     }
 };
 
