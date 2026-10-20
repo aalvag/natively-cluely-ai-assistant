@@ -199,7 +199,7 @@ function splitIntoSections(content: string): Map<string, string[]> {
       if (!sections.has(current)) sections.set(current, []);
       continue;
     }
-    sections.get(current)!.push(line);
+    sections.get(current)?.push(line);
   }
 
   return sections;
