@@ -7471,7 +7471,6 @@ export class AppState {
     if (this.isMeetingActive && ((started.mic && this.microphoneCapture) || (started.system && this.systemAudioCapture))) {
       this.setMeetingWithoutAudio(false);
     }
-    }
     return started;
   }
 
