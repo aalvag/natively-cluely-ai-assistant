@@ -1,4 +1,5 @@
 import path from 'path';
+import { ONNX_MAC_UNSUPPORTED_MESSAGE, onnxRuntimeSupportedOnThisMac } from './onnxMacSupport';
 import fs from 'fs';
 import type { WhisperModelId, WhisperModelInfo } from './types';
 import { isCorruptModelFailure } from './loadFailure';
@@ -11,6 +12,21 @@ export const MODEL_CATALOG: WhisperModelInfo[] = [
   //     Encoder caching + decoder state reuse. English-only. Best choice for live use.
   { id: 'onnx-community/moonshine-tiny-ONNX', name: 'Moonshine Tiny',  sizeMb: 26,   speed: 'very-fast', accuracy: 'good',      multilingual: false, status: 'missing', streaming: true },
   { id: 'onnx-community/moonshine-base-ONNX', name: 'Moonshine Base',  sizeMb: 60,   speed: 'very-fast', accuracy: 'very-high', multilingual: false, status: 'missing', streaming: true },
+
+  // ── Parakeet TDT v2 — English only. Same export layout and engine as v3
+  //     below (only the vocabulary differs: 1024 tokens vs 8192, read from
+  //     vocab.txt), and more accurate on English: 2.1% vs 2.5% WER on
+  //     LibriSpeech test-clean in FluidAudio's published benchmark. CC-BY-4.0.
+  {
+    id: 'istupakov/parakeet-tdt-0.6b-v2-onnx',
+    name: 'Parakeet TDT 0.6B v2',
+    sizeMb: 661,
+    speed: 'very-fast',
+    accuracy: 'very-high',
+    multilingual: false,
+    status: 'missing',
+    sessionLayout: 'parakeet-tdt',
+  },
 
   // ── Parakeet — NVIDIA FastConformer TDT v3, Multilingual (25 European languages).
   //     Token-and-Duration Transducer architecture with duration-skipping decoding,
@@ -177,9 +193,25 @@ function catalogEntry(modelId: string): WhisperModelInfo | undefined {
   return MODEL_CATALOG.find(m => m.id === modelId);
 }
 
-/** The repo a model is downloaded from: its `repoId`, or the id itself. */
+// Test seam for the Parakeet repo choice below (see parakeet/aneBackend.ts).
+export { setParakeetBackendDepsForTesting } from './parakeet/aneBackend';
+
+/**
+ * Parakeet TDT on a Mac that can run it on the Neural Engine: the CoreML
+ * repo, which becomes the download target while the ONNX files under the id
+ * stay a working older copy (like a Whisper `repoId` with legacyFilesUsable).
+ * undefined everywhere else, where the ONNX files under the id are the model.
+ */
+function parakeetCoreMlRepo(modelId: string): string | undefined {
+  const ane = require('./parakeet/aneBackend') as typeof import('./parakeet/aneBackend');
+  const model = ane.PARAKEET_CORE_ML_MODELS[modelId];
+  if (!model) return undefined;
+  return ane.resolveParakeetBackend().backend === 'coreml-ane' ? model.download.repo : undefined;
+}
+
+/** The repo a model is downloaded from: the Parakeet CoreML repo above, its `repoId`, or the id itself. */
 export function getModelDownloadRepo(modelId: string): string {
-  return catalogEntry(modelId)?.repoId ?? modelId;
+  return parakeetCoreMlRepo(modelId) ?? catalogEntry(modelId)?.repoId ?? modelId;
 }
 
 /**
@@ -187,6 +219,8 @@ export function getModelDownloadRepo(modelId: string): string {
  * then the files a previous version left under the id, when they still work.
  */
 function candidateRepos(modelId: string): string[] {
+  const coreml = parakeetCoreMlRepo(modelId);
+  if (coreml) return [coreml, modelId];
   const m = catalogEntry(modelId);
   if (!m?.repoId || m.repoId === modelId) return [modelId];
   return m.legacyFilesUsable ? [m.repoId, modelId] : [m.repoId];
@@ -194,7 +228,11 @@ function candidateRepos(modelId: string): string[] {
 
 /** Every directory this model's files may sit in, used ones or not. */
 function allRepoDirsFor(modelId: string, cacheDir: string): string[] {
-  return [...new Set([getModelDownloadRepo(modelId), modelId])].map(r => repoDir(cacheDir, r));
+  // A Parakeet CoreML copy is removed with the model even where this machine
+  // would not use it (the helper went missing, the profile moved Macs).
+  const ane = require('./parakeet/aneBackend') as typeof import('./parakeet/aneBackend');
+  const coreml = ane.PARAKEET_CORE_ML_MODELS[modelId]?.download.repo;
+  return [...new Set([getModelDownloadRepo(modelId), modelId, ...(coreml ? [coreml] : [])])].map(r => repoDir(cacheDir, r));
 }
 
 // Maps `dtype` keyword to the ONNX filename suffix the loader will look for.
@@ -345,7 +383,16 @@ export const PARAKEET_TDT_REQUIRED_FILES = [
   'config.json',
 ] as const;
 
-function isParakeetModelCached(modelDir: string): boolean {
+/**
+ * `repo` is the folder being checked: a Parakeet CoreML repo (Neural Engine,
+ * see parakeetCoreMlRepo) holds the CoreML bundles; any other holds the ONNX
+ * files.
+ */
+function isParakeetModelCached(modelDir: string, modelId: string, repo: string): boolean {
+  const ane = require('./parakeet/aneBackend') as typeof import('./parakeet/aneBackend');
+  if (ane.parakeetCoreMlModelForRepo(repo)?.modelId === modelId) {
+    return ane.isParakeetCoreMlCached(modelDir, modelId);
+  }
   return PARAKEET_TDT_REQUIRED_FILES.every(f => {
     try { return fs.statSync(path.join(modelDir, f)).size > 0; } catch { return false; }
   });
@@ -427,6 +474,10 @@ export function isModelUpgradeAvailable(
   dtype?: string | Record<string, string>,
   cacheDir: string = getModelsDir(),
 ): boolean {
+  // Parakeet on a Neural Engine Mac: an ONNX install works, and the CoreML
+  // copy is the upgrade (several times faster, and off the CPU).
+  const coreml = parakeetCoreMlRepo(modelId);
+  if (coreml) return !isRepoCached(modelId, coreml, dtype, cacheDir) && isRepoCached(modelId, modelId, dtype, cacheDir);
   const m = catalogEntry(modelId);
   if (!m?.repoId || m.repoId === modelId || !m.legacyFilesUsable) return false;
   return !isRepoCached(modelId, m.repoId, dtype, cacheDir) && isRepoCached(modelId, modelId, dtype, cacheDir);
@@ -464,7 +515,7 @@ function isRepoCached(
 
   const sessionLayout = catalogEntry(modelId)?.sessionLayout;
   if (sessionLayout === 'nemotron-rnnt') return isNemotronModelCached(modelDir);
-  if (sessionLayout === 'parakeet-tdt') return isParakeetModelCached(modelDir);
+  if (sessionLayout === 'parakeet-tdt') return isParakeetModelCached(modelDir, modelId, repo);
 
   if (!dtype) {
     try { return fs.readdirSync(modelDir).length > 0; } catch { return false; }
@@ -498,8 +549,45 @@ export function getResumableDownloadFiles(modelId: string, dtype: string | Recor
   const m = catalogEntry(modelId);
   const layout = m?.sessionLayout;
   if (!m || layout === 'nemotron-rnnt' || layout === 'parakeet-tdt' || layout === 'single') return [];
-  const { encoder, encoderData, decoderOptions } = expectedOnnxFiles(dtype, m.externalDataFormat, layout);
-  return [encoder, ...encoderData, ...decoderOptions[0]].map(f => `onnx/${f}`);
+  return loadedOnnxFiles(dtype, m.externalDataFormat, layout).map(f => `onnx/${f}`);
+}
+
+/**
+ * The files in `onnx/` that transformers.js loads under the init `dtype`: the
+ * encoder (or the one `model` of a 'single' layout) and the merged decoder,
+ * with their external-data companions. transformers.js 3.8.1 never loads the
+ * split decoder pair, so it is not listed. For the default mixed map that is
+ * `encoder_model.onnx` + `decoder_model_merged_quantized.onnx`.
+ *
+ * The worker's load diagnostics stat these. They used to build the names
+ * themselves and, for a mixed map, named `decoder_model_merged.onnx` (not
+ * there) with size -1 (issue #668).
+ */
+export function loadedOnnxFiles(
+  dtype: string | Record<string, string>,
+  externalDataFormat?: boolean | Record<string, boolean>,
+  sessionLayout?: WhisperModelInfo['sessionLayout'],
+): string[] {
+  const layout = sessionLayout === 'single' ? 'single' : undefined;
+  const { encoder, encoderData, decoderOptions } = expectedOnnxFiles(dtype, externalDataFormat, layout);
+  return [encoder, ...encoderData, ...decoderOptions[0]];
+}
+
+/**
+ * The local models the settings select, catalog ids only: the global one
+ * (Tiny English when unset, as a meeting start reads it), plus the mic and
+ * system ones when per-channel models are on. Startup preload and the
+ * background update (legacyCopyUpgrade.ts) both read it.
+ */
+export function selectedLocalModelIds(get: (key: string) => unknown): string[] {
+  const ids: unknown[] = [get('localWhisperModel') ?? 'Xenova/whisper-tiny.en'];
+  if (get('localWhisperPerChannelEnabled')) ids.push(get('localWhisperModelMic'), get('localWhisperModelSystem'));
+  return [...new Set(ids.filter((id): id is string => typeof id === 'string' && MODEL_CATALOG_IDS.has(id)))];
+}
+
+/** The `onnx/` folder of one repo's copy in the models cache. */
+export function onnxDirFor(cacheDir: string, repo: string): string {
+  return path.join(repoDir(cacheDir, repo), 'onnx');
 }
 
 /**
@@ -543,17 +631,13 @@ export function getAvailableModels(): WhisperModelInfo[] {
   // (Monterey) and earlier the dylib load fails with "Symbol not found:
   // __ZNSt3__18to_charsEPcS0_d". Surface a clear error so users don't waste
   // time downloading models that will immediately crash.
-  if (process.platform === 'darwin') {
-    const release = (require('os') as typeof import('os')).release(); // e.g. "21.x.x" = macOS 12
-    const darwinMajor = parseInt(release.split('.')[0], 10);
-    // Darwin 22 = macOS 13 Ventura. Darwin 21 = macOS 12 Monterey.
-    if (Number.isNaN(darwinMajor) || darwinMajor < 22) {
-      return MODEL_CATALOG.filter(m => !m.hidden).map(m => ({
-        ...m,
-        status: 'error' as const,
-        errorMessage: 'Requires macOS 13 Ventura or later. Local models are not supported on macOS 12 (Monterey) or earlier.',
-      }));
-    }
+  // (13.3 precisely; see onnxMacSupport.ts.)
+  if (!onnxRuntimeSupportedOnThisMac()) {
+    return MODEL_CATALOG.filter(m => !m.hidden).map(m => ({
+      ...m,
+      status: 'error' as const,
+      errorMessage: ONNX_MAC_UNSUPPORTED_MESSAGE,
+    }));
   }
 
   // Resolve the active dtype lazily — avoids importing inferenceConfig at
@@ -564,10 +648,14 @@ export function getAvailableModels(): WhisperModelInfo[] {
   return MODEL_CATALOG.filter(m => !m.hidden).flatMap(m => {
     const cached = isModelCached(m.id, dtype);
     if (m.installedOnly && !cached) return [];
+    const upgradeAvailable = cached && dtype !== undefined && isModelUpgradeAvailable(m.id, dtype);
     return [{
       ...m,
+      // The copy on disk while an older one is installed (Settings adds these
+      // up as the installed total), else what a download fetches.
+      sizeMb: upgradeAvailable ? m.sizeMb : downloadSizeMb(m),
       status: cached ? 'available' as const : 'missing' as const,
-      upgradeAvailable: cached && dtype !== undefined && isModelUpgradeAvailable(m.id, dtype),
+      upgradeAvailable,
     }];
   });
 }
@@ -580,7 +668,14 @@ export function getAvailableModels(): WhisperModelInfo[] {
  */
 export function getModelSizeBytes(modelId: string): number {
   const m = MODEL_CATALOG.find(x => x.id === modelId);
-  return m ? Math.round(m.sizeMb * 1024 * 1024) : 0;
+  return m ? Math.round(downloadSizeMb(m) * 1024 * 1024) : 0;
+}
+
+/** What a download of `m` fetches: the CoreML files for Parakeet on a Neural Engine Mac, else the catalog size. */
+function downloadSizeMb(m: WhisperModelInfo): number {
+  if (!parakeetCoreMlRepo(m.id)) return m.sizeMb;
+  const ane = require('./parakeet/aneBackend') as typeof import('./parakeet/aneBackend');
+  return ane.parakeetCoreMlSizeMb(m.id) ?? m.sizeMb;
 }
 
 /** Catalog size in MB, or undefined for an unknown id (callers then use the flat memory floor). */
@@ -672,8 +767,14 @@ function supersededModelCacheDirs(
 ): string[] {
   if (!dtype) return [];
   return MODEL_CATALOG
-    .filter(m => m.repoId && m.repoId !== m.id && m.legacyFilesUsable)
-    .filter(m => isRepoCached(m.id, m.repoId!, dtype, cacheDir))
+    .filter(m => {
+      // Parakeet on a Neural Engine Mac: the ONNX files under the id are the
+      // older copy once the CoreML one is installed (~660 MB nothing opens).
+      const coreml = parakeetCoreMlRepo(m.id);
+      if (coreml) return isRepoCached(m.id, coreml, dtype, cacheDir);
+      return !!m.repoId && m.repoId !== m.id && !!m.legacyFilesUsable
+        && isRepoCached(m.id, m.repoId, dtype, cacheDir);
+    })
     .map(m => m.id);
 }
 

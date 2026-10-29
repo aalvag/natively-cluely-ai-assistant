@@ -7,6 +7,7 @@ import {
   Code,
   Copy,
   Check,
+  Crop,
   Globe,
   HelpCircle,
   History,
@@ -19,7 +20,6 @@ import {
   MicOff,
   NotebookPen,
   Pencil,
-  PointerOff,
   Quote,
   RefreshCw,
   SlidersHorizontal,
@@ -35,6 +35,7 @@ import { categorizeSttError } from '../lib/sttErrorMapper';
 import { splitGistLine, splitGistLineStreaming, collapseBlockGaps } from '../lib/displayMarkup';
 
 import type { SkillSummary } from '../types/electron';
+import { copyText } from '../lib/copyText';
 
 function SkillPicker({
   skills,
@@ -189,9 +190,7 @@ const CodeBlockChrome = ({ lang, code }: { lang: string; code: string }) => {
   }, []);
 
   const handleCopy = () => {
-    const p = navigator.clipboard?.writeText(code);
-    if (!p) return;
-    p.then(() => {
+    copyText(code).then(() => {
       setCopied(true);
       if (timer.current) clearTimeout(timer.current);
       timer.current = setTimeout(() => setCopied(false), 2000);
@@ -315,6 +314,8 @@ import {
 import { decideStreamingHeightCommit } from '../lib/streamingHeightDecision.mjs';
 import { mergeTranscriptChunks } from '../lib/transcriptMerge.mjs';
 import { createTranscriptTailWaiter } from '../lib/answerTailWait.mjs';
+import { audioWarningAction } from '../lib/audioWarningAction.mjs';
+import { backspace, deleteWord, editCommand, editShortcutLetter, isWordDelete, paste, pastedText, typed } from '../lib/stealthEdit.mjs';
 import {
   applyWhatToAnswerNullFeedbackMessages,
   finalizeStreamingByIntentMessages,
@@ -398,6 +399,9 @@ import {
   type DirectAssistFallbackHop,
   type DirectAssistFallbackNotice,
 } from '../lib/directAssistFailure.mjs';
+import { addAttachment, revealsOverlay, withoutFormulaImages } from '../lib/attachmentTray.mjs';
+import { imageFilesFromDrop, overlayPasteAction } from '../lib/overlayImageDrop.mjs';
+import { shouldSkipLiveRagForChatFollowUp } from '../lib/liveRagFollowUpGate.mjs';
 import {
   applyFirstStreamingToken,
   commitStreamingFlush,
@@ -461,8 +465,11 @@ import { genMessageId } from '../utils/messageId';
 import { mapLanguageForPrism, isBlockCode } from '../utils/prismLanguage';
 import { registerPrismLanguages } from '../utils/registerPrismLanguages';
 import { useShortcuts } from '../hooks/useShortcuts';
+import ClickThroughToggle from './ui/ClickThroughToggle';
 import { analytics, detectProviderType, reportAnswerFailed } from '../lib/analytics/analytics.service';
-import type { MeetingInterfaceTheme } from '../lib/meetingInterfaceTheme';
+import { interfaceThemeSurface, isCssOwnedInterfaceTheme, type MeetingInterfaceTheme } from '../lib/meetingInterfaceTheme';
+import { overlayRowOf, useOverlayButtonOrder, type OverlayButtonId } from '../lib/overlayButtonOrder';
+import { OVERLAY_BUTTONS } from './overlay/overlayButtons';
 import {
   getGlassOverlayAppearance,
   getOverlayAppearance,
@@ -489,9 +496,11 @@ import ChromeFold from './overlay/ChromeFold';
 import { useOverlayTrial } from './overlay/useOverlayTrial';
 import { TrialChip, TrialNoticeBanner } from './overlay/TrialNotice';
 import { AutoStopNoticeBanner, useMeetingAutoStopNotice } from './overlay/AutoStopNotice';
+import { useAmbientChatMeeting } from './overlay/AmbientChatNotice';
 import { LastTimeRecapBanner, useLastTimeRecap } from './overlay/LastTimeRecapNotice';
 import type { LiveHelperAction } from '../types/assist';
 import { useMeetingMute } from './overlay/useMeetingMute';
+import { HeroGlassButton } from './overlay/heroGlass/HeroGlassButton';
 
 // PERF: hoisted plugin arrays. ReactMarkdown receives `remarkPlugins` and
 // `rehypePlugins` as new array literals if defined inline at the call site —
@@ -1079,6 +1088,8 @@ export const StreamingHighlightedCode = React.memo(
 interface MessageRowProps {
   msg: Message;
   isLightTheme: boolean;
+  /** Lavender: your question is the hero's lavender pill (overlay/heroGlass). */
+  isLavenderTheme?: boolean;
   appearance: any;
   renderMessageText: (msg: Message) => React.ReactNode;
 }
@@ -1225,6 +1236,7 @@ const MessageRow = React.memo(
   function MessageRow({
     msg,
     isLightTheme,
+    isLavenderTheme = false,
     appearance: _appearance,
     renderMessageText,
   }: MessageRowProps) {
@@ -1274,7 +1286,9 @@ const MessageRow = React.memo(
               }
               ${
                 msg.role === 'user'
-                  ? isLightTheme
+                  ? isLavenderTheme
+                    ? 'hlg-button hlg-lavender hlg-sm hero-bubble'
+                    : isLightTheme
                     ? 'bg-blue-500/10 backdrop-blur-md border border-blue-500/20 text-blue-900 rounded-[20px] rounded-tr-[4px] shadow-sm font-medium'
                     : 'bg-blue-600/20 backdrop-blur-md border border-blue-500/30 text-blue-100 rounded-[20px] rounded-tr-[4px] shadow-sm font-medium'
                   : ''
@@ -1461,6 +1475,7 @@ const MessageRow = React.memo(
   (prev, next) =>
     prev.msg === next.msg &&
     prev.isLightTheme === next.isLightTheme &&
+    prev.isLavenderTheme === next.isLavenderTheme &&
     prev.appearance === next.appearance &&
     prev.renderMessageText === next.renderMessageText,
 );
@@ -1475,9 +1490,14 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   overlayOpacity = OVERLAY_OPACITY_DEFAULT,
   interfaceTheme = 'default',
 }) => {
-  const isLightTheme = useResolvedTheme() === 'light';
+  // Lavender paints a light panel under the dark app theme too, so every
+  // light/dark class choice below follows the panel, not the app.
+  const isLightTheme = interfaceTheme === 'lavender' || useResolvedTheme() === 'light';
   const isGlassTheme = interfaceTheme === 'liquid-glass';
   const isModernTheme = interfaceTheme === 'modern';
+  // Lavender draws its buttons with the website hero's own button
+  // (overlay/heroGlass), not the chip classes the other styles share.
+  const isLavenderTheme = interfaceTheme === 'lavender';
   const shellRef = React.useRef<HTMLDivElement>(null);
   const t = useT();
   const [isExpanded, setIsExpanded] = useState(true);
@@ -1485,11 +1505,24 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   const trial = useOverlayTrial();
   // The automatic stop's "stops in 1 minute" notice, and typing reported to main.
   const autoStop = useMeetingAutoStopNotice();
+  // Ambient AI Chat: this meeting captures no audio (overlay/AmbientChatNotice.tsx).
+  const ambientChat = useAmbientChatMeeting();
+  // Such a meeting says so from its start ("Mic is off"). ✕ hides it until the
+  // mic button is pressed; it drops when the meeting gets audio (main clears
+  // ambientChat.on), and the next audio-less meeting shows it again.
+  const [ambientMicDismissed, setAmbientMicDismissed] = useState(false);
+  useEffect(() => {
+    if (!ambientChat.on) setAmbientMicDismissed(false);
+  }, [ambientChat.on]);
+  const showAmbientMicNotice = ambientChat.on && !ambientMicDismissed;
   // "Last time" for a recurring meeting (overlay/LastTimeRecapNotice.tsx).
   const lastTime = useLastTimeRecap();
   // Muted in Zoom / Teams / Meet: the mic is transcribed as silence (main: MeetingMuteSync).
   const meetingMute = useMeetingMute();
   const [inputValue, setInputValue] = useState('');
+  // Latest committed value, for the mount-only stealth key listener's copy/cut.
+  const inputValueRef = useRef('');
+  inputValueRef.current = inputValue;
   const [availableSkills, setAvailableSkills] = useState<SkillSummary[]>([]);
   const [skillPickerIndex, setSkillPickerIndex] = useState(0);
   const { shortcuts, isShortcutPressed, conflicts: shortcutConflicts, globalShortcutsEnabled } = useShortcuts();
@@ -1570,6 +1603,16 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // looked broken ("Screenshot attached" with no explanation, 2026-08-18).
   const [captureFallback, setCaptureFallback] = useState<
     import('../types/electron').PageCaptureFallbackNotice & { at: number } | null
+  >(null);
+
+  // #647 Problem A: the last screenshot answer came back as an assessment
+  // refusal and was retried with the capture cropped to the browser's page
+  // area. `refusalRetry.cropped` says a crop was made and the banner below
+  // suggests a selective screenshot; `improved` says the retry answered and
+  // the banner's "Answer re-asked" line tells the user the answer they see
+  // is the retried one.
+  const [refusalRetryNotice, setRefusalRetryNotice] = useState<
+    { at: number; cropped: boolean; improved: boolean } | null
   >(null);
 
   // The structured capture (Smart Browser Context v2) that arrived with the last
@@ -1729,6 +1772,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           // A page context arrived — retire any stale "fell back to screenshot"
           // notice so the pills can't contradict each other.
           setCaptureFallback(null);
+          // An earlier capture's formula images number another page's formulas.
+          setAttachedContext((prev) => withoutFormulaImages(prev));
           setPageContext({
             title: meta?.title?.trim() || hostnameFromUrl(meta?.url) || 'Captured page',
             url: meta?.url,
@@ -2064,6 +2109,24 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // the state so the captured-key handler can early-out without depending
   // on React's render cycle for stop signals.
   const [stealthTapActive, setStealthTapActive] = useState<boolean>(false);
+  // Ctrl/Cmd+A while stealth typing selects the whole box (it has no caret, so
+  // "everything" is the only selection); the next keystroke replaces it. Ref for
+  // the mount-only key listener, state to paint the highlight.
+  const stealthAllSelectedRef = useRef(false);
+  const stealthSelectedValueRef = useRef('');
+  const [stealthAllSelected, setStealthAllSelectedState] = useState(false);
+  const markStealthAllSelected = useCallback((on: boolean) => {
+    stealthAllSelectedRef.current = on;
+    stealthSelectedValueRef.current = on ? inputValueRef.current : '';
+    setStealthAllSelectedState(on);
+  }, []);
+  // A selection ends with the session, and with the text it covered: Esc, a
+  // submit, or any other path that puts new text in the box.
+  useEffect(() => {
+    if (stealthAllSelectedRef.current && (!stealthTapActive || inputValue !== stealthSelectedValueRef.current)) {
+      markStealthAllSelected(false);
+    }
+  }, [stealthTapActive, inputValue, markStealthAllSelected]);
   const stealthTapActiveRef = useRef<boolean>(false);
   const caretMirrorRef = useRef<HTMLDivElement>(null);
   // While the stealth hook is engaged the input is never DOM-focused (always
@@ -2204,9 +2267,9 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   const sessionCapturesRef = useRef<Array<{ path: string; preview: string; timestamp: number }>>([]);
 
   // Latent Context State (Screenshots attached but not sent)
-  const [attachedContext, setAttachedContext] = useState<Array<{ path: string; preview: string }>>(
-    [],
-  );
+  const [attachedContext, setAttachedContext] = useState<
+    Array<{ path: string; preview: string; formulaCapture?: string }>
+  >([]);
   // Phone Mirror: preview → path of every screenshot the tray held lately, so a
   // sent question card (which keeps only previews) can name its screenshots.
   const phoneShotPathsRef = useRef(new Map<string, string>());
@@ -2406,39 +2469,11 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     };
   }, []);
 
-  // Dynamic Action Button Mode (Recap vs Brainstorm)
-  const [actionButtonMode, setActionButtonMode] = useState<'recap' | 'brainstorm'>('recap');
-  // The shortcut listeners further down subscribe once and read the slot
-  // through this ref, as they read their handlers through handlersRef. Read
-  // from the closure it was always the first render's 'recap', so Cmd/Ctrl+3
-  // ran Recap with the button showing Brainstorm (2026-10-10).
-  const actionButtonModeRef = useRef(actionButtonMode);
-  actionButtonModeRef.current = actionButtonMode;
-
-  useEffect(() => {
-    // Load persisted mode
-    window.electronAPI
-      ?.getActionButtonMode?.()
-      ?.then((mode: 'recap' | 'brainstorm') => {
-        if (mode) setActionButtonMode(mode);
-      })
-      .catch(() => {});
-
-    // Listen for live changes from SettingsPopup / IPC
-    const unsubscribe = window.electronAPI?.onActionButtonModeChanged?.(
-      (mode: 'recap' | 'brainstorm') => {
-        setActionButtonMode(mode);
-      },
-    );
-    return () => {
-      unsubscribe?.();
-    };
-  }, []);
-
-  const useDarkCodeTheme = !isLightTheme || isGlassTheme || isModernTheme;
-  // Glass and modern keep a dark panel under the light app theme, so only the
-  // default interface theme ever puts the chat's content on a light surface.
-  const isLightSurface = isLightTheme && !isGlassTheme && !isModernTheme;
+  // Glass and modern keep a dark panel under the light app theme and lavender
+  // a light one under the dark theme; only default follows the app.
+  const isLightSurface = interfaceThemeSurface(interfaceTheme, isLightTheme ? 'light' : 'dark') === 'light';
+  // Lavender keeps the website theme's dark code well on its light panel.
+  const useDarkCodeTheme = !isLightSurface || isLavenderTheme;
   const codeTheme = useDarkCodeTheme ? vividDarkCodeTheme : oneLight;
   const codeLineNumberColor = useDarkCodeTheme ? VIVID_DARK_LINE_NUMBER_COLOR : 'rgba(24,24,24,0.4)';
   // Header only shows for the light theme and the modern/glass interface
@@ -2446,13 +2481,13 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // [data-interface-theme] variables) — the new vivid-black default dark
   // theme drops the header row in favor of a floating hover-reveal language
   // tag + copy button (see HighlightedCode / StreamingHighlightedCode).
-  const showCodeHeader = !useDarkCodeTheme || isModernTheme || isGlassTheme;
+  const showCodeHeader = !useDarkCodeTheme || isModernTheme || isGlassTheme || isLavenderTheme;
   const appearance = useMemo(
     () =>
-      isGlassTheme
+      isCssOwnedInterfaceTheme(interfaceTheme)
         ? getGlassOverlayAppearance()
         : getOverlayAppearance(overlayOpacity, isLightTheme ? 'light' : 'dark'),
-    [overlayOpacity, isLightTheme, isGlassTheme],
+    [overlayOpacity, isLightTheme, interfaceTheme],
   );
   const overlayPanelClass = 'overlay-text-primary';
   const codeBlockClass = 'overlay-code-block-surface';
@@ -2762,18 +2797,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // new is that the slack now also exists on the VERTICAL axis, and at the
   // panel's fully expanded width.
   const SHELL_WIDTH_EXPANDED = WINDOW_WIDTH - OVERLAY_PANEL_INSET * 2;
-  // The quick-action row's single-line width in EACH mode, measured from two
-  // hidden copies of the row (0 until the first measure). The collapsed panel
-  // grows past its default only as far as the row needs, so Interview Mode's
-  // Brainstorm chip never pushes Answer onto a second line in any language.
+  // The quick-action row's single-line width, measured from a hidden copy of
+  // the row (0 until the first measure). The collapsed panel grows past its
+  // default only as far as the row needs, so the five buttons picked in
+  // Settings › Overlay never push one onto a second line in any language.
   // See the measuring effect after handleManualResizeToggle.
-  const [quickRowNeeds, setQuickRowNeeds] = useState({ recap: 0, brainstorm: 0 });
-  // The mode whose chip label is ON SCREEN. It trails actionButtonMode: a
-  // longer label waits for the panel to make room, and a shorter one is swapped
-  // in before the panel narrows. Until they agree the panel holds the wider of
-  // the two, so the row never wraps mid-change.
-  const [shownActionMode, setShownActionMode] = useState(actionButtonMode);
-  const quickRowNeed = Math.max(quickRowNeeds[actionButtonMode], quickRowNeeds[shownActionMode]);
+  const [quickRowNeed, setQuickRowNeed] = useState(0);
   const SHELL_WIDTH_COLLAPSED = collapsedWidthForRow(
     collapsedWidthFor(SHELL_WIDTH_EXPANDED),
     SHELL_WIDTH_EXPANDED,
@@ -3054,6 +3083,22 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         });
         setIsExpanded(true);
       }
+    });
+    return () => unsub?.();
+  }, []);
+
+  // A route flow (default-output change, device-mismatch switch, Settings
+  // reconfigure) just rebuilt the system capture on a working device, so a
+  // terminal "system audio gave up" banner describes a capture that no longer
+  // exists. Only terminal ones: a non-terminal warning (e.g. "meeting audio is
+  // on another device") may still be true, and is shown once per meeting.
+  // Permission banners are left alone — a rebuild fixes neither.
+  useEffect(() => {
+    const unsub = window.electronAPI?.onDeviceSelectionApplied?.((payload) => {
+      if (payload.kind !== 'output' || payload.fellBack) return;
+      setSystemAudioWarning((w) => (
+        w?.kind === 'audio-capture-failure' && w.channel === 'system' && w.terminal ? null : w
+      ));
     });
     return () => unsub?.();
   }, []);
@@ -3682,11 +3727,34 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       });
       if (decision.action === 'none') return;
       if (decision.action === 'snap') {
+        // A stopped tween never runs its onComplete, so the observer hold it
+        // armed and its settle are lost with it. The first quick-action answer
+        // is that case: the answer starts streaming mid-expand ('streaming'
+        // snap), grows the panel while every observer report is skipped, and
+        // the hold then expires on its timer with nothing left to report.
+        // Traced live: a 310px window under a 352px panel, footer cut off,
+        // until the next press re-measured. Do what onComplete does.
+        // The target is set before the window lead is awaited, the tween ref
+        // only once it runs; a snap in that gap leaves the same hold behind.
+        const interruptedTween =
+          viewportTweenRef.current !== null || viewportTweenTargetRef.current !== null;
         viewportTweenRef.current?.stop();
         viewportTweenRef.current = null;
         viewportTweenTargetRef.current = null;
         viewportAppliedRef.current = decision.height;
         viewportHeight.set(decision.height);
+        // A width transition owns the hold and settles it itself; so does a drag.
+        if (interruptedTween && !animationControlsRef.current && !isResizingRef.current) {
+          heightReportSuppressedUntilRef.current = 0;
+          requestAnimationFrame(() => {
+            measureVerticalCapRef.current?.();
+            const settled = contentRef.current?.offsetHeight ?? 0;
+            if (settled > 0) {
+              resizeOverlayWindow(settled);
+              syncStreamingHeightBaseline(settled);
+            }
+          });
+        }
         return;
       }
       // Already travelling to exactly this height — let it finish rather than
@@ -4264,59 +4332,51 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   }, [shellWidth, startTransition, SHELL_WIDTH_COLLAPSED, SHELL_WIDTH_EXPANDED]);
 
   // ── Collapsed width follows the quick-action row ──────────────────────────
-  // Interview Mode swaps Recap for Brainstorm, and in several languages that
-  // chip is long enough to push Answer onto a second line at the default
-  // collapsed width. So the row is measured from layout and the collapsed
-  // width grows to fit it (collapsedWidthForRow: never below the default,
-  // never above the expanded width). English with Inter fits the default and
-  // never moves.
+  // The row holds whichever five buttons Settings › Overlay put there, and in
+  // several languages a long pick (What did I miss?, Brainstorm) pushes the
+  // last chip onto a second line at the default collapsed width. So the row is
+  // measured from layout and the collapsed width grows to fit it
+  // (collapsedWidthForRow: never below the default, never above the expanded
+  // width). English with Inter and the default five fits the default.
+  const overlayButtonOrder = useOverlayButtonOrder();
+  const overlayRow = overlayRowOf(overlayButtonOrder);
   const quickRowRef = useRef<HTMLDivElement>(null);
-  const recapRowMeasureRef = useRef<HTMLDivElement>(null);
-  const brainstormRowMeasureRef = useRef<HTMLDivElement>(null);
+  const rowMeasureRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const row = quickRowRef.current;
     const card = shellRef.current;
-    const recapRow = recapRowMeasureRef.current;
-    const brainstormRow = brainstormRowMeasureRef.current;
-    if (!row || !card || !recapRow || !brainstormRow || typeof ResizeObserver === 'undefined') return;
+    const measureRow = rowMeasureRef.current;
+    if (!row || !card || !measureRow || typeof ResizeObserver === 'undefined') return;
     const px = (v: string) => parseFloat(v) || 0;
     const measure = () => {
-      // The hidden rows are the real chips laid out on one line at their
-      // natural width, so their width IS the single-line need; add the card
+      // The hidden row is the real chips laid out on one line at their
+      // natural width, so its width IS the single-line need; add the card
       // chrome around the row (its borders: card width minus row width).
       const chrome = px(getComputedStyle(card).width) - px(getComputedStyle(row).width);
-      const next = {
-        recap: px(getComputedStyle(recapRow).width) + chrome,
-        brainstorm: px(getComputedStyle(brainstormRow).width) + chrome,
-      };
-      setQuickRowNeeds((prev) =>
-        Math.abs(prev.recap - next.recap) < 0.25 && Math.abs(prev.brainstorm - next.brainstorm) < 0.25
-          ? prev
-          : next,
-      );
+      const next = px(getComputedStyle(measureRow).width) + chrome;
+      setQuickRowNeed((prev) => (Math.abs(prev - next) < 0.25 ? prev : next));
     };
     measure();
-    // Fires on language changes and when Inter finishes loading over the
-    // fallback font. Neither the mode nor Answer/Stop moves these rows.
+    // Fires on language changes, when Inter finishes loading over the
+    // fallback font, and when Settings › Overlay changes the row's buttons.
+    // Answer/Stop does not move this row.
     const ro = new ResizeObserver(measure);
-    ro.observe(recapRow);
-    ro.observe(brainstormRow);
+    ro.observe(measureRow);
     return () => ro.disconnect();
   }, []);
 
   // When the collapsed width changes, move a panel that is resting at (or
   // heading to) the old collapsed width onto the new one. Expanded, dragged
-  // and custom widths are left alone. Only an Interview Mode change animates —
-  // the width follows the mode in the same render, so that is known exactly;
-  // the first measure and a late-loading font snap, inside the reflow they
-  // come with. A spring already in flight is redirected, never stopped: its
-  // completion is what settles the window height.
-  const quickRowModeKey = `${actionButtonMode}|${shownActionMode}`;
-  const appliedModeKeyRef = useRef(quickRowModeKey);
+  // and custom widths are left alone. Only a change of the row's buttons
+  // animates; the first measure and a late-loading font snap, inside the
+  // reflow they come with. A spring already in flight is redirected, never
+  // stopped: its completion is what settles the window height.
+  const quickRowKey = overlayRow.join('|');
+  const appliedRowKeyRef = useRef(quickRowKey);
   const appliedCollapsedRef = useRef(SHELL_WIDTH_COLLAPSED);
   useLayoutEffect(() => {
-    const modeDriven = appliedModeKeyRef.current !== quickRowModeKey;
-    appliedModeKeyRef.current = quickRowModeKey;
+    const rowDriven = appliedRowKeyRef.current !== quickRowKey;
+    appliedRowKeyRef.current = quickRowKey;
     const previous = appliedCollapsedRef.current;
     appliedCollapsedRef.current = SHELL_WIDTH_COLLAPSED;
     if (previous === SHELL_WIDTH_COLLAPSED) return;
@@ -4329,43 +4389,13 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     if (manualWidthOverrideRef.current !== null) {
       manualWidthOverrideRef.current = SHELL_WIDTH_COLLAPSED;
     }
-    if (inFlight || (modeDriven && hasRenderedExpandedRef.current)) {
+    if (inFlight || (rowDriven && hasRenderedExpandedRef.current)) {
       startTransition(SHELL_WIDTH_COLLAPSED);
       return;
     }
     transitionTargetRef.current = SHELL_WIDTH_COLLAPSED;
     shellWidth.set(SHELL_WIDTH_COLLAPSED);
-  }, [SHELL_WIDTH_COLLAPSED, quickRowModeKey, shellWidth, startTransition]);
-
-  // The chip label the swap is heading to. A longer label waits until the
-  // panel is wide enough for the row; if nothing is widening the panel (it is
-  // expanded, dragged, or the window is too narrow) it swaps at once.
-  const [labelActionMode, setLabelActionMode] = useState(actionButtonMode);
-  useEffect(() => {
-    if (labelActionMode === actionButtonMode) return;
-    const target = actionButtonMode;
-    const fits = () => shellWidth.get() + 0.5 >= quickRowNeeds[target];
-    const swap = () => setLabelActionMode(target);
-    if (fits()) {
-      swap();
-      return;
-    }
-    const unsubscribe = shellWidth.on('change', () => {
-      if (fits()) swap();
-    });
-    const raf = requestAnimationFrame(() => {
-      if (animationControlsRef.current === null) swap();
-    });
-    const timer = setTimeout(swap, 1200);
-    return () => {
-      unsubscribe();
-      cancelAnimationFrame(raf);
-      clearTimeout(timer);
-    };
-  }, [actionButtonMode, labelActionMode, quickRowNeeds, shellWidth]);
-  const handleModeLabelShown = useCallback((key: string) => {
-    setShownActionMode(key === 'brainstorm' ? 'brainstorm' : 'recap');
-  }, []);
+  }, [SHELL_WIDTH_COLLAPSED, quickRowKey, shellWidth, startTransition]);
 
   // ── Free-form resize handles ──────────────────────────────────────────────
   // EAST-side directions only ('e', 's', 'se'). A west-side handle would need
@@ -4852,7 +4882,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         hasContent: messages.length > 0,
         overlayOpacity,
         themeMode: isLightTheme ? 'light' : 'dark',
-        interfaceTheme: isGlassTheme ? 'liquid-glass' : isModernTheme ? 'modern' : 'default',
+        interfaceTheme,
       })
       .catch(() => {});
   }, [
@@ -4861,8 +4891,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     messages.length,
     overlayOpacity,
     isLightTheme,
-    isGlassTheme,
-    isModernTheme,
+    interfaceTheme,
   ]);
 
   useEffect(() => {
@@ -5658,20 +5687,19 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     return () => unsubscribe();
   }, []);
 
-  const handleScreenshotAttach = (data: { path: string; preview: string }) => {
-    setIsExpanded(true);
-    const item = { ...data, timestamp: Date.now() };
+  const handleScreenshotAttach = (data: { path: string; preview: string; formulaCapture?: string; quiet?: boolean }) => {
+    // A phone capture or photo is quiet: it joins the tray (which the phone
+    // shows) without the overlay popping up on the desktop.
+    const { quiet, ...item } = data;
+    if (revealsOverlay({ quiet })) setIsExpanded(true);
+
+    const sessionItem = { path: data.path, preview: data.preview, timestamp: Date.now() };
     sessionCapturesRef.current = [
       ...sessionCapturesRef.current.filter((s) => s.path !== data.path),
-      item,
+      sessionItem,
     ].slice(-5);
 
-    setAttachedContext((prev) => {
-      // Prevent duplicates and cap at 5
-      if (prev.some((s) => s.path === data.path)) return prev;
-      const updated = [...prev, data];
-      return updated.slice(-5); // Keep last 5
-    });
+    setAttachedContext((prev) => addAttachment(prev, item));
   };
 
   // STT Status listener — must survive isExpanded changes.
@@ -8117,6 +8145,14 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           if (streamingIntentRef.current === data.mode) flushToken();
           discardEmptyPlaceholder(data.mode);
         }
+        // A follow-up's placeholder is named for its refinement ('shorten',
+        // 'rephrase', ...), not for the engine's 'follow_up' mode: it is the
+        // live stream's intent while that refinement is in flight.
+        const refining = streamingIntentRef.current;
+        if (data.mode === 'follow_up' && refining && overlayActionInFlightRef.current.has(`follow_up:${refining}`)) {
+          flushToken();
+          discardEmptyPlaceholder(refining);
+        }
         // What to Answer sometimes words its own failure: for a provider
         // failure the engine follows this event with a sentence as the answer.
         // The notice is posted regardless, so a failure is never silent, and
@@ -8173,6 +8209,13 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       attachedContext.map(({ path, preview }) => ({ path, preview })),
     );
   }, [attachedContext]);
+
+  // Phone Mirror's Answer chip toggles this recording, so the phone shows it
+  // too: Stop while recording, Answer again once it ends. Reported on every
+  // change, including the false on mount, which clears one left by a reload.
+  useEffect(() => {
+    window.electronAPI?.phoneMirrorSetRecording?.(isManualRecording);
+  }, [isManualRecording]);
 
   // The phone took one off its tray (it shows this tray), so it leaves here.
   useEffect(() => {
@@ -8267,7 +8310,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     const questionCardId = genMessageId();
     let currentAttachments = attachedContext;
     if (pending && !currentAttachments.some((s) => s.path === pending.path)) {
-      currentAttachments = [...currentAttachments, pending].slice(-5);
+      currentAttachments = addAttachment(currentAttachments, pending);
     }
     // Retain multi-screenshot session context (last 15 mins) if no new image was explicitly attached
     if (currentAttachments.length === 0 && sessionCapturesRef.current.length > 0) {
@@ -8470,6 +8513,11 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       setLatestVisionProviderUsed(result.visionProviderUsed);
       setLatestVisionModelUsed(result.visionModelUsed);
       setLatestVisionFailureReason(result.visionFailureReason);
+      // #647 Problem A: an assessment refusal was retried with the capture
+      // cropped to the browser's page area. The banner says what happened
+      // and suggests the selective screenshot for next time; the retried
+      // answer has already replaced the refusal in `result.answer`.
+      setRefusalRetryNotice(result.refusalRetry ? { ...result.refusalRetry, at: Date.now() } : null);
       if (result.answer == null) {
         // A quiet note, not a sentence at reading size where an answer would
         // be: main's own reason when it gives one, ours otherwise.
@@ -8540,8 +8588,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     analytics.trackCommandExecuted('follow_up_' + intent);
 
     try {
-      await window.electronAPI.generateFollowUp(intent);
+      const result = await window.electronAPI.generateFollowUp(intent);
+      // Nothing came back: cancelled, or overtaken by an answer (see
+      // handleClarify). A real failure arrives as onIntelligenceError.
+      if (!result?.refined) discardEmptyPlaceholder(intent);
     } catch (err) {
+      discardEmptyPlaceholder(intent);
       setMessages((prev) => [
         ...prev,
         {
@@ -9351,6 +9403,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         isRecordingRef.current = false;
         answerStopInFlightRef.current = false;
         setIsManualRecording(false);
+        // Told now, ahead of the question below: the [isManualRecording]
+        // effect reports it only after the question has reached main, and the
+        // phone would then add a second Thinking that nothing answers.
+        window.electronAPI?.phoneMirrorSetRecording?.(false);
         setManualTranscript('');
 
         const currentAttachments = attachedContext;
@@ -9474,19 +9530,38 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
         try {
           let prompt = '';
+          // A follow-up skipped past live RAG goes the way typed chat does (V3:
+          // conversation ring + live-meeting evidence). On the caller-owned
+          // speaking prompt it kept the history but lost the transcript the
+          // previous answer came from, and disowned that answer.
+          let followUpViaChat = false;
+
+          // Prior turns only — the new user bubble was just queued via
+          // setMessages, so React state here is still the previous ring.
+          const conversationContextForSubmit = buildConversationContextFromMessages(messages);
+          // A prior user turn is enough: answers are `system` rows, and every
+          // answer follows a user row (typed, spoken or a quick-action label).
+          const hasPriorChat = messages.some((m) => m.role === 'user');
 
           if (currentAttachments.length > 0) {
             prompt = `You are a helper. The user has provided a screenshot and a spoken question/command.
 User said: "${question}"
-
+${conversationContextForSubmit ? `\nPrior conversation context:\n${conversationContextForSubmit}\n` : ''}
 Instructions:
 1. Analyze the screenshot in the context of what the user said.
 2. Provide a direct, helpful answer.
 3. Be concise.`;
           } else {
-            const ragResult = await window.electronAPI.ragQueryLive?.(question);
-            if (ragResult?.success) {
-              return;
+            // Issue #552: live RAG answers from transcript chunks alone and
+            // never sees prior chat. Referential follow-ups skip it and go the
+            // typed-chat route below; self-contained questions still hit
+            // ragQueryLive.
+            followUpViaChat = shouldSkipLiveRagForChatFollowUp(question, { hasPriorChat });
+            if (!followUpViaChat) {
+              const ragResult = await window.electronAPI.ragQueryLive?.(question);
+              if (ragResult?.success) {
+                return;
+              }
             }
 
             prompt = `You are a real-time interview assistant. The user just repeated or paraphrased a question from their interviewer.
@@ -9496,7 +9571,7 @@ Instructions:
 3. Keep the answer conversational but informative (2-4 sentences ideal)
 4. Do NOT include phrases like "The question is..." - just give the answer directly
 5. Format for speaking out loud, not for reading
-
+${conversationContextForSubmit ? `\nPrior conversation context:\n${conversationContextForSubmit}\n` : ''}
 Provide only the answer, nothing else.`;
           }
 
@@ -9512,11 +9587,11 @@ Provide only the answer, nothing else.`;
           await window.electronAPI.streamGeminiChat(
             question,
             currentAttachments.length > 0 ? currentAttachments.map((s) => s.path) : undefined,
-            prompt,
+            followUpViaChat ? conversationContextForSubmit : prompt,
             // `liveQuestion`: a turn of this session (unlike a question about a
             // past meeting), so main decides the diagram contract for it with
             // the design that is on the table.
-            { skipSystemPrompt: true, liveQuestion: true },
+            followUpViaChat ? { liveQuestion: true } : { skipSystemPrompt: true, liveQuestion: true },
           );
         } catch (err) {
           // R-17: a throw from invoke() never reaches the main process, so no
@@ -9554,6 +9629,14 @@ Provide only the answer, nothing else.`;
       // A previous Stop may still be collecting its transcript tail; starting
       // now would wipe voiceInput while that snapshot is being taken.
       if (answerStopInFlightRef.current) return;
+      // Ambient AI Chat: main captured no audio for this meeting, so a
+      // recording would draw "Listening..." with nothing able to arrive in it
+      // (issue #679). Go where a Stop with nothing heard goes (issue #540).
+      if (ambientChat.on) {
+        setAmbientMicDismissed(false);
+        void handlersRef.current.handleWhatToSay();
+        return;
+      }
       setVoiceInput('');
       voiceInputRef.current = '';
       setManualTranscript('');
@@ -9989,7 +10072,7 @@ Provide only the answer, nothing else.`;
             >
               {isThinking ? (
                 <div className="flex items-center min-h-[24px] py-0.5">
-                  <span className="natively-thinking-label text-[13px]">{t('Thinking...')}</span>
+                  <span className="natively-thinking-label text-[13px]">{t('Thinking')}</span>
                 </div>
               ) : (
                 msg.text
@@ -10050,7 +10133,7 @@ Provide only the answer, nothing else.`;
                */}
               {!msg.text && (
                 <div className="flex items-center min-h-[24px] py-0.5">
-                  <span className="natively-thinking-label text-[13px]">{t('Thinking...')}</span>
+                  <span className="natively-thinking-label text-[13px]">{t('Thinking')}</span>
                 </div>
               )}
             </div>
@@ -10617,11 +10700,7 @@ Provide only the answer, nothing else.`;
         handleFollowUpQuestions();
       } else if (isShortcutPressed(e, 'dynamicAction4')) {
         e.preventDefault();
-        if (actionButtonModeRef.current === 'brainstorm') {
-          handleBrainstorm();
-        } else {
-          handleRecap();
-        }
+        handleRecap();
       } else if (isShortcutPressed(e, 'answer')) {
         e.preventDefault();
         handleAnswerNow();
@@ -10828,10 +10907,7 @@ Provide only the answer, nothing else.`;
       // The answer can start before the tray effect records this one.
       phoneShotPathsRef.current.set(data.preview, data.path);
 
-      setAttachedContext((prev) => {
-        if (prev.some((s) => s.path === data.path)) return prev;
-        return [...prev, data].slice(-5);
-      });
+      setAttachedContext((prev) => addAttachment(prev, data));
 
       // Use requestAnimationFrame so we wait for at least one paint cycle —
       // more reliable than setTimeout(0) under React 18 concurrent scheduling.
@@ -10992,10 +11068,8 @@ Provide only the answer, nothing else.`;
       else if (action === 'shorten') handlers.handleFollowUp('shorten');
       else if (action === 'followUp') handlers.handleFollowUpQuestions();
       else if (action === 'recap') handlers.handleRecap();
-      else if (action === 'dynamicAction4') {
-        if (actionButtonModeRef.current === 'brainstorm') handlers.handleBrainstorm();
-        else handlers.handleRecap();
-      } else if (action === 'answer') handlers.handleAnswerNow();
+      else if (action === 'dynamicAction4') handlers.handleRecap();
+      else if (action === 'answer') handlers.handleAnswerNow();
       else if (action === 'clarify') handlers.handleClarify();
       else if (action === 'codeHint') handlers.handleCodeHint();
       else if (action === 'brainstorm') handlers.handleBrainstorm();
@@ -11049,7 +11123,12 @@ Provide only the answer, nothing else.`;
     // listeners see the same binding.
     let escSuppressUntilNextActive = false;
 
-    const unsubState = window.electronAPI.onStealthTapState(({ active, reason }) => {
+    const unsubState = window.electronAPI.onStealthTapState(({ active: anyActive, reason, target }) => {
+      // The hook also types into the notes window (2026-10-20); a session of
+      // its own is the only one the overlay shows or expands for. A notes
+      // session still proves the hook works here.
+      if (anyActive) isCgEventTapAvailableRef.current = true;
+      const active = anyActive && (target ?? 'overlay') === 'overlay';
       stealthTapActiveRef.current = active;
       setStealthTapActive(active);
       if (active) {
@@ -11072,14 +11151,12 @@ Provide only the answer, nothing else.`;
       // CONTRACT WITH RUST: keyboard_tap.rs pass-through filter (R3)
       // returns the event unmodified for ANY system-modifier key
       // (Cmd / Ctrl / Option / Fn) and for ALL F-keys, so the OS
-      // routes those normally to the foreground app. Consequence:
-      // (ev.flags & CMD) is NEVER true here, neither is OPT or CTRL.
-      // The previous round had Cmd+Enter / Cmd+Backspace / Cmd+A /
-      // Option+Backspace branches — all dead code under R3. Removed
-      // to prevent a false sense of feature support; if Rust ever
-      // changes the filter to deliver Cmd events, those branches
-      // need to be REINTRODUCED with explicit testing, not
-      // resurrected from a TODO.
+      // routes those normally to the foreground app. The exceptions
+      // (native-module/src/edit_shortcut.rs, both hooks): Cmd/Ctrl+V/A/C/X
+      // arrive tagged CMD (macOS) or CTRL (Windows), and word delete
+      // arrives as Backspace tagged OPT (macOS) or CTRL (Windows).
+      // Nothing else with a modifier reaches this listener, so there is
+      // no Cmd+Enter or Cmd+Backspace branch.
 
       // Esc handled regardless of active state (main process broadcasts
       // it BEFORE stopping the tap, so we get here while still active;
@@ -11109,9 +11186,46 @@ Provide only the answer, nothing else.`;
       if (!stealthTapActiveRef.current) return; // ignore other events after stop
       if (!ev.isKeyDown) return; // we only act on keyDown
 
+      // Ctrl/Cmd+V/A/C/X: the hooks deliver these instead of passing them to the
+      // foreground app (native-module/src/edit_shortcut.rs). Never typed as text.
+      const editLetter = editShortcutLetter(ev);
+      if (editLetter === 'v') {
+        // Issue #351: text first, then a clipboard image (diagram / PDF
+        // snippet). Excel, Word and PowerPoint put a picture of the copied text
+        // beside the text, so an image-first paste would attach it instead.
+        // attachClipboardImage broadcasts screenshot-attached itself.
+        void (async () => {
+          try {
+            const text = await window.electronAPI.stealthReadClipboard?.();
+            // Not after the session ended (Esc, a submit on macOS), and on top
+            // of any keys typed while the clipboard was read.
+            if (!pastedText(text) && stealthTapActiveRef.current && !escSuppressUntilNextActive) {
+              const result = await window.electronAPI.attachClipboardImage?.();
+              if (result?.error) console.warn('[stealth] pasted image not attached:', result.error);
+              return;
+            }
+            if (!stealthTapActiveRef.current || escSuppressUntilNextActive || !pastedText(text)) return;
+            const allSelected = stealthAllSelectedRef.current;
+            if (allSelected) markStealthAllSelected(false);
+            setInputValue((prev) => paste({ value: prev, allSelected }, text ?? '').value);
+          } catch {
+            /* ignore */
+          }
+        })();
+        return;
+      }
+      if (editLetter) {
+        const next = editCommand({ value: inputValueRef.current, allSelected: stealthAllSelectedRef.current }, editLetter);
+        if (next.copy !== undefined) window.electronAPI.stealthWriteClipboard?.(next.copy).catch(() => {});
+        markStealthAllSelected(next.allSelected);
+        if (next.value !== inputValueRef.current) setInputValue(next.value);
+        return;
+      }
+
       switch (ev.keyCode) {
         case 36: // Return
         case 76: // Numpad Enter
+          markStealthAllSelected(false);
           handleManualSubmitRef.current();
           // macOS parity: on macOS the input holds real DOM focus, so submitting
           // leaves the caret in the box and the user can type the next message
@@ -11123,9 +11237,17 @@ Provide only the answer, nothing else.`;
             window.electronAPI.stealthTapStop().catch(() => {});
           }
           return;
-        case 51: // Backspace — delete one char
-          setInputValue((prev) => prev.slice(0, -1));
+        case 51: { // Backspace — word-delete with the modifier (Ctrl on Windows,
+          // Option on macOS; the hooks tag it), else one char or the whole selection.
+          const wasSelected = stealthAllSelectedRef.current;
+          if (wasSelected) markStealthAllSelected(false);
+          if (isWordDelete(ev)) {
+            setInputValue((prev) => deleteWord({ value: prev, allSelected: wasSelected }).value);
+          } else {
+            setInputValue((prev) => backspace({ value: prev, allSelected: wasSelected }).value);
+          }
           return;
+        }
         // ROUND 4 FIX (#6): Tab (48) and arrows (123-126) used to
         // be no-op'd here. They're now passed through at the Rust
         // layer (keyboard_tap.rs F-key whitelist) so they reach the
@@ -11147,7 +11269,9 @@ Provide only the answer, nothing else.`;
         ev.chars !== '\n' &&
         ev.chars !== '\t'
       ) {
-        setInputValue((prev) => prev + ev.chars);
+        const wasSelected = stealthAllSelectedRef.current;
+        if (wasSelected) markStealthAllSelected(false);
+        setInputValue((prev) => typed({ value: prev, allSelected: wasSelected }, ev.chars).value);
       }
     });
 
@@ -11475,7 +11599,7 @@ Provide only the answer, nothing else.`;
       .filter(Boolean)
       .join('\n');
     try {
-      await navigator.clipboard.writeText(report);
+      await copyText(report);
     } catch {
       const ta = document.createElement('textarea');
       ta.value = report;
@@ -11507,7 +11631,7 @@ Provide only the answer, nothing else.`;
         process around this window. This window is exactly the shell card. */}
     <div
       ref={contentRef}
-      data-interface-theme={isGlassTheme ? 'liquid-glass' : isModernTheme ? 'modern' : 'default'}
+      data-interface-theme={interfaceTheme}
       // CENTERED (mx-auto) in the fixed-width window: the window never
       // width-resizes, so centering is stable — the panel's center (and the
       // pill window centered over this window) never moves as the panel
@@ -11745,37 +11869,20 @@ Provide only the answer, nothing else.`;
                   payload.channel).
                 */
                 const rawTitleKey = systemAudioWarning.titleKey ?? '';
-                const reasonIsMicrophone = rawTitleKey.toLowerCase().includes('microphone');
-                const reasonIsScreenRecording = rawTitleKey
-                  .toLowerCase()
-                  .includes('screen recording');
-                // Neither pane fixes a same-device input/output loop: the user
-                // has to change the OUTPUT device. No verified deep link for
-                // the Sound pane exists in this codebase, so this falls to the
-                // already-wired internal-Settings fallback rather than sending
-                // the user somewhere confidently wrong.
-                const reasonIsAudioDeviceConfig = rawTitleKey
-                  .toLowerCase()
-                  .includes('same device');
-                const wantsMicrophonePane =
-                  reasonIsMicrophone ||
-                  (!reasonIsScreenRecording &&
-                    !reasonIsAudioDeviceConfig &&
-                    systemAudioWarning.kind === 'audio-capture-failure' &&
-                    systemAudioWarning.channel === 'mic');
-                const wantsScreenCapturePane =
-                  !wantsMicrophonePane &&
-                  !reasonIsAudioDeviceConfig &&
-                  (reasonIsScreenRecording ||
-                    systemAudioWarning.kind === 'screen-recording-permission' ||
-                    systemAudioWarning.channel === 'system');
-                const deepLinkUrl = !isMac
-                  ? null
-                  : wantsMicrophonePane
-                  ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone'
-                  : wantsScreenCapturePane
-                  ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'
-                  : null;
+                // Where the one action goes, per platform (audioWarningAction.mjs):
+                // a macOS privacy pane, Windows mic privacy settings, or
+                // Natively Settings → Audio. The old fallback opened the
+                // quick-settings popover off-screen (-10000,-10000), so on
+                // Windows every "Open Settings" did nothing visible.
+                const warningAction = audioWarningAction({
+                  platform: isMac ? 'darwin' : isWindows ? 'win32' : 'other',
+                  kind: systemAudioWarning.kind,
+                  channel: systemAudioWarning.channel,
+                  titleKey: systemAudioWarning.titleKey,
+                  message: systemAudioWarning.message,
+                });
+                const deepLinkUrl = warningAction.type === 'external' ? warningAction.url : null;
+                const wantsMicrophonePane = warningAction.type === 'external' && warningAction.pane === 'microphone';
 
                 // Identity of THIS warning, so visiting a pane for one problem
                 // does not promote the button on a different problem that
@@ -11860,10 +11967,10 @@ Provide only the answer, nothing else.`;
                                 // restart meaningful, so that click is what
                                 // promotes the button.
                                 setPermissionPaneVisited(warningIdentity);
-                              } else {
-                                // Windows / unknown channel / device-config
-                                // faults: fall back to internal Settings.
-                                window.electronAPI?.toggleSettingsWindow?.();
+                              } else if (warningAction.type === 'mic-privacy') {
+                                window.electronAPI?.openMicSettings?.();
+                              } else if (warningAction.type === 'settings-tab') {
+                                window.electronAPI?.openSettingsTab?.(warningAction.tab);
                               }
                             }}
                             title={
@@ -11871,14 +11978,18 @@ Provide only the answer, nothing else.`;
                                 ? wantsMicrophonePane
                                   ? t('Open macOS Microphone privacy settings')
                                   : t('Open macOS Screen Recording privacy settings')
-                                : t('Open Natively Settings')
+                                : warningAction.type === 'mic-privacy'
+                                ? t('Open Windows microphone privacy settings')
+                                : t('Open Natively audio settings')
                             }
                           >
                             {deepLinkUrl
                               ? wantsMicrophonePane
                                 ? t('Open Mic Settings')
                                 : t('Open Screen Settings')
-                              : t('Open Settings')}
+                              : warningAction.type === 'mic-privacy'
+                              ? t('Open Mic Settings')
+                              : t('Open Audio Settings')}
                           </OverlayBannerButton>
                         )}
                         {/*
@@ -11918,6 +12029,32 @@ Provide only the answer, nothing else.`;
                   (overlay/AutoStopNotice.tsx; main: MeetingEndDetector). */}
               <ChromeFold show={autoStop.stopsAt !== null} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-auto-stop">
               {autoStop.stopsAt !== null && <AutoStopNoticeBanner notice={autoStop} />}
+              </ChromeFold>
+
+              {/* An Ambient AI Chat meeting, from its start: users turn the
+                  setting on thinking it is something good, then report the mic
+                  as broken. Say why, and turn it off from here; main starts
+                  the meeting's capture (setAmbientChatEnabled). */}
+              <ChromeFold show={showAmbientMicNotice} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-ambient-mic">
+              {showAmbientMicNotice && (
+                <OverlayBanner
+                  className="mx-4"
+                  tone="warning"
+                  icon={<MicOff strokeWidth={2.2} />}
+                  title={t('Mic is off')}
+                  message={t('Ambient AI Chat is on, so this meeting is not being heard or transcribed.')}
+                  onDismiss={() => setAmbientMicDismissed(true)}
+                  dismissLabel={t('Dismiss')}
+                  actions={
+                    <OverlayBannerButton
+                      variant="primary"
+                      onClick={() => window.electronAPI?.setAmbientChatEnabled?.(false)}
+                    >
+                      {t('Turn on mic')}
+                    </OverlayBannerButton>
+                  }
+                />
+              )}
               </ChromeFold>
 
               {/* PR #173: STT Not Configured Warning Banner */}
@@ -11993,6 +12130,37 @@ Provide only the answer, nothing else.`;
                   message={captureFallback.detail}
                   onDismiss={() => setCaptureFallback(null)}
                   dismissLabel={t('Dismiss page capture notice')}
+                  // The detail sends the user to pair or re-pair the extension
+                  // in Settings → Companion (tab id phone-mirror); take them there.
+                  actions={captureFallback.detail.includes('Settings → Companion') ? (
+                    <OverlayBannerButton
+                      variant="primary"
+                      onClick={() => window.electronAPI?.openSettingsTab?.('phone-mirror')}
+                    >
+                      {t('Open Companion')}
+                    </OverlayBannerButton>
+                  ) : undefined}
+                />
+              )}
+              </ChromeFold>
+
+              {/* #647 Problem A: the screenshot answer came back as an
+                  assessment refusal and was retried with the capture cropped
+                  to the browser's page area. Warning tone: the answer the
+                  user sees is degraded, and the selective screenshot
+                  (⌘/Ctrl+Shift+H) is the way around it. */}
+              <ChromeFold show={!!refusalRetryNotice} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-refusal-retry">
+              {refusalRetryNotice && (
+                <OverlayBanner
+                  className="mx-4"
+                  tone="warning"
+                  icon={<Crop strokeWidth={2.2} />}
+                  title={t('Answer was retried without the browser border')}
+                  message={refusalRetryNotice.improved
+                    ? t('The screenshot included the browser border, which can read as a live test. Answer re-asked with just the page. Next time, crop out the browser with a selective screenshot.')
+                    : t('The screenshot included the browser border, which can read as a live test. Next time, crop out the browser with a selective screenshot.')}
+                  onDismiss={() => setRefusalRetryNotice(null)}
+                  dismissLabel={t('Dismiss')}
                 />
               )}
               </ChromeFold>
@@ -12106,6 +12274,35 @@ Provide only the answer, nothing else.`;
               )}
               </ChromeFold>
 
+              {/* Windows: the same failure (the keyboard hook would not
+                  start) sets this state, but the banner above is macOS-only,
+                  so stealth typing just did nothing. There is no permission
+                  to grant; the usual cause is security software blocking the
+                  low-level hook. */}
+              <ChromeFold show={isWindows && stealthPermissionMissing} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-stealth-hook-blocked">
+              {isWindows && stealthPermissionMissing && (
+                <OverlayBanner
+                  className="mx-4"
+                  data-stealth-ignore="true"
+                  title={t('Stealth Typing Blocked')}
+                  message={t('Windows did not let Natively capture typing. This is usually security software blocking the keyboard hook. Allow Natively there, then try again.')}
+                  onDismiss={() => setStealthPermissionMissing(false)}
+                  dismissLabel={t('Dismiss')}
+                  dismissButtonProps={{ 'data-stealth-ignore': 'true' }}
+                  actions={
+                    <OverlayBannerButton
+                      variant="primary"
+                      onClick={() => { void window.electronAPI.stealthTapStart?.(); }}
+                      title={t('Try to start stealth typing again')}
+                      data-stealth-ignore="true"
+                    >
+                      {t('Try Again')}
+                    </OverlayBannerButton>
+                  }
+                />
+              )}
+              </ChromeFold>
+
               {/* Phase 3 — Dynamic action card row (Cluely-style live triggers).
                                 Appears between status pills and rolling transcript so users see
                                 actionable suggestions in their primary scan path. Bar self-hides
@@ -12198,6 +12395,7 @@ Provide only the answer, nothing else.`;
                       key={msg.id}
                       msg={msg}
                       isLightTheme={isLightTheme}
+                      isLavenderTheme={isLavenderTheme}
                       appearance={appearance}
                       renderMessageText={renderMessageText}
                     />
@@ -12257,7 +12455,7 @@ Provide only the answer, nothing else.`;
                       (m) => m.role === 'system' && m.isStreaming,
                     ) && (
                     <div className="flex justify-start my-2.5 min-h-[24px] items-center">
-                      <span className="natively-thinking-label text-[13px]">{t('Thinking...')}</span>
+                      <span className="natively-thinking-label text-[13px]">{t('Thinking')}</span>
                     </div>
                   )}
                   <div ref={messagesEndRef} />
@@ -12333,7 +12531,7 @@ Provide only the answer, nothing else.`;
                       onClick={handleJumpToLatest}
                       aria-label={t('Jump to latest')}
                       title={t('Jump to latest')}
-                      data-interface-theme={isGlassTheme ? 'liquid-glass' : isModernTheme ? 'modern' : 'default'}
+                      data-interface-theme={interfaceTheme}
                       // NOT overlay-resize-toggle-surface/appearance.shellStyle
                       // despite matching ResizeToggle everywhere else on this
                       // button (motion, size, gloss sheen): that surface is
@@ -12499,17 +12697,14 @@ Provide only the answer, nothing else.`;
                   // not DOM text, so the copies never show up in textContent,
                   // text queries or text search.
                   const ghost = (text: string) => <span className="ov-ghost-label" data-label={text} />;
-                  const modeChipContent = (mode: 'recap' | 'brainstorm') =>
-                    mode === 'brainstorm' ? (
-                      <span className="flex items-center gap-1.5">
-                        <Lightbulb className="w-3 h-3 opacity-70" /> {t('Brainstorm')}
-                      </span>
-                    ) : (
-                      <span className="flex items-center gap-1.5">
-                        <RefreshCw className="w-3 h-3 opacity-70" /> {t('Recap')}
-                      </span>
-                    );
-                  const answerContent = (
+                  // Lavender: the hero's paper pill (hlg-*), icon and label in its slots.
+                  const heroChipClass = 'hlg-sm hero-pill hero-hotkey interaction-base interaction-press shrink-0';
+                  const heroIcon = (Icon: typeof Mic) => <Icon size={11} strokeWidth={2} />;
+                  const answerContent = isLavenderTheme ? (
+                    <span className="flex items-center gap-[5px]">
+                      <Mic size={11} strokeWidth={2} /> {t('Answer')}
+                    </span>
+                  ) : (
                     <span className="flex items-center gap-1.5">
                       <Mic className="w-3 h-3 opacity-70" /> {t('Answer')}
                     </span>
@@ -12535,62 +12730,85 @@ Provide only the answer, nothing else.`;
                       </span>
                     </>
                   );
-                  // The row laid out on one line for one mode, invisible and
-                  // inert: its width is what the collapsed panel needs (see the
-                  // measuring effect). Same classes and icons as the real
-                  // chips; spans, not buttons, and CSS-drawn labels.
-                  const measureRow = (mode: 'recap' | 'brainstorm', ref: React.RefObject<HTMLDivElement | null>) => (
-                    <div ref={ref} className="ov-row-measure flex flex-nowrap items-center gap-1.5 px-4" aria-hidden inert>
-                      <span className={chipClass} style={appearance.chipStyle}>
-                        <Pencil className="w-3 h-3 opacity-70" />
-                        {ghost(t('What to answer?'))}
+                  // The row laid out on one line, invisible and inert: its
+                  // width is what the collapsed panel needs (see the measuring
+                  // effect). Same classes and icons as the real chips; spans,
+                  // not buttons, and CSS-drawn labels.
+                  const measureChip = (id: OverlayButtonId) => {
+                    if (isLavenderTheme) {
+                      const { Icon, label } = OVERLAY_BUTTONS[id];
+                      return (
+                        <span key={id} className={`hlg-button hlg-lavender ${heroChipClass}${id === 'answer' ? ' min-w-[74px]' : ''}`}>
+                          <span className="hlg-content">
+                            {id === 'answer' ? (
+                              <span className="hlg-label"><span className="ov-chip-stack">{answerSizers}</span></span>
+                            ) : (
+                              <>
+                                <span className="hlg-icon">{heroIcon(Icon)}</span>
+                                <span className="hlg-label">{ghost(t(label))}</span>
+                              </>
+                            )}
+                          </span>
+                        </span>
+                      );
+                    }
+                    if (id === 'answer') {
+                      return (
+                        <span key={id} className={answerChipClass(false)} style={appearance.chipStyle}>
+                          <span className="ov-chip-stack">{answerSizers}</span>
+                        </span>
+                      );
+                    }
+                    const { Icon, label } = OVERLAY_BUTTONS[id];
+                    return (
+                      <span key={id} className={chipClass} style={appearance.chipStyle}>
+                        <Icon className="w-3 h-3 opacity-70" />
+                        {ghost(t(label))}
                       </span>
-                      <span className={chipClass} style={appearance.chipStyle}>
-                        <MessageSquare className="w-3 h-3 opacity-70" />
-                        {ghost(t('Clarify'))}
-                      </span>
-                      <span className={chipClass} style={appearance.chipStyle}>
-                        {mode === 'brainstorm' ? (
-                          <Lightbulb className="w-3 h-3 opacity-70" />
-                        ) : (
-                          <RefreshCw className="w-3 h-3 opacity-70" />
-                        )}
-                        {ghost(mode === 'brainstorm' ? t('Brainstorm') : t('Recap'))}
-                      </span>
-                      <span className={chipClass} style={appearance.chipStyle}>
-                        <HelpCircle className="w-3 h-3 opacity-70" />
-                        {ghost(t('Follow Up Question'))}
-                      </span>
-                      <span className={answerChipClass(false)} style={appearance.chipStyle}>
-                        <span className="ov-chip-stack">{answerSizers}</span>
-                      </span>
-                    </div>
-                  );
-                  return (
-                    <>
-                      <div
-                        ref={quickRowRef}
-                        className={`ov-chip-row ov-quickrow-pad flex flex-wrap justify-center items-center gap-1.5 px-4 pb-3 max-w-full overflow-visible ${rollingTranscript && showTranscript ? 'pt-1' : 'pt-3 is-bare'}`}
-                      >
-                        <button onClick={handleWhatToSay} className={chipClass} style={appearance.chipStyle}>
-                          <Pencil className="w-3 h-3 opacity-70" /> {t('What to answer?')}
-                        </button>
-                        <button onClick={handleClarify} className={chipClass} style={appearance.chipStyle}>
-                          <MessageSquare className="w-3 h-3 opacity-70" /> {t('Clarify')}
-                        </button>
+                    );
+                  };
+                  const onChip: Record<Exclude<OverlayButtonId, 'answer'>, () => void> = {
+                    what_to_answer: () => void handleWhatToSay(),
+                    clarify: () => void handleClarify(),
+                    recap: () => void handleRecap(),
+                    follow_up: () => void handleFollowUpQuestions(),
+                    brainstorm: () => void handleBrainstorm(),
+                    catch_me_up: () => void handleLiveHelper('catch_me_up'),
+                    define: () => void handleLiveHelper('define'),
+                    sound_smart: () => void handleLiveHelper('sound_smart'),
+                  };
+                  const chip = (id: OverlayButtonId) => {
+                    if (isLavenderTheme) {
+                      if (id === 'answer') {
+                        return (
+                          <HeroGlassButton
+                            key={id}
+                            variant="lavender"
+                            onClick={handleAnswerNow}
+                            className={`${heroChipClass} min-w-[74px]${isManualRecording ? ' hero-recording' : ''}`}
+                          >
+                            <span className="ov-chip-stack">
+                              {answerSizers}
+                              <span className="flex justify-center">
+                                <SwapText swapKey={isManualRecording ? 'stop' : 'answer'}>
+                                  {isManualRecording ? stopContent : answerContent}
+                                </SwapText>
+                              </span>
+                            </span>
+                          </HeroGlassButton>
+                        );
+                      }
+                      const { Icon, label } = OVERLAY_BUTTONS[id];
+                      return (
+                        <HeroGlassButton key={id} variant="lavender" onClick={onChip[id]} className={heroChipClass} icon={heroIcon(Icon)}>
+                          {t(label)}
+                        </HeroGlassButton>
+                      );
+                    }
+                    if (id === 'answer') {
+                      return (
                         <button
-                          onClick={shownActionMode === 'brainstorm' ? handleBrainstorm : handleRecap}
-                          className={chipClass}
-                          style={appearance.chipStyle}
-                        >
-                          <SwapText swapKey={labelActionMode} onShown={handleModeLabelShown}>
-                            {modeChipContent(labelActionMode)}
-                          </SwapText>
-                        </button>
-                        <button onClick={handleFollowUpQuestions} className={chipClass} style={appearance.chipStyle}>
-                          <HelpCircle className="w-3 h-3 opacity-70" /> {t('Follow Up Question')}
-                        </button>
-                        <button
+                          key={id}
                           onClick={handleAnswerNow}
                           className={answerChipClass(isManualRecording)}
                           style={isManualRecording ? undefined : appearance.chipStyle}
@@ -12604,25 +12822,28 @@ Provide only the answer, nothing else.`;
                             </span>
                           </span>
                         </button>
-                        {/* The live helpers sit on a line of their own under
-                            the main actions, at any width, so the collapsed
-                            panel keeps its measured width (measureRow). */}
-                        <span className="basis-full h-0" aria-hidden />
-                        <button onClick={() => handleLiveHelper('catch_me_up')} className={chipClass} style={appearance.chipStyle}>
-                          <History className="w-3 h-3 opacity-70" /> {t('What did I miss?')}
-                        </button>
-                        <button onClick={() => handleLiveHelper('define')} className={chipClass} style={appearance.chipStyle}>
-                          <BookOpen className="w-3 h-3 opacity-70" /> {t('Define')}
-                        </button>
-                        <button onClick={() => handleLiveHelper('sound_smart')} className={chipClass} style={appearance.chipStyle}>
-                          <Quote className="w-3 h-3 opacity-70" /> {t('Sound smart')}
-                        </button>
-                        <button onClick={() => handleLiveHelper('follow_up_questions')} className={chipClass} style={appearance.chipStyle}>
-                          <Quote className="w-3 h-3 opacity-70" /> {t('Follow-up questions')}
-                        </button>
+                      );
+                    }
+                    const { Icon, label } = OVERLAY_BUTTONS[id];
+                    return (
+                      <button key={id} onClick={onChip[id]} className={chipClass} style={appearance.chipStyle}>
+                        <Icon className="w-3 h-3 opacity-70" /> {t(label)}
+                      </button>
+                    );
+                  };
+                  return (
+                    <>
+                      <div
+                        ref={quickRowRef}
+                        className={`ov-chip-row ov-quickrow-pad flex flex-wrap justify-center px-4 items-center gap-1.5 pb-3 max-w-full overflow-visible ${rollingTranscript && showTranscript ? 'pt-1' : 'pt-3 is-bare'}`}
+                      >
+                        {/* One row: the five buttons picked in Settings ›
+                            Overlay, in its order. */}
+                        {overlayRow.map(chip)}
                       </div>
-                      {measureRow('recap', recapRowMeasureRef)}
-                      {measureRow('brainstorm', brainstormRowMeasureRef)}
+                      <div ref={rowMeasureRef} className="ov-row-measure flex flex-nowrap items-center gap-1.5 px-4" aria-hidden inert>
+                        {overlayRow.map(measureChip)}
+                      </div>
                     </>
                   );
                 })()}
@@ -12653,13 +12874,61 @@ Provide only the answer, nothing else.`;
                                     overlay no longer accidentally engage the
                                     tap and break inputs in Settings/Model
                                     Selector windows. */}
-                <div className="relative group" data-stealth-engage="true">
+                <div
+                  className="relative group"
+                  data-stealth-engage="true"
+                  onDragOver={(e) => {
+                    // Issue #351: accept image files from Finder/Explorer.
+                    if (![...e.dataTransfer.types].includes('Files')) return;
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'copy';
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const files = imageFilesFromDrop(e.dataTransfer.files);
+                    void Promise.all(
+                      files.map(async (file) => {
+                        try {
+                          const result = await window.electronAPI.attachLocalImage?.(file);
+                          if (result && !result.success) console.warn('[overlay] dropped image not attached:', result.error);
+                        } catch (err) {
+                          console.warn('[overlay] attachLocalImage failed:', err);
+                        }
+                      }),
+                    );
+                  }}
+                >
                   <input
                     ref={textInputRef}
                     data-testid="overlay-chat-input"
                     type="text"
                     value={inputValue}
                     onChange={(e) => { setInputValue(e.target.value); setSkillPickerIndex(0); }}
+                    onPaste={(e) => {
+                      // Issue #351: Cmd/Ctrl+V with only an image on the
+                      // clipboard attaches it like a screenshot; any text
+                      // pastes natively (see overlayPasteAction).
+                      const action = overlayPasteAction(e.clipboardData);
+                      const attachClipboardImage = window.electronAPI.attachClipboardImage;
+                      if (action.kind !== 'image' || !attachClipboardImage) return;
+                      e.preventDefault();
+                      void (async () => {
+                        try {
+                          const result = await attachClipboardImage();
+                          if (result?.success) return;
+                          // Windows: a file copied in Explorer is a file
+                          // reference, not a picture, so readImage is empty.
+                          const fromFiles = await Promise.all(
+                            action.files.map((file) => window.electronAPI.attachLocalImage?.(file)),
+                          );
+                          if (!fromFiles.some((r) => r?.success)) {
+                            console.warn('[overlay] pasted image not attached:', result?.error ?? 'no image on the clipboard');
+                          }
+                        } catch (err) {
+                          console.warn('[overlay] attachClipboardImage failed:', err);
+                        }
+                      })();
+                    }}
                     onKeyDown={(e) => {
                       if (filteredSkills.length > 0 && skillPickerQuery !== null) {
                         if (e.key === 'ArrowUp') {
@@ -12731,7 +13000,7 @@ Provide only the answer, nothing else.`;
                       aria-hidden="true"
                       className="nat-caret-mirror pl-3 pr-10 py-2.5 text-[13px] leading-relaxed"
                     >
-                      <span className="nat-caret-text">{inputValue}</span>
+                      <span className={`nat-caret-text ${stealthAllSelected ? 'nat-caret-selected' : ''}`}>{inputValue}</span>
                       <span className="nat-caret" />
                     </div>
                   )}
@@ -12752,6 +13021,9 @@ Provide only the answer, nothing else.`;
                   {/* Custom Rich Placeholder */}
                   {!inputValue && (
                     <div className="absolute inset-x-3 top-1/2 -translate-y-1/2 min-w-0 overflow-hidden whitespace-nowrap pointer-events-none text-[13px] overlay-text-muted">
+                      {isLavenderTheme ? (
+                      <span className="overlay-input-placeholder-full">{t('Ask anything on screen or conversation')}</span>
+                      ) : (
                       <span className="overlay-input-placeholder-full inline-flex items-center gap-1.5">
                         <span>{t('Ask anything on screen or conversation, or')}</span>
                       <span className="flex items-center gap-1 opacity-80">
@@ -12771,6 +13043,7 @@ Provide only the answer, nothing else.`;
                       </span>
                       <span>{t('for selective screenshot')}</span>
                       </span>
+                      )}
                       <span className="overlay-input-placeholder-compact">{t('Ask anything…')}</span>
                     </div>
                   )}
@@ -12802,15 +13075,20 @@ Provide only the answer, nothing else.`;
 
                         window.electronAPI.toggleModelSelector({ x, y, activate: false });
                       }}
-                      className={`
+                      className={isLavenderTheme
+                        // The hero's model chip: a paper pill in the mono face.
+                        ? 'hlg-button hlg-lavender hlg-sm hero-pill hero-mono shrink-0 interaction-base interaction-press'
+                        : `
                                                 flex items-center gap-1 pl-3 pr-1.5 h-7
                                                 border rounded-[9px] transition-colors
                                                 text-xs font-medium text-left shrink-0
                                                 interaction-base interaction-press
                                                 ${controlSurfaceClass}
                                             `}
-                      style={{ ...appearance.controlStyle, width: MODEL_SELECTOR_WIDTH }}
+                      style={isLavenderTheme ? { width: MODEL_SELECTOR_WIDTH } : { ...appearance.controlStyle, width: MODEL_SELECTOR_WIDTH }}
                     >
+                      {isLavenderTheme && <span className="hlg-lens" aria-hidden="true" />}
+                      <span className={isLavenderTheme ? 'hlg-content' : 'contents'}>
                       <ModelSelectorLabel>
                         {(() => {
                           const m = currentModel;
@@ -12869,7 +13147,12 @@ Provide only the answer, nothing else.`;
                           return m;
                         })()}
                       </ModelSelectorLabel>
-                      <ChevronDown size={12} className="shrink-0 transition-transform" />
+                      {isLavenderTheme ? (
+                        <svg className="shrink-0" width="8" height="8" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M3 4l2 2 2-2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
+                      ) : (
+                        <ChevronDown size={12} className="shrink-0 transition-transform" />
+                      )}
+                      </span>
                     </button>
 
                     <div className="relative">
@@ -12906,7 +13189,10 @@ Provide only the answer, nothing else.`;
                     </div>
 
                     {/* Notes: the notes window, where the user types their own notes for
-                        this meeting; they go into the meeting notes at Stop. */}
+                        this meeting; they go into the meeting notes at Stop. Lavender's
+                        row is the hero's, without Notes and Passthrough (owner request);
+                        passthrough keeps its global shortcut there. */}
+                    {!isLavenderTheme && (<>
                     <div className="relative">
                       <button
                         onClick={() => { void window.electronAPI?.notesWindowToggle?.(); }}
@@ -12919,38 +13205,55 @@ Provide only the answer, nothing else.`;
                       </button>
                     </div>
 
-                    {/* Mouse Passthrough Toggle */}
+                    {/* Mouse Passthrough Toggle. Opens into a pill with the
+                        exit hotkey when turned on — once click-through is on
+                        this button can no longer be clicked, so the hotkey is
+                        the only way back (ClickThroughToggle). */}
                     <div className="relative">
-                      <button
-                        onClick={() => {
+                      <ClickThroughToggle
+                        on={isMousePassthrough}
+                        onToggle={() => {
                           const newState = !isMousePassthrough;
                           setIsMousePassthrough(newState);
                           window.electronAPI?.setOverlayMousePassthrough?.(newState);
                         }}
-                        data-state={isMousePassthrough ? 'on' : undefined}
-                        className="w-7 h-7 rounded-[9px] flex items-center justify-center interaction-base interaction-press overlay-bare-icon"
-                      >
-                        <PointerOff className="w-3.5 h-3.5" />
-                      </button>
+                        keys={shortcuts.toggleMousePassthrough || [getModifierSymbol('cmd'), 'Shift', 'B']}
+                        exitLabel={t('to exit')}
+                        ariaLabel={t('Toggle Mouse Passthrough')}
+                      />
                     </div>
+                    </>)}
                   </div>
 
-                  <button
-                    onClick={handleManualSubmit}
-                    disabled={!inputValue.trim()}
-                    className={`
-                                    w-7 h-7 rounded-full flex items-center justify-center
-                                    interaction-base interaction-press
-                                    ${
-                                      inputValue.trim()
-                                        ? 'bg-[#007AFF] text-white shadow-lg shadow-blue-500/20 hover:bg-[#0071E3]'
-                                        : 'overlay-icon-surface overlay-text-muted cursor-not-allowed'
-                                    }
-                                `}
-                    style={inputValue.trim() ? undefined : appearance.iconStyle}
-                  >
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </button>
+                  {isLavenderTheme ? (
+                    // The hero's send bead (its SEND_STYLE and arrow glyph).
+                    <HeroGlassButton
+                      variant="lavender"
+                      onClick={handleManualSubmit}
+                      disabled={!inputValue.trim()}
+                      className="hlg-sm hero-send interaction-base interaction-press"
+                      aria-label={t('Send')}
+                    >
+                      <svg width="10" height="10" viewBox="0 0 11 11" fill="none" aria-hidden="true"><path d="M2.5 5.5H8.5M6 3l2.5 2.5L6 8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                    </HeroGlassButton>
+                  ) : (
+                    <button
+                      onClick={handleManualSubmit}
+                      disabled={!inputValue.trim()}
+                      className={`
+                                      w-7 h-7 rounded-full flex items-center justify-center
+                                      interaction-base interaction-press
+                                      ${
+                                        inputValue.trim()
+                                          ? 'bg-[#007AFF] text-white shadow-lg shadow-blue-500/20 hover:bg-[#0071E3]'
+                                          : 'overlay-icon-surface overlay-text-muted cursor-not-allowed'
+                                      }
+                                  `}
+                      style={inputValue.trim() ? undefined : appearance.iconStyle}
+                    >
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                 </div>
               </div>
 

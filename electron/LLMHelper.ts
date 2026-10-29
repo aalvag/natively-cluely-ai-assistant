@@ -30,7 +30,7 @@ import { getVisionCapabilityStore, normalizeVisionBaseURL, storedVisionAnswer, s
 import { VisionProbe, VISION_PROBE_QUESTION, VISION_PROBE_SYSTEM } from "./llm/visionProbe"
 import { parseOpenRouterVision } from "./llm/providerVisionData"
 import { trimUserContentToFit, userContentRoomChars } from "./llm/localContextTrim"
-import { getModelCapabilities, selectPromptTier, estimateTokens, truncateTranscriptToFit, getOpenAiMaxOutput, getOpenAiReasoningEffort, claudeAcceptsSamplingParams, claudeThinkingParam, type OpenAiReasoningEffort, type PromptTier, type ModelCapabilities } from "./llm/modelCapabilities"
+import { getModelCapabilities, ollamaRequestContext, selectPromptTier, estimateTokens, truncateTranscriptToFit, getOpenAiMaxOutput, getOpenAiReasoningEffort, claudeAcceptsSamplingParams, claudeThinkingParam, type OpenAiReasoningEffort, type PromptTier, type ModelCapabilities } from "./llm/modelCapabilities"
 import { GeminiPromptCache } from "./llm/GeminiPromptCache"
 import { filterOllamaGenerationModels } from "./llm/ollamaGenerationModels"
 import {
@@ -75,8 +75,6 @@ import { isPhoneImagePath, visionImageEdge } from './utils/phoneImage';
 import curl2Json from "@bany/curl-to-json";
 import { CustomProvider, CurlProvider } from './services/CredentialsManager';
 import { TRIAL_SENTINEL_KEY } from './config/constants';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import axios from 'axios';
 import { createProviderRateLimiters, RateLimiter } from './services/RateLimiter';
 import { chatGptCompatibleModel, CodexCliConfig, CodexCliService, codexSignedOutMessage, DEFAULT_CODEX_CLI_CONFIG, getCodexAuthStatus } from './services/CodexCliService';
@@ -91,7 +89,6 @@ import type {
   DirectAssistRung,
   DirectAssistSelection,
 } from './direct-assist/types';
-const execAsync = promisify(exec);
 const NATIVELY_API_URL = nativelyApiBase();
 
 function nowMs(): number {
@@ -162,9 +159,11 @@ import {
   AGENTROUTER_JUDGE_MODEL,
   agentRouterError,
   agentRouterProtocolFor,
+  agentRouterReasoningEffort,
   agentRouterWireModel,
   isAgentRouterClaudeWireModel,
   isAgentRouterModelId,
+  pickAgentRouterModel,
 } from './llm/agentRouter'
 import { createAgentRouterClients } from './llm/agentRouterClients'
 import { stripLeadingReasoningBlock } from './llm/reasoningTagFilter'
@@ -233,8 +232,9 @@ const LAST_JUDGE_RUNG_TIMEOUT_MS = 2300
 export const GEMINI_TEXT_TTFT_MS = Object.freeze({ flashLite: 2_500, flash: 5_000, pro: 10_000 })
 // Ceiling for a fast call made with no caller signal (the preferFast callers).
 const FAST_MODEL_DEFAULT_TIMEOUT_MS = 8000
-// Codex's measured first token is 1.7-2.0 s (gpt-5.5; see DEFAULT_CODEX_CLI_CONFIG),
-// before a single token of reply. A fast rung with a smaller budget cannot be
+// Codex's measured first token was 1.7-2.0 s (gpt-5.5, 2026-09-11). gpt-5.6-luna,
+// the default since gpt-5.5 was refused (see DEFAULT_CODEX_CLI_CONFIG), measured
+// 0.9-1.1 s on a one-line prompt; a real answer prompt is far longer. A fast rung with a smaller budget cannot be
 // met on Codex — the judge rung (1.8 s) and the query rewrite (1.5 s) would
 // spend their whole budget and then fall through anyway — so a Codex
 // Background Model skips them and they run their own ladders at once.
@@ -755,6 +755,22 @@ export class LLMHelper {
 
   private isProviderDisabled(family: string): boolean {
     return isProviderFamilyDisabled(family, this.getDisabledProviderFamilies());
+  }
+
+  /**
+   * An automatically chosen AgentRouter model (judge, structured ladder),
+   * checked against the fetched catalogue LIVE, like the disabled list above:
+   * AgentRouter retires models between releases, and a fixed id that is gone
+   * 503s on every call. See pickAgentRouterModel.
+   */
+  private agentRouterAutoModel(wanted: string): string {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const rows = CredentialsManager.getInstance().getCloudFetchedModels?.('agentrouter');
+      return pickAgentRouterModel(wanted, Array.isArray(rows) ? rows.map((m: any) => m?.id) : []);
+    } catch {
+      return wanted;
+    }
   }
 
   /** Error text for "nothing left to try", which reads very differently when
@@ -2331,7 +2347,7 @@ export class LLMHelper {
   // these named entry points so the surface stays auditable.
 
   public async runVisionRequest(
-    providerId: 'natively' | 'openai' | 'claude' | 'gemini_flash_lite' | 'gemini_flash' | 'gemini_pro' | 'groq_scout' | 'custom' | 'litellm' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'ninerouter' | 'agentrouter' | 'deepseek' | 'curl' | 'ollama',
+    providerId: 'natively' | 'openai' | 'claude' | 'gemini_flash_lite' | 'gemini_flash' | 'gemini_pro' | 'groq_scout' | 'custom' | 'litellm' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'ninerouter' | 'agentrouter' | 'deepseek' | 'curl' | 'ollama' | 'oauth_model',
     userPrompt: string,
     systemPrompt: string,
     imagePath: string,
@@ -2406,6 +2422,22 @@ export class LLMHelper {
           opts?.signal?.removeEventListener('abort', onOuterAbort);
           if (this.ollamaRecordAbort === record) this.ollamaRecordAbort = null;
         }
+      }
+      // The screen record written by Codex or Antigravity when nothing else can
+      // read the screenshot (see getOAuthRecordReader). Both adapters throw on
+      // failure, so an error is never stored as the screen's contents. Codex
+      // runs at low effort on the default tier: the user's own reasoning
+      // setting (high, xhigh, flex) is for answers, and a transcription at that
+      // effort runs past OAUTH_RECORD_BUDGET_MS every time.
+      case 'oauth_model': {
+        const reader = this.getOAuthRecordReader();
+        if (!reader) throw new Error('No signed-in model can read this screenshot');
+        const stream = reader.family === 'codex-cli'
+          ? this.streamWithCodexCli(userPrompt, systemPrompt, false, [imagePath], opts?.signal, undefined, { modelReasoningEffort: 'low', serviceTier: 'default' })
+          : this.streamWithAntigravity(userPrompt, systemPrompt, [imagePath], opts?.signal, reader.model);
+        let text = '';
+        for await (const piece of stream) text += piece;
+        return text;
       }
       case 'curl': {
         if (!this.activeCurlProvider) throw new Error('No cURL provider selected');
@@ -3339,7 +3371,7 @@ export class LLMHelper {
     });
   }
 
-  private async *streamWithCodexCli(userContent: string, systemPrompt?: string, fastMode = false, imagePaths?: string[], signal?: AbortSignal, modelOverride?: string): AsyncGenerator<string, void, unknown> {
+  private async *streamWithCodexCli(userContent: string, systemPrompt?: string, fastMode = false, imagePaths?: string[], signal?: AbortSignal, modelOverride?: string, tuning?: { modelReasoningEffort?: CodexCliConfig['modelReasoningEffort']; serviceTier?: CodexCliConfig['serviceTier'] }): AsyncGenerator<string, void, unknown> {
     if (!this.isCodexAvailable()) throw new Error('Codex CLI transport is disabled or ChatGPT is signed out.');
     // Codex routes to chatgpt.com/backend-api — it is a CLOUD provider, and it
     // needs the same local-only last boundary every other cloud provider has.
@@ -3363,8 +3395,8 @@ export class LLMHelper {
       timeoutMs: this.codexCliConfig.timeoutMs,
       imagePaths,
       sandboxMode: this.codexCliConfig.sandboxMode,
-      serviceTier: this.codexCliConfig.serviceTier,
-      modelReasoningEffort: this.codexCliConfig.modelReasoningEffort,
+      serviceTier: tuning?.serviceTier ?? this.codexCliConfig.serviceTier,
+      modelReasoningEffort: tuning?.modelReasoningEffort ?? this.codexCliConfig.modelReasoningEffort,
       signal,
     });
   }
@@ -3422,6 +3454,9 @@ export class LLMHelper {
       caps.maxContextTokens,
       this.litellmInputCapFor(modelId) ?? Number.POSITIVE_INFINITY,
       this.ninerouterInputCapFor(modelId) ?? Number.POSITIVE_INFINITY,
+      // Ollama runs at the window the request asks for (num_ctx), not the
+      // model's native one; a 128k llama3.1 gets 16k.
+      this.useOllama ? ollamaRequestContext(modelId) : Number.POSITIVE_INFINITY,
     );
     if (maxContextTokens >= 100_000) return text;
     const reserved = reservedOutputTokens ?? 2000;
@@ -3474,9 +3509,10 @@ export class LLMHelper {
       const ollamaModel = (images && this.localVisionOverride(imagePaths)) || this.ollamaModel;
 
       const sys = systemPrompt ? this.resolveLocalSystemPrompt(systemPrompt) : TINY_SYSTEM_PROMPT;
-      // Per-request hard guard: trim userContent (never sys) until total fits the model's max ctx.
+      // Per-request hard guard: trim userContent (never sys) until total fits the
+      // window requested below as num_ctx (ollamaRequestContext).
       let userContent = prompt;
-      const maxCtx = getModelCapabilities(ollamaModel, true).maxContextTokens;
+      const maxCtx = ollamaRequestContext(ollamaModel);
       let total = estimateTokens(sys) + estimateTokens(userContent) + 2000;
       if (total > maxCtx) {
         console.warn('[Ollama] context overflow', { model: ollamaModel, total, max: maxCtx });
@@ -3502,6 +3538,9 @@ export class LLMHelper {
         options: {
           temperature: 0.7,
           top_p: 0.9,
+          // Without it Ollama uses its 4096-token default and drops the start of
+          // a longer prompt (the system prompt) silently.
+          num_ctx: maxCtx,
         }
       };
       if (this.isThinkingModel(ollamaModel)) ollamaBody.think = false;
@@ -3663,6 +3702,42 @@ export class LLMHelper {
   public getOllamaRecordTarget(): { model: string; url: string } | null {
     if (!this.useOllama || this.isProviderDisabled('ollama') || !this.ollamaVisionModel) return null;
     return { model: this.ollamaVisionModel, url: this.ollamaUrl };
+  }
+
+  /**
+   * The Codex or Antigravity model that writes the after-the-answer screen
+   * record when no other provider can. The vision registry has no rung of its
+   * own for either (both sign in with OAuth, no key it can see), so a user with
+   * only one of them had every screen record fail with `all_vision_failed` —
+   * the answer read the screenshot, since the streaming chain seats both
+   * whenever they are signed in, but no follow-up could ever quote that screen
+   * (issue #647's log).
+   *
+   * The same availability rule as the streaming chain (buildVisionChain), so
+   * the two cannot disagree about who may read a screenshot: signed in and
+   * switched on, not local-only, not "Reads images: Off". That chain seats both
+   * whatever the selection, an Ollama or custom one included, so this does too
+   * (code review, 2026-10-24) — and it matches the record's rule of 2026-10-01:
+   * a cloud provider when one is available, else the selected Ollama.
+   * "Keep screenshots on this device" never reaches here: the registry seats
+   * this rung only where cloud vision is allowed. The selection goes first when
+   * it is one of the two; otherwise Codex before Antigravity, the streaming order.
+   */
+  public getOAuthRecordReader(): { family: 'codex-cli' | 'antigravity'; model: string } | null {
+    if (this.isLocalOnlyMode) return null;
+    const codex = (): { family: 'codex-cli'; model: string } | null => {
+      if (!this.isCodexAvailable()) return null;
+      const model = this.getSelectedCodexCliModel();
+      return this.userVisionOverride('codex-cli', model) === false ? null : { family: 'codex-cli', model };
+    };
+    const antigravity = (): { family: 'antigravity'; model: string } | null => {
+      const model = this.antigravityFallbackModel();
+      if (!model) return null;
+      const routed = `antigravity:${model}`;
+      return this.userVisionOverride('antigravity', routed) === false ? null : { family: 'antigravity', model: routed };
+    };
+    if (this.isAntigravityModel(this.currentModelId)) return antigravity() ?? codex();
+    return codex() ?? antigravity();
   }
 
   /**
@@ -5937,9 +6012,9 @@ let isMultimodal = !!(imagePaths?.length);
     if (family === 'openrouter') return this.openrouterClient ? OPENROUTER_JUDGE_MODEL : null;
     if (family === 'fluxion') return (this.fluxionOpenAIClient || this.fluxionAnthropicClient) ? this.currentModelId : null;
     // NOT the selected model: see AGENTROUTER_JUDGE_MODEL. The judge runs on
-    // every candidate utterance, and on a rationed Claude/GPT pick that would
-    // spend the user's daily AgentRouter allowance on classification.
-    if (family === 'agentrouter') return this.hasAgentRouterCredential() ? AGENTROUTER_JUDGE_MODEL : null;
+    // every candidate utterance, so it stays on the fastest model rather than
+    // whatever slower one the user picked.
+    if (family === 'agentrouter') return this.hasAgentRouterCredential() ? this.agentRouterAutoModel(AGENTROUTER_JUDGE_MODEL) : null;
     if (family === 'ninerouter') return this.ninerouterClient ? this.currentModelId : null;
     if (family === 'nvidia_nim') return this.nvidiaNimClient ? this.currentModelId : null;
     if (family === 'litellm') return this.litellmClient ? this.currentModelId : null;
@@ -6550,17 +6625,17 @@ let isMultimodal = !!(imagePaths?.length);
     // Intelligence read the résumé with its rule-based parser.
     //
     // The model is the gateway's automatic default (AGENTROUTER_DEFAULT_MODEL,
-    // DeepSeek), NOT the selected one, for the reason the Auto Answer judge
-    // gives: a profile upload makes six or more structured calls, and on a
-    // Claude or GPT pick those would be taken from the user's daily ration.
-    // Thinking off and the DeepSeek output cap come from
-    // agentRouterAnthropicParams, as for a chat turn; 0.4 as the rungs above.
+    // resolved against the fetched catalogue), NOT the selected one, for the
+    // reason the Auto Answer judge gives: a profile upload makes six or more
+    // structured calls, and a slow pick would make each of them slow. 0.4 as
+    // the rungs above (ignored for GPT, which takes no temperature).
     //
     // Last on purpose, after DeepSeek: nobody with a working rung is moved.
     if (this.hasAgentRouterCredential()) {
+      const arModel = this.agentRouterAutoModel(AGENTROUTER_DEFAULT_MODEL);
       providers.push({
-        name: `AgentRouter (${agentRouterWireModel(AGENTROUTER_DEFAULT_MODEL)})`,
-        execute: () => this.generateWithAgentRouter(message, undefined, undefined, AGENTROUTER_DEFAULT_MODEL, signal, { temperature: 0.4 }),
+        name: `AgentRouter (${agentRouterWireModel(arModel)})`,
+        execute: () => this.generateWithAgentRouter(message, undefined, undefined, arModel, signal, { temperature: 0.4 }),
       });
     }
 
@@ -7644,6 +7719,11 @@ let isMultimodal = !!(imagePaths?.length);
       return;
     }
 
+    if (agentRouterProtocolFor(model) === 'responses') {
+      yield* this.streamAgentRouterResponses(model, userMessage, systemPrompt, imagePaths, abortSignal, opts);
+      return;
+    }
+
     const client = this.agentrouterOpenAIClient;
     if (!client) throw new Error('AgentRouter client not initialized');
     const messages = await this.buildOpenRouterMessages(userMessage, systemPrompt, imagePaths);
@@ -7673,6 +7753,82 @@ let isMultimodal = !!(imagePaths?.length);
       throw agentRouterError(e, model);
     } finally {
       if (abortSignal?.aborted && typeof stream?.abort === 'function') stream.abort();
+      if (abortSignal?.aborted && typeof stream?.controller?.abort === 'function') stream.controller.abort();
+    }
+  }
+
+  /**
+   * Responses API parameters for an AgentRouter GPT model: streamWithOpenai's
+   * output cap (getOpenAiMaxOutput), reasoning as low as the model was measured
+   * to accept (agentRouterReasoningEffort), no temperature or seed (reasoning
+   * models refuse non-default sampling). The fast seam's 256 is raised to 512
+   * for the hidden reasoning tokens, as agentRouterOpenAIParams does.
+   */
+  private agentRouterResponsesParams(model: string, opts?: AgentRouterCallOptions): Record<string, unknown> {
+    return {
+      max_output_tokens: opts?.maxTokens ? Math.max(opts.maxTokens, 512) : getOpenAiMaxOutput(model, MAX_OUTPUT_TOKENS),
+      reasoning: { effort: agentRouterReasoningEffort(model) },
+    };
+  }
+
+  /**
+   * AgentRouter GPT over the OpenAI Responses API (`/v1/responses`), the only
+   * route those models accept since 2026-10 (agentRouter.ts fact 8). The system
+   * prompt travels as `instructions`, images as `input_image` data URLs, and
+   * `store: false` keeps the turn off the gateway's response store, as the
+   * Codex backend request does. Text arrives as `response.output_text.delta`;
+   * an in-band `response.failed` (a rate limit lands there, measured) is
+   * explained like every other AgentRouter error.
+   */
+  private async * streamAgentRouterResponses(
+    model: string,
+    userMessage: string,
+    systemPrompt: string | undefined,
+    imagePaths: string[] | undefined,
+    abortSignal: AbortSignal | undefined,
+    opts: AgentRouterCallOptions | undefined,
+  ): AsyncGenerator<string, void, unknown> {
+    const client = this.agentrouterOpenAIClient;
+    if (!client) throw new Error('AgentRouter client not initialized');
+    const imageParts = imagePaths?.length ? await this.buildOpenAiImageParts(imagePaths) : [];
+    const content = imageParts.length
+      ? [{ type: 'input_text', text: userMessage }, ...imageParts.map((p: any) => ({ type: 'input_image', image_url: p.image_url.url, detail: 'auto' }))]
+      : userMessage;
+    let stream: any;
+    try {
+      stream = await client.responses.create(
+        {
+          model,
+          stream: true,
+          store: false,
+          ...(systemPrompt ? { instructions: systemPrompt } : {}),
+          input: [{ role: 'user', content }],
+          ...this.agentRouterResponsesParams(model, opts),
+        } as any,
+        { signal: abortSignal },
+      );
+    } catch (e: any) {
+      if (abortSignal?.aborted) return;
+      throw agentRouterError(e, model);
+    }
+    try {
+      for await (const event of stream) {
+        if (abortSignal?.aborted) return;
+        // Same `data: null` guard as the Chat Completions branch.
+        if (!event) continue;
+        if (event.type === 'response.output_text.delta') {
+          if (typeof event.delta === 'string' && event.delta) yield event.delta;
+          continue;
+        }
+        if (event.type === 'response.failed' || event.type === 'error') {
+          const error = event.response?.error ?? event.error ?? event;
+          throw agentRouterError(Object.assign(new Error(String(error?.message || 'gateway failed mid-stream')), { error }), model);
+        }
+      }
+    } catch (e: any) {
+      if (abortSignal?.aborted) return;
+      throw e?.agentRouter ? e : agentRouterError(e, model);
+    } finally {
       if (abortSignal?.aborted && typeof stream?.controller?.abort === 'function') stream.controller.abort();
     }
   }
@@ -13198,9 +13354,11 @@ let isMultimodal = !!(imagePaths?.length);
     this.cancelOllamaRecordFor(abortSignal);
     const ollamaModel = modelOverride || this.ollamaModel;
     let userContent = context ? `CONTEXT:\n${context}\n\nUSER:\n${message}` : message;
-    // Per-request hard guard: trim userContent (never systemPrompt) until total fits the model's max ctx.
+    // Per-request hard guard: trim userContent (never systemPrompt) until total
+    // fits the window requested below as num_ctx (ollamaRequestContext).
+    const ollamaNumCtx = ollamaRequestContext(ollamaModel);
     {
-      const maxCtx = getModelCapabilities(ollamaModel, true).maxContextTokens;
+      const maxCtx = ollamaNumCtx;
       const total = estimateTokens(systemPrompt) + estimateTokens(userContent) + 2000;
       if (total > maxCtx) {
         console.warn('[Ollama] context overflow', { model: ollamaModel, total, max: maxCtx });
@@ -13269,6 +13427,11 @@ let isMultimodal = !!(imagePaths?.length);
           num_predict: process.env.OLLAMA_MAX_OUTPUT_TOKENS
             ? Number(process.env.OLLAMA_MAX_OUTPUT_TOKENS)
             : undefined,
+          // The window the prompt was trimmed to. Without it Ollama uses its
+          // 4096-token default and drops the start of a longer prompt (the
+          // system prompt) silently. The prewarm goes through here too, so the
+          // model is loaded once at this size, not reloaded on the first turn.
+          num_ctx: ollamaNumCtx,
         }
       };
       if (this.isThinkingModel(ollamaModel)) streamBody.think = false;
@@ -14278,25 +14441,19 @@ let isMultimodal = !!(imagePaths?.length);
 
       console.log('[LLMHelper] Attempting to force restart Ollama...');
 
-      // 1. Check for process on port 11434
+      // 1. Stop a wedged Ollama daemon that still holds the port: only the
+      // listener, only if it is Ollama, never this app (ollamaPortProcess.ts;
+      // the old `lsof -t -i` + `kill -9` also killed connected clients, this
+      // app included, and did nothing on Windows).
       try {
-        const { stdout } = await execAsync(`lsof -t -i:11434`);
-        // SECURITY FIX (P1-1): Validate EACH PID token from lsof before shell interpolation.
-        // lsof -t returns one PID per line when multiple processes are on the port.
-        const pids = stdout.trim().split(/\s+/).filter(p => /^\d+$/.test(p));
-        for (const pid of pids) {
-          console.log(`[LLMHelper] Found blocking PID: ${pid}. Killing...`);
-          await execAsync(`kill -9 ${pid}`);
-        }
-        if (pids.length === 0 && stdout.trim()) {
-          console.warn(`[LLMHelper] Unexpected lsof output (no valid PIDs): "${stdout.trim().substring(0, 50)}". Skipping kill.`);
+        const port = Number(new URL(this.ollamaUrl).port) || 11434;
+        const { ollamaPidsListeningOn, stopOllamaPid } = require('./services/ollamaPortProcess');
+        for (const pid of await ollamaPidsListeningOn(port)) {
+          console.log(`[LLMHelper] Ollama (PID ${pid}) holds port ${port} but does not answer. Stopping it...`);
+          await stopOllamaPid(pid);
         }
       } catch (e: any) {
-        // lsof returns exit code 1 if no process found — that is expected, swallow it.
-        // Only surface genuinely unexpected errors.
-        if (!e.message?.includes('exit code 1') && e.code !== 1) {
-          console.warn('[LLMHelper] lsof error (non-fatal):', e.message);
-        }
+        console.warn('[LLMHelper] Could not stop the Ollama holding the port (non-fatal):', e?.message ?? e);
       }
 
       // 2. Restart Ollama through the Manager (which handles polling and background spawn)

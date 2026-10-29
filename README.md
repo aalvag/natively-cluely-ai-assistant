@@ -14,6 +14,18 @@ If you’re looking for a hosted desktop recording API, consider checking out [R
 **Now with the most advanced stealth of any tool we compare, Visual Answers that draw the system design for you, and an interface built to feel native on your Mac.**
 <br/>
 
+## Sponsored by Sidrune AI
+
+<a href="https://fluxionai.world/register?source=github&campaign=natively&promo=NATIVELY">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/sponsors/sidrune-logo-white.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/sponsors/sidrune-logo-black.svg">
+    <img src="assets/sponsors/sidrune-logo-black.svg" width="220" alt="Sidrune AI">
+  </picture>
+</a>
+
+**We recommend [Sidrune AI](https://fluxionai.world/register?source=github&campaign=natively&promo=NATIVELY): one API for GPT, Claude, and other leading AI models.** Get $3 in API credit through Natively. Sidrune is built into Natively as a provider, so you can pick it in Settings › AI Providers.
+
 <a href="#" style="pointer-events: none; cursor: default; color: inherit; text-decoration: none;" title="#1 Cluely clone · Free Cluely alternative · Source-available interview copilot · Free Interview Coder alternative · AI coding interview assistant · LeetCode AI solver · HackerRank AI cheat · Final Round AI free alternative · LockedIn AI alternative · Parakeet AI source-available · Undetectable interview AI · Stealth mode interview copilot.Cluely clone · Cluely alternative · Free Cluely · Cluely free version · source-available Cluely ·
     Final Round AI clone · Final Round AI alternative · Free Final Round AI · Final Round AI free version ·
     Interview Coder clone · Interview Coder alternative · Free Interview Coder · source-available Interview Coder ·
@@ -53,8 +65,8 @@ If you’re looking for a hosted desktop recording API, consider checking out [R
 > **Competitors charge $20–$149/month, store your data on their servers, and one already breached 83,000 users.** Natively costs $0, runs locally, and has never had a data breach. Your keys, your models, your machine.
 
 <p align="center">
-  <a href="https://natively.software">
-    <img src="https://img.shields.io/badge/Visit%20Website-22C55E?style=for-the-badge&logo=vercel&logoColor=white" />
+  <a href="https://heynatively.com">
+    <img src="https://img.shields.io/badge/Visit%20Website-22C55E?style=for-the-badge&logo=cloudflare&logoColor=white" />
   </a>
 </p>
 
@@ -81,7 +93,7 @@ brew install --cask Natively-AI-assistant/tap/natively
 
 <br/>
 
-**<span style="color: #ef4444">👥 9,000+ Users</span>** &nbsp;·&nbsp; **<span style="color: #f97316">🔥 700+ DAU</span>** &nbsp;·&nbsp; **<span style="color: #22c55e">💸 $0 vs $149/mo rivals</span>** &nbsp;·&nbsp; **<span style="color: #3b82f6">⚡ <500ms latency</span>** &nbsp;·&nbsp; **<span style="color: #a855f7">🛡️ 0 data breaches</span>**
+**<span style="color: #ef4444">👥 40,000+ Users</span>** &nbsp;·&nbsp; **<span style="color: #f97316">🔥 1,000+ DAU</span>** &nbsp;·&nbsp; **<span style="color: #22c55e">💸 $0 vs $149/mo rivals</span>** &nbsp;·&nbsp; **<span style="color: #3b82f6">⚡ <500ms latency</span>** &nbsp;·&nbsp; **<span style="color: #a855f7">🛡️ 0 data breaches</span>**
 
 </div>
 
@@ -353,7 +365,7 @@ Natively works as a **free, undetectable AI coding interview assistant** for sta
 
 <div align="center">
 
-[![Natively Website](https://img.shields.io/badge/Natively_Website-natively.software-22C55E?style=flat-square&logo=vercel&logoColor=white)](https://natively.software)
+[![Natively Website](https://img.shields.io/badge/Natively_Website-heynatively.com-22C55E?style=flat-square&logo=cloudflare&logoColor=white)](https://heynatively.com)
 [![Telegram Chat](https://img.shields.io/badge/Telegram_Chat-nativelyaichat-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/nativelyaichat)
 [![LinkedIn Company](https://img.shields.io/badge/LinkedIn_Company-nativley--ai-0077B5?style=flat-square&logo=linkedin&logoColor=white)](https://www.linkedin.com/company/nativley-ai)
 
@@ -427,12 +439,6 @@ Under the hood, Natively API connects you to the absolute best models for the op
 ## Natively Pro
 
 While Natively is **free for personal, educational, research, and non-commercial use**, we also offer a **Pro Edition** (available as **Lifetime or Yearly** subscriptions) designed specifically for power users and job seekers. Purchasing a Pro license gives you an edge in the job market, all while directly supporting the continued development of Natively.
-
-### 🪙 Unlock Natively Pro with $NAT Token
-
-We've launched the official **$NAT token** on Printr! Holders who maintain a specific balance of `$NAT` tokens in their connected wallet automatically unlock access to all **Natively Pro** features.
-
-👉 **[Trade $NAT on Printr](https://app.printr.money/trade/0xba1e50273ec14ca52b3fa64a5054c39470c2835392c6ecd06876f5bccd597d7b)**
 
 ### Free vs Pro Feature Comparison
 
@@ -1106,7 +1112,7 @@ You are not allowed to use this codebase, forks, modified versions, or substanti
 
 Public forks must clearly state that they are based on Natively, originally developed by Natively AI Private Limited.
 
-Commercial license requests: sales@heynatively.com · https://natively.software
+Commercial license requests: sales@heynatively.com · https://heynatively.com
 
 > **Note:** This project is available for sponsorships, ads, or partnerships – perfect for companies in the AI, productivity, or developer tools space.
 

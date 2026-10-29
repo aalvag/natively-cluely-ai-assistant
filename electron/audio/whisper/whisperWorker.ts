@@ -15,6 +15,7 @@
  * natively as a true dynamic ESM import at runtime.
  */
 import { parentPort } from 'worker_threads';
+import { createWhisperTaskQueue } from './whisperTaskQueue';
 import { WhisperProgressAggregator } from './whisperProgressAggregator';
 import { downloadModelFilesResumable } from './resumableDownload';
 import { getBoundedOnnxSessionOptions } from '../../utils/onnxThreadConfig';
@@ -30,8 +31,9 @@ import { getBoundedOnnxSessionOptions } from '../../utils/onnxThreadConfig';
 //  - ENGLISH_ONLY_MODELS was a hand-typed id list that omitted Parakeet CTC
 //    (English-only per NVIDIA's model card). isEnglishOnlyLocalModel() is
 //    derived from MODEL_CATALOG's own `multilingual` flag instead.
-import { isEnglishOnlyLocalModel, resolveWhisperLanguage } from './modelLanguageSupport';
+import { detectedWhisperLanguage, isEnglishOnlyLocalModel, resolveWhisperLanguage } from './modelLanguageSupport';
 import { moonshineMaxNewTokens } from './moonshineTokenBudget';
+import { loadedOnnxFiles, onnxDirFor } from './modelManager';
 
 let pipe: any = null;
 let loadedModelId = '';
@@ -271,8 +273,16 @@ async function initNemotronChannel(msg: any, channelId: string): Promise<void> {
 }
 
 // ── Dual-channel Parakeet TDT (2026-09-25) ─────────────────────────────
+// Either engine: ONNX Runtime on the CPU (ParakeetTdtEngine) or, on Apple
+// Silicon, the Neural Engine helper (AneParakeetEngine). Both are stateless
+// per call, so the worker treats them alike.
+interface ParakeetChannelEngine {
+  transcribe(pcm: Float32Array): Promise<{ text: string }>;
+}
 let parakeetSharedResources: import('./parakeet/parakeetTdtEngine').ParakeetTdtSharedResources | null = null;
-const parakeetChannels = new Map<string, import('./parakeet/parakeetTdtEngine').ParakeetTdtEngine>();
+// One helper process per worker, shared by its channels like the ONNX sessions.
+let parakeetAneEngine: import('./parakeet/aneBackend').AneParakeetEngine | null = null;
+const parakeetChannels = new Map<string, ParakeetChannelEngine>();
 const parakeetChains = new Map<string, Promise<void>>();
 function getParakeetChain(channelId: string): Promise<void> {
   return parakeetChains.get(channelId) ?? Promise.resolve();
@@ -284,19 +294,45 @@ let parakeetInitChain: Promise<void> = Promise.resolve();
 
 async function initParakeetChannel(msg: any, channelId: string): Promise<void> {
   try {
-    const { ParakeetTdtEngine } = require('./parakeet/parakeetTdtEngine');
-    let engine;
-    if (parakeetSharedResources) {
+    const path = require('path');
+    const modelDir = path.join(msg.cacheDir, ...String(msg.modelId).split('/'));
+    const onProgress = (pct: number) => {
+      parentPort!.postMessage({ type: 'progress', modelId: msg.modelId, progress: pct, channelId: msg.channelId });
+    };
+    let engine: ParakeetChannelEngine;
+    if (msg.parakeetBackend === 'coreml-ane' && msg.aneHelperPath) {
+      if (!parakeetAneEngine) {
+        const { AneParakeetEngine, parakeetCoreMlModelForRepo } = require('./parakeet/aneBackend');
+        // sourceRepoId is the CoreML repo (see buildWorkerInitMessage); its
+        // files live in that repo's own folder, beside the ONNX one.
+        const found = parakeetCoreMlModelForRepo(String(msg.sourceRepoId ?? ''));
+        if (!found || found.modelId !== msg.modelId) throw new Error(`${msg.modelId} has no Neural Engine build at ${msg.sourceRepoId}`);
+        const { downloadParakeetFiles } = require('./parakeet/downloadFiles');
+        const coremlDir = path.join(msg.cacheDir, ...String(msg.sourceRepoId).split('/'));
+        const model = found.model;
+        await downloadParakeetFiles(coremlDir, model.download, onProgress);
+        parakeetAneEngine = await AneParakeetEngine.create(msg.aneHelperPath, coremlDir, model.version, {
+          // The helper is this worker's engine. If it dies mid-session, end the
+          // worker too, so the host's existing crash handling (error event,
+          // recovery, reload on the next start) runs instead of every later
+          // request failing quietly.
+          onUnexpectedExit: (error: Error) => {
+            parentPort!.postMessage({ type: 'error', message: `Parakeet Neural Engine helper stopped: ${error.message}` });
+            process.exit(1);
+          },
+        });
+      }
+      engine = parakeetAneEngine!;
+    } else if (parakeetSharedResources) {
+      const { ParakeetTdtEngine } = require('./parakeet/parakeetTdtEngine');
       engine = await ParakeetTdtEngine.create(msg.cacheDir, msg.executionProviders ?? ['cpu'], parakeetSharedResources);
     } else {
+      const { ParakeetTdtEngine } = require('./parakeet/parakeetTdtEngine');
       const { downloadParakeetTdtFiles } = require('./parakeet/downloadFiles');
-      const path = require('path');
-      const modelDir = path.join(msg.cacheDir, ...String(msg.modelId).split('/'));
-      await downloadParakeetTdtFiles(modelDir, (pct: number) => {
-        parentPort!.postMessage({ type: 'progress', modelId: msg.modelId, progress: pct, channelId: msg.channelId });
-      });
-      engine = await ParakeetTdtEngine.create(modelDir, msg.executionProviders ?? ['cpu']);
-      parakeetSharedResources = engine.getSharedResources();
+      await downloadParakeetTdtFiles(modelDir, onProgress, msg.modelId);
+      const onnxEngine = await ParakeetTdtEngine.create(modelDir, msg.executionProviders ?? ['cpu']);
+      parakeetSharedResources = onnxEngine.getSharedResources();
+      engine = onnxEngine;
     }
     parakeetChannels.set(channelId, engine);
     loadedModelId = msg.modelId;
@@ -315,6 +351,9 @@ parentPort.on('message', async (msg: any) => {
     // flight here, and process.exit() in a worker thread stops this thread
     // only. Work still queued behind this message is abandoned on purpose —
     // the host has already stopped listening for it.
+    // The Neural Engine helper would also exit on its own when this thread's
+    // pipes close; disposing it first makes that immediate.
+    parakeetAneEngine?.dispose();
     process.exit(0);
   }
   if (msg.type === 'init') {
@@ -428,19 +467,19 @@ parentPort.on('message', async (msg: any) => {
       try {
         const _fs = require('fs');
         const _path = require('path');
-        const _orgName = String(sourceRepoId).split('/');
-        const _modelDir = _path.join(String(msg.cacheDir), _orgName[0] || '', _orgName[1] || '', 'onnx');
-        const _encName = typeof dtype === 'string' && dtype !== 'fp32' ? `encoder_model_${dtype}.onnx` : 'encoder_model.onnx';
-        const _decName = typeof dtype === 'string' && dtype !== 'fp32' ? `decoder_model_merged_${dtype}.onnx` : 'decoder_model_merged.onnx';
+        const _modelDir = onnxDirFor(String(msg.cacheDir), String(sourceRepoId));
         const _stat = (p: string) => { try { return _fs.statSync(p).size; } catch { return -1; } };
+        // Bytes per file transformers.js will load, -1 when missing.
+        const _files = Object.fromEntries(
+          loadedOnnxFiles(dtype, msg.useExternalDataFormat, msg.sessionLayout).map(f => [f, _stat(_path.join(_modelDir, f))]),
+        );
         let _ortVer = 'unknown';
         try { _ortVer = require('onnxruntime-node/package.json').version; } catch { /* bundled? */ }
         console.log('[WhisperWorker][diag]', JSON.stringify({
           cacheDir: String(msg.cacheDir),
           modelDir: _modelDir,
           modelDirExists: _fs.existsSync(_modelDir),
-          encoderFile: _encName, encoderBytes: _stat(_path.join(_modelDir, _encName)),
-          decoderFile: _decName, decoderBytes: _stat(_path.join(_modelDir, _decName)),
+          files: _files,
           providers, dtype: dtypeDesc,
           sessionOptions,
           ortNodeVersion: _ortVer,
@@ -517,6 +556,7 @@ parentPort.on('message', async (msg: any) => {
       // New model = stale prompt cache (different tokenizer vocab)
       cachedPromptText = '';
       cachedPromptIds = null;
+      autoLanguage = null;
 
       parentPort!.postMessage({ type: 'ready' });
     } catch (e: any) {
@@ -692,74 +732,224 @@ parentPort.on('message', async (msg: any) => {
       parentPort!.postMessage({ type: 'error', taskId: msg.taskId, message: 'Model not loaded' });
       return;
     }
-    pipelineChain = pipelineChain.then(async () => {
-      try {
-        let language: string | null = resolveWhisperLanguage(msg.language);
-        const streaming: boolean = !!msg.streaming;
-
-        const isEnglishOnly = isEnglishOnlyLocalModel(loadedModelId);
-        if (isEnglishOnly) {
-          language = null;
-        }
-
-        const opts: any = streaming
-          ? {
-              sampling_rate: 16000,
-              task: 'transcribe',
-              temperature: 0,
-              no_speech_threshold: 0.6,
-              compression_ratio_threshold: 2.4,
-              condition_on_previous_text: false,
-              return_timestamps: false,
-            }
-          : {
-              sampling_rate: 16000,
-              task: 'transcribe',
-              condition_on_previous_text: false,
-              compression_ratio_threshold: 2.4,
-              logprob_threshold: -1.0,
-              no_speech_threshold: 0.6,
-            };
-        if (isEnglishOnly) {
-          delete opts.task;
-        } else if (language) {
-          opts.language = language;
-        }
-
-        if (cachedPromptIds && cachedPromptIds.length > 0 && !isMoonshineModel(loadedModelId)) {
-          opts.prompt_ids = cachedPromptIds;
-        }
-
-        const rawAudio = msg.audio instanceof Float32Array ? msg.audio : new Float32Array(Object.values(msg.audio));
-        const audioInput = new Float32Array(rawAudio.length);
-        audioInput.set(rawAudio);
-
-        if (isMoonshineModel(loadedModelId)) {
-          opts.max_new_tokens = moonshineMaxNewTokens(msg.audio?.length ?? 0, 16000);
-        }
-
-        const startTime = Date.now();
-        const result = await pipe(audioInput, opts);
-        const elapsed = Date.now() - startTime;
-        const text = result?.text ?? '';
-        logWorker(`[WhisperWorker] transcribed taskId=${msg.taskId} stream=${streaming} lang=${opts.language || 'auto'} len=${audioInput.length} (${elapsed}ms) → "${text}"`);
-
-        parentPort!.postMessage({
-          type: streaming ? 'partial' : 'result',
-          taskId: msg.taskId,
-          text,
-        });
-      } catch (e: any) {
-        logWorker(`[WhisperWorker] transcribe error taskId=${msg.taskId}: ${e?.stack || e?.message || e}`);
-        parentPort!.postMessage({
-          type: 'error',
-          taskId: msg.taskId,
-          message: `Transcription failed: ${e.message}`,
-        });
-      }
-    }).catch((chainErr) => {
-      logWorker(`[WhisperWorker] pipelineChain error: ${chainErr?.stack || chainErr}`);
-      console.error('[WhisperWorker] pipelineChain error:', chainErr);
-    });
+    whisperQueue.push(msg);
   }
 });
+
+// Whisper / Moonshine: one pass at a time, finals first (whisperTaskQueue.ts).
+const whisperQueue = createWhisperTaskQueue<any>({
+  run: runWhisperTranscribe,
+  // Answered so the host stops waiting on it; it shows no text.
+  skip: (msg) => parentPort!.postMessage({ type: 'partial', taskId: msg.taskId, text: '', skipped: true }),
+  behind: (waitedMs) => parentPort!.postMessage({ type: 'behind', waitedMs }),
+});
+
+// "Auto Detect" on a multilingual Whisper. Left to transformers.js 3.8.1 a null
+// language is transcribed as English (it has no detection), so French speech
+// came back as English sentences (2026-10-21).
+//
+// Every final is checked, so a meeting that changes language follows it. The
+// check runs the encoder once and the transcription reuses that output
+// (encoder_outputs), so it costs one decoder step, not a second encoder pass.
+// Partials use the language of the last final. An unsure guess keeps the
+// language before it: under 50%, or under 80% on a clip shorter than 1.5 s.
+let autoLanguage: string | null = null;
+const AUTO_LANGUAGE_MIN_SAMPLES = 16000 * 1.5;
+
+// Both steps use transformers.js internals (the version is pinned exactly in
+// package.json and WhisperInternalsContract2026_10_21.test.mjs checks them).
+// If one still fails three finals in a row it is switched off for the
+// session: every final would otherwise pay for a failed attempt first.
+const INTERNALS_FAILURE_LIMIT = 3;
+const internalsFailures = { detect: 0, reuse: 0 };
+function internalsUsable(step: 'detect' | 'reuse'): boolean {
+  return internalsFailures[step] < INTERNALS_FAILURE_LIMIT;
+}
+function internalsResult(step: 'detect' | 'reuse', ok: boolean, e?: any): void {
+  if (ok) {
+    internalsFailures[step] = 0;
+    return;
+  }
+  internalsFailures[step] += 1;
+  if (internalsFailures[step] === INTERNALS_FAILURE_LIMIT) {
+    console.warn(`[WhisperWorker] ${step === 'detect' ? 'Auto Detect' : 'Reusing the encoder output'} failed ${INTERNALS_FAILURE_LIMIT} times in a row, off until restart:`, e?.message ?? e);
+  }
+}
+
+function acceptsAutoLanguage(guess: { probability: number } | null, samples: number): boolean {
+  if (!guess) return false;
+  if (!autoLanguage) return true;
+  return guess.probability >= (samples >= AUTO_LANGUAGE_MIN_SAMPLES ? 0.5 : 0.8);
+}
+
+async function detectAutoLanguage(audio: Float32Array): Promise<{ language: string | null; encoderOutputs: any }> {
+  const model = pipe?.model;
+  const config = model?.generation_config;
+  const langToId = config?.lang_to_id;
+  const sot = config?.decoder_start_token_id;
+  if (!langToId || sot == null || !pipe.processor || typeof model._prepare_encoder_decoder_kwargs_for_generation !== 'function') {
+    return { language: autoLanguage, encoderOutputs: null };
+  }
+  const { Tensor } = await loadTransformers() as any;
+  const { input_features } = await pipe.processor(audio);
+  const { encoder_outputs } = await model._prepare_encoder_decoder_kwargs_for_generation({
+    inputs_tensor: input_features,
+    model_inputs: { input_features },
+    model_input_name: 'input_features',
+    generation_config: {},
+  });
+  const out = await model({
+    encoder_outputs,
+    decoder_input_ids: new Tensor('int64', BigInt64Array.from([BigInt(sot)]), [1, 1]),
+  });
+  const guess = detectedWhisperLanguage(out.logits.data, langToId);
+  if (acceptsAutoLanguage(guess, audio.length) && guess!.language !== autoLanguage) {
+    console.log(`[WhisperWorker] Auto Detect: ${guess!.language} (${Math.round(guess!.probability * 100)}%, was ${autoLanguage ?? 'none'}, ${loadedModelId})`);
+    autoLanguage = guess!.language;
+  }
+  return { language: autoLanguage, encoderOutputs: encoder_outputs };
+}
+
+// WhisperPreTrainedModel.forward_params leaves out encoder_outputs, so
+// generate() would drop it and run the encoder again. With it listed,
+// generate() skips the encoder ("if (!('encoder_outputs' in model_inputs))").
+function letGenerateReuseEncoderOutputs(model: any): boolean {
+  if (!Array.isArray(model?.forward_params)) return false;
+  if (!model.forward_params.includes('encoder_outputs')) model.forward_params = [...model.forward_params, 'encoder_outputs'];
+  return true;
+}
+
+async function runWhisperTranscribe(msg: any): Promise<void> {
+  if (!pipe) {
+    parentPort!.postMessage({ type: 'error', taskId: msg.taskId, message: 'Model not loaded' });
+    return;
+  }
+  try {
+    if (msg.audio && !(msg.audio instanceof Float32Array)) {
+      msg.audio = new Float32Array(Object.values(msg.audio));
+    }
+    let language: string | null = resolveWhisperLanguage(msg.language);
+    const streaming: boolean = !!msg.streaming;
+
+    // English-only checkpoints (Distil-Whisper + .en variants) have no
+    // multilingual decoder — and transformers.js REJECTS the decoder-prompt
+    // options for them outright. From the installed library source:
+    //
+    //   if (e.is_multilingual) { …lang_to_id / task_to_id… }
+    //   else if (s || r) throw new Error(
+    //     "Cannot specify `task` or `language` for an English-only model…")
+    //
+    // where s = generationConfig.language and r = generationConfig.task. So
+    // BOTH must be omitted, not just one, and this block previously did the
+    // exact opposite: it FORCED language='english' on precisely the models
+    // that forbid it. Every transcription then threw, and because the
+    // streaming loop re-dispatches per audio window the failure repeated
+    // once per chunk — 15,733 identical errors across three days in the
+    // 2026-08-12 production log (10,183 of them in a single day), with the
+    // user's local STT silently producing nothing the whole time.
+    //
+    // Omitting them is not a downgrade: an English-only checkpoint can only
+    // transcribe, and only in English, so there is nothing left to express.
+    //
+    // Derived from MODEL_CATALOG's `multilingual` flag (modelLanguageSupport)
+    // rather than the previous hand-typed id set, which omitted Parakeet CTC
+    // — English-only per NVIDIA's model card, and a CTC pipeline with no
+    // decoder prompt to condition anyway.
+    let encoderOutputs: any = null;
+    const isEnglishOnly = isEnglishOnlyLocalModel(loadedModelId);
+    if (isEnglishOnly) {
+      language = null;
+    } else if (!language && !isMoonshineModel(loadedModelId)) {
+      if (streaming) {
+        language = autoLanguage;
+      } else if (internalsUsable('detect')) {
+        try {
+          ({ language, encoderOutputs } = await detectAutoLanguage(msg.audio));
+          internalsResult('detect', true);
+        } catch (e: any) {
+          console.warn('[WhisperWorker] Auto Detect failed, keeping the last language:', e?.message ?? e);
+          internalsResult('detect', false, e);
+          language = autoLanguage;
+        }
+      } else {
+        language = autoLanguage;
+      }
+    }
+
+    // Streaming partial passes use deterministic settings so consecutive
+    // overlapping windows are stable enough for LocalAgreement-2 to
+    // converge on a committed prefix. Final passes also disable
+    // condition_on_previous_text + add Whisper's standard fallback
+    // thresholds to suppress repetition loops on long segments.
+    const opts: any = streaming
+      ? {
+          sampling_rate: 16000,
+          task: 'transcribe',
+          temperature: 0,
+          no_speech_threshold: 0.6,
+          // Whisper's anti-loop check — drops outputs whose token gzip
+          // ratio exceeds 2.4 (typical of "thank you. thank you. thank
+          // you..." hallucinations on near-silent windows). Final pass
+          // uses the same threshold; streaming should match for
+          // consistency in what reaches the user.
+          compression_ratio_threshold: 2.4,
+          condition_on_previous_text: false,
+          return_timestamps: false,
+        }
+      : {
+          sampling_rate: 16000,
+          task: 'transcribe',
+          condition_on_previous_text: false,
+          compression_ratio_threshold: 2.4,
+          logprob_threshold: -1.0,
+          no_speech_threshold: 0.6,
+        };
+    // `task` is set unconditionally in BOTH opts branches above, so an
+    // English-only model must have it stripped here — fixing only the
+    // `language` line would still throw on `task`.
+    if (isEnglishOnly) {
+      delete opts.task;
+    } else if (language) {
+      opts.language = language;
+    }
+
+    // Use the pre-tokenized prompt cache populated by setPrompt messages.
+    // Skip for Moonshine (cached IDs are null in that case anyway).
+    if (cachedPromptIds && cachedPromptIds.length > 0 && !isMoonshineModel(loadedModelId)) {
+      opts.prompt_ids = cachedPromptIds;
+    }
+
+    // Moonshine: set the token budget ourselves. Left to the library it is
+    // floor(whole seconds) * 6, which is ZERO for anything under a second —
+    // see moonshineTokenBudget.ts. msg.audio is already 16 kHz mono (the
+    // host resamples before posting).
+    if (isMoonshineModel(loadedModelId)) {
+      opts.max_new_tokens = moonshineMaxNewTokens(msg.audio?.length ?? 0, 16000);
+    }
+
+    let result: any;
+    if (encoderOutputs && internalsUsable('reuse') && letGenerateReuseEncoderOutputs(pipe.model)) {
+      try {
+        result = await pipe(msg.audio, { ...opts, encoder_outputs: encoderOutputs });
+        internalsResult('reuse', true);
+      } catch (e: any) {
+        console.warn('[WhisperWorker] Reusing the encoder output failed, running it again:', e?.message ?? e);
+        internalsResult('reuse', false, e);
+        result = await pipe(msg.audio, opts);
+      }
+    } else {
+      result = await pipe(msg.audio, opts);
+    }
+    parentPort!.postMessage({
+      type: streaming ? 'partial' : 'result',
+      taskId: msg.taskId,
+      text: result.text ?? '',
+    });
+  } catch (e: any) {
+    parentPort!.postMessage({
+      type: 'error',
+      taskId: msg.taskId,
+      message: `Transcription failed: ${e.message}`,
+    });
+  }
+}

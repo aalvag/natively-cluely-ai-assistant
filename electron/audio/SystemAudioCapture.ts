@@ -1,10 +1,14 @@
 import { EventEmitter } from 'events';
 import { loadNativeModule } from './nativeModuleLoader';
 import { normalizeSpeechEdge } from './speechEdge';
+import { rendererCaptureFallbackActive } from './fallback/fallbackPolicy';
 
 function getRustAudioCapture(): any {
     const NativeModule: any = loadNativeModule();
-    return NativeModule?.SystemAudioCapture;
+    return rendererCaptureFallbackActive(!!NativeModule?.SystemAudioCapture)
+        ? (console.warn('[SystemAudioCapture] Native audio module unavailable: using the Chromium loopback fallback.'),
+           require('./fallback/rendererCaptureMonitor').RendererSystemAudioCapture)
+        : NativeModule?.SystemAudioCapture;
 }
 
 export class SystemAudioCapture extends EventEmitter {
@@ -86,6 +90,11 @@ export class SystemAudioCapture extends EventEmitter {
             console.warn('[SystemAudioCapture] getActiveBackend failed:', e);
         }
         return '';
+    }
+
+    /** The output device id this capture was asked to bind to; null = the default route. */
+    public getRequestedDeviceId(): string | null {
+        return this.deviceId;
     }
 
     /**

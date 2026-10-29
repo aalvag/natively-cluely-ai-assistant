@@ -10,6 +10,7 @@ import { CredentialsManager } from './CredentialsManager';
 import { PHONE_MIRROR_HTML } from './phoneMirrorClient';
 import { DOM_CONTEXT_MAX_CHARS } from '../config/constants';
 import { sanitizeContextEnvelope } from './browser-context/sanitize';
+import { describeUnreadableFormulas, PAGE_CAPTURE_FALLBACK_CHANNEL } from './pageCaptureFallback';
 import { isPhoneImagePath } from '../utils/phoneImage';
 import { splitGistLine, stripGistTrailer } from '../../src/lib/displayMarkup';
 
@@ -77,6 +78,9 @@ export type StreamEvent =
     }
   | { type: 'meeting'; active: boolean; reset: boolean }
   | { type: 'attachments'; items: PhoneAttachment[] }
+  // The overlay's Answer button is recording the desktop mic (it reads Stop);
+  // the phone's Answer chip mirrors it.
+  | { type: 'recording'; active: boolean }
   | { type: 'images'; id: string; images: PhoneAttachment[]; createdAt: string };
 
 /**
@@ -97,6 +101,12 @@ export interface PhoneImage {
   data: Buffer;
   mime: 'image/jpeg' | 'image/png' | 'image/webp';
   ext: 'jpg' | 'png' | 'webp';
+}
+
+/** One of the extension's formula images (#645). */
+export interface FormulaImage extends PhoneImage {
+  /** The first and last formula number it shows, as `[formula N, see image]` in the text. */
+  formulas?: [number, number];
 }
 
 /** One line of live transcript as the phone receives it. */
@@ -261,6 +271,8 @@ export class PhoneMirrorService {
   // every screenshot seen in it lately, by path.
   private attachments: PhoneAttachment[] = [];
   private attachmentPaths: string[] = [];
+  // The overlay's manual (Answer / Stop) recording, mirrored (see setRecording).
+  private recording = false;
   private shots = new Map<string, PhoneAttachment & { fromPhone: boolean }>();
   private rateBuckets = new Map<string, { count: number; resetAt: number }>();
   private statusListeners = new Set<StatusListener>();
@@ -310,7 +322,16 @@ export class PhoneMirrorService {
   private meetingPeopleListener: ((socket: object, report: Record<string, unknown>) => void) | null = null;
   // In-flight desktop→extension requests keyed by reqId, resolved by the
   // matching `capture-ack`/`tabs` control frame (or a timeout).
-  private pendingCaptures = new Map<string, { resolve: (r: { ok: boolean; reason?: string; category?: string }) => void; timer: ReturnType<typeof setTimeout> }>();
+  private pendingCaptures = new Map<string, {
+    resolve: (r: DomCaptureResult) => void;
+    timer: ReturnType<typeof setTimeout>;
+    /** From the request's /dom POST: formulas its text could not carry (#645). */
+    unreadableFormulas?: number;
+    /** From the request's /dom POST: the extension's image of the formulas with no text (#645). */
+    formulaImages?: FormulaImage[];
+  }>();
+  // A popup capture's formula images: no request to hand them to (#645).
+  private formulaImageHandler: ((images: FormulaImage[], unreadableFormulas: number) => void) | null = null;
   private pendingTabs = new Map<string, { resolve: (tabs: ExtensionTab[]) => void; timer: ReturnType<typeof setTimeout> }>();
   // reqIds the desktop issued for capture-dom and is still waiting to receive over
   // /dom. The FIRST matching /dom POST consumes its reqId and delivers to the
@@ -614,6 +635,9 @@ export class PhoneMirrorService {
       this.transcriptPartial = null;
       this.history = [];
       this.awaitingAnswers.clear();
+      // The overlay drops a recording on either edge; the phone's chip must
+      // not keep reading Stop. Its own 'meeting' frame resets the chip too.
+      this.recording = false;
       if (this.livePartial) {
         this.droppedStreams.add(this.livePartial.streamId);
         // Bounded: a stream that never finishes must not pin memory.
@@ -656,6 +680,20 @@ export class PhoneMirrorService {
     if (same) return;
     this.attachments = next;
     this.broadcast({ type: 'attachments', items: next });
+  }
+
+  /**
+   * Mirror the overlay's Answer button: true while it records the desktop mic
+   * (it reads Stop), false once it stops. A tap on the phone's Answer chip
+   * toggles it, and without this the phone showed no sign that it had.
+   * Tracked while stopped too, like the tray, so a phone that connects later
+   * sees whether a recording is running.
+   */
+  setRecording(active: boolean): void {
+    const next = active === true;
+    if (next === this.recording) return;
+    this.recording = next;
+    this.broadcast({ type: 'recording', active: next });
   }
 
   /** The screenshots in the overlay's tray, for a question typed on the phone (the overlay then clears it). */
@@ -820,6 +858,14 @@ export class PhoneMirrorService {
     this.liveRenderTimer = null;
   }
 
+  /** Where a popup capture's formula images go (main saves and attaches them). */
+  setFormulaImageHandler(handler: (images: FormulaImage[], unreadableFormulas: number) => void): () => void {
+    this.formulaImageHandler = handler;
+    return () => {
+      if (this.formulaImageHandler === handler) this.formulaImageHandler = null;
+    };
+  }
+
   setPhoneImageHandler(handler: (image: PhoneImage) => Promise<unknown>): () => void {
     this.phoneImageHandler = handler;
     return () => {
@@ -949,9 +995,12 @@ export class PhoneMirrorService {
    * Ask the most-recently-active companion extension to capture the active tab
    * (or `tabId`) and POST it to /dom. Resolves when the extension acks `done`,
    * or `{ok:false}` on error/timeout/no-extension so the caller can fall back
-   * to a screenshot. The DOM itself flows over /dom, not this promise.
+   * to a screenshot. The DOM itself flows over /dom, not this promise; only
+   * the formulas drawn as SVG with no text are carried over from it: the
+   * extension's image of them, and how many it could not draw (the caller
+   * adds a screenshot for those when there is no image).
    */
-  requestDomCapture(opts?: { tabId?: number; timeoutMs?: number }): Promise<{ ok: boolean; reason?: string }> {
+  requestDomCapture(opts?: { tabId?: number; timeoutMs?: number }): Promise<DomCaptureResult> {
     const target = this.pickExtensionClient();
     if (!target) return Promise.resolve({ ok: false, reason: 'no-extension' });
     const reqId = generateToken();
@@ -960,7 +1009,7 @@ export class PhoneMirrorService {
     // is consumed on first /dom POST or cleared on settle below.
     this.openCaptureReqIds.add(reqId);
     return new Promise((resolve) => {
-      const settle = (r: { ok: boolean; reason?: string }) => {
+      const settle = (r: DomCaptureResult) => {
         this.openCaptureReqIds.delete(reqId);
         resolve(r);
       };
@@ -1226,6 +1275,11 @@ export class PhoneMirrorService {
           // Settings) happens to refresh it.
           this.emitStatusClientCount();
           if (this.meetingTabsWanted && this.extTokenSockets.has(ws)) this.sendMeetingTabsSubscribe(ws, true);
+          try {
+            ws.send(JSON.stringify({ type: 'desktop-features', formulaImages: FORMULA_IMAGE_LIMITS }));
+          } catch (_) {
+            /* the close handler clears this socket */
+          }
           return true;
         }
         return false;
@@ -1258,7 +1312,12 @@ export class PhoneMirrorService {
             this.pendingCaptures.delete(msg.reqId);
             pending.resolve(
               status === 'done'
-                ? { ok: true, category: typeof msg.category === 'string' ? msg.category : undefined }
+                ? {
+                    ok: true,
+                    category: typeof msg.category === 'string' ? msg.category : undefined,
+                    unreadableFormulas: pending.unreadableFormulas,
+                    formulaImages: pending.formulaImages,
+                  }
                 : status === 'none'
                   ? { ok: false, reason: 'none' }
                   : { ok: false, reason: typeof msg.error === 'string' ? msg.error : 'error' },
@@ -1443,6 +1502,7 @@ export class PhoneMirrorService {
     this.token = '';
     this.extToken = '';
     this.livePartial = null;
+    this.recording = false;
     this.cancelLiveRender();
     this.rateBuckets.clear();
     this.armedUntil = 0;
@@ -1550,7 +1610,7 @@ export class PhoneMirrorService {
       req.on('data', (chunk) => {
         if (limitExceeded) return;
         body += chunk;
-        if (body.length > 500000) {
+        if (body.length > MAX_DOM_TEXT_BODY_CHARS + MAX_FORMULA_IMAGE_CHARS) {
           limitExceeded = true;
           const headers: Record<string, string> = { 'Content-Type': 'text/plain' };
           if (allowedOrigin) headers['Access-Control-Allow-Origin'] = allowedOrigin;
@@ -1611,6 +1671,28 @@ export class PhoneMirrorService {
             // listeners (onDomContextReceived(dom, meta)) keep working unchanged.
             const envelope = sanitizeContextEnvelope(parsed.envelope);
             targetWin.webContents.send('dom-context-received', cappedDom, meta, envelope);
+            // The extension acks `done` only after this 200, so the pending
+            // capture is still open here. The count stays in main (it decides
+            // the screenshot); the renderer's meta shape is unchanged.
+            const formulas = unreadableFormulasOf(parsed.meta);
+            const formulaImages = formulaImagesOf(parsed.formulaImages, parsed.formulaImageRanges);
+            const pendingCapture = typeof parsed.reqId === 'string' ? this.pendingCaptures.get(parsed.reqId) : undefined;
+            if (pendingCapture && formulas > 0) pendingCapture.unreadableFormulas = formulas;
+            if (pendingCapture && formulaImages.length) pendingCapture.formulaImages = formulaImages;
+            // A capture from the extension popup has no request to hand them to:
+            // its images are attached in the overlay. A screenshot taken now
+            // would show the popup, so without images the notice says plainly
+            // that the formulas are missing.
+            if (typeof parsed.reqId !== 'string') {
+              if (formulaImages.length && this.formulaImageHandler) {
+                this.formulaImageHandler(formulaImages, formulas);
+              } else if (formulas > 0 || formulaImages.length) {
+                targetWin.webContents.send(
+                  PAGE_CAPTURE_FALLBACK_CHANNEL,
+                  describeUnreadableFormulas(Math.max(formulas, formulaImages.length), 'not-taken'),
+                );
+              }
+            }
             res.writeHead(200, jsonHeaders);
             res.end(JSON.stringify({ success: true }));
             return;
@@ -1984,6 +2066,8 @@ export class PhoneMirrorService {
       );
       // Always sent, so a phone coming back never keeps a tray the desktop has since cleared.
       ws.send(JSON.stringify({ type: 'attachments', items: this.attachments }));
+      // Likewise, so a phone that reconnects never keeps reading Stop.
+      ws.send(JSON.stringify({ type: 'recording', active: this.recording }));
     } catch (_) {
       /* client may be gone already */
     }
@@ -2316,6 +2400,77 @@ function sanitizeCaptureMeta(raw: unknown): DomCaptureMeta | undefined {
   };
   // Drop the object entirely if nothing useful survived.
   return Object.values(out).some((v) => v !== undefined) ? out : undefined;
+}
+
+/**
+ * `meta.unreadableFormulas` from the extension: how many formulas the page
+ * text could not carry. 0 for anything that is not a positive whole number.
+ */
+export function unreadableFormulasOf(meta: unknown): number {
+  const v = meta && typeof meta === 'object' ? (meta as Record<string, unknown>).unreadableFormulas : undefined;
+  return typeof v === 'number' && Number.isInteger(v) && v > 0 ? Math.min(v, 10_000) : 0;
+}
+
+/** What requestDomCapture resolves with. */
+export interface DomCaptureResult {
+  ok: boolean;
+  reason?: string;
+  category?: string;
+  /** Formulas with no text that no formula image shows (#645). */
+  unreadableFormulas?: number;
+  /** The extension's image of the formulas with no text, already checked to be PNG or JPEG (#645). */
+  formulaImages?: FormulaImage[];
+}
+
+/** At most this many formula images per capture. */
+const MAX_FORMULA_IMAGES = 3;
+/** Per image, decoded. */
+const MAX_FORMULA_IMAGE_BYTES = 400_000;
+/** All of a capture's formula images, as the data URLs the extension sends. */
+const MAX_FORMULA_IMAGE_CHARS = 1_200_000;
+/** A /dom body without formula images: the page text and its meta. */
+const MAX_DOM_TEXT_BODY_CHARS = 500_000;
+
+/**
+ * What the extension may send as `formulaImages`, told to it on connect: an
+ * extension that has not heard this does not draw them, so a desktop that
+ * cannot read them never gets text that points at them.
+ */
+export const FORMULA_IMAGE_LIMITS = {
+  maxImages: MAX_FORMULA_IMAGES,
+  // The whole data URL, prefix included, so it always decodes within
+  // MAX_FORMULA_IMAGE_BYTES.
+  maxImageChars: Math.floor(MAX_FORMULA_IMAGE_BYTES / 3) * 4,
+  maxTotalChars: MAX_FORMULA_IMAGE_CHARS,
+} as const;
+
+/**
+ * The `formulaImages` of a /dom POST (data URLs the extension drew), as images
+ * checked by their leading bytes, each with its entry of `formulaImageRanges`
+ * (the first and last formula number it shows) when that is two whole
+ * numbers in order. Anything else is dropped.
+ */
+export function formulaImagesOf(raw: unknown, rawRanges?: unknown): FormulaImage[] {
+  if (!Array.isArray(raw)) return [];
+  const ranges = Array.isArray(rawRanges) ? rawRanges : [];
+  const out: FormulaImage[] = [];
+  for (const [i, item] of raw.slice(0, MAX_FORMULA_IMAGES).entries()) {
+    if (typeof item !== 'string') continue;
+    const m = /^data:image\/(?:png|jpeg);base64,([A-Za-z0-9+/=]+)$/.exec(item);
+    if (!m) continue;
+    const data = Buffer.from(m[1], 'base64');
+    if (!data.length || data.length > MAX_FORMULA_IMAGE_BYTES) continue;
+    const kind = sniffImage(data);
+    if (!kind || kind.mime === 'image/webp') continue;
+    const range = ranges[i];
+    const whole = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
+    const formulas: [number, number] | undefined =
+      Array.isArray(range) && range.length === 2 && whole(range[0]) && whole(range[1]) && range[0] <= range[1]
+        ? [range[0], range[1]]
+        : undefined;
+    out.push({ data, ...kind, ...(formulas ? { formulas } : {}) });
+  }
+  return out;
 }
 
 /** What an upload really is, from its leading bytes; null when not an image we take. */

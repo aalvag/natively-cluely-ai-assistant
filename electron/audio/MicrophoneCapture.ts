@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { loadNativeModule } from './nativeModuleLoader';
 import { normalizeSpeechEdge } from './speechEdge';
+import { rendererCaptureFallbackActive } from './fallback/fallbackPolicy';
 
 // RustMicCapture is the native Rust class (napi-rs) that captures microphone input.
 // Uses LAZY init — the native monitor is NOT created in the constructor. Constructing
@@ -9,7 +10,10 @@ import { normalizeSpeechEdge } from './speechEdge';
 // though no meeting is active (the user-facing invariant we're protecting here).
 function getRustMicCapture(): any {
     const NativeModule: any = loadNativeModule();
-    return NativeModule?.MicrophoneCapture;
+    return rendererCaptureFallbackActive(!!NativeModule?.MicrophoneCapture)
+        ? (console.warn('[MicrophoneCapture] Native audio module unavailable: using the Chromium capture fallback.'),
+           require('./fallback/rendererCaptureMonitor').RendererMicCapture)
+        : NativeModule?.MicrophoneCapture;
 }
 
 export class MicrophoneCapture extends EventEmitter {

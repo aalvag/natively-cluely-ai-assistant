@@ -6,6 +6,9 @@ export interface AppSettings {
     /** The Calendar account name whose full-name mentions in saved notes were carried
      *  to the first name (calendarNameMigration); set once per name. */
     calendarFirstNameMigratedFor?: string;
+    /** Saved notes were cleaned of models' "empty" placeholders (GitHub #662,
+     *  placeholderNotesMigration); set once. */
+    placeholderNotesCleaned?: boolean;
     // Only boot-critical or non-encrypted settings should live here.
     // In the future, other non-secret data like 'language' or 'theme'
     // can be moved here from CredentialsManager to allow early boot access.
@@ -35,6 +38,10 @@ export interface AppSettings {
     // while idle. Off by default — the hotkey's existing behavior is unchanged
     // until the user opts in from Settings > General.
     ambientChatEnabled?: boolean;
+    /** Ambient AI Chat was turned off once for installs upgraded from an older
+     *  build (turnAmbientChatOffOnce); set once, after which the user's own
+     *  choice stands. */
+    ambientChatResetOnUpgrade?: boolean;
     // Automatic answers after the interviewer finishes a question. Off by
     // default: until the user opts in from Settings > General, an answer is
     // produced only by the What-to-Answer hotkey, exactly as before. The
@@ -82,7 +89,9 @@ export interface AppSettings {
     // The notes window (`?window=notes`, 2026-10-15): where it was and how big,
     // and whether it was open when last used, so a meeting starting reopens it
     // (without taking focus) for someone who keeps it open.
-    notesWindowState?: { x: number; y: number; width: number; height: number; open: boolean };
+    notesWindowState?: { x: number; y: number; width: number; height: number; open: boolean; layout?: number };
+    /** What a meeting opens: the overlay or the notepad (utils/meetingSurface.ts). */
+    meetingSurface?: 'overlay' | 'notepad';
     // Direct Assist is the opt-in, single-provider answer path. It deliberately
     // bypasses meeting retrieval and the legacy answer-orchestration pipeline.
     // Keep the persisted default OFF during rollout; the operator kill switch
@@ -152,7 +161,7 @@ export interface AppSettings {
     // setting to disable that floor.
     browserAutoDetectCoding?: boolean;        // default true
     browserAutoAttachCoding?: boolean;        // default true
-    browserAskBeforeUnknown?: boolean;        // default true
+    browserAskBeforeUnknown?: boolean;        // default true ("Hold back unsure pages")
     browserAiClassifierEnabled?: boolean;     // default false (opt-in)
     browserAutoDetectJobDescriptions?: boolean; // default false
     browserAutoDetectDeveloperDocs?: boolean; // default false
@@ -645,6 +654,22 @@ export class SettingsManager {
             console.error('[SettingsManager] Failed to read settings file; continuing READ-ONLY for this session:', e);
             this.settings = {};
             this.settingsUnreadable = true;
+        }
+        this.turnAmbientChatOffOnce();
+    }
+
+    // Ambient AI Chat skips capture and STT for every meeting, and builds before
+    // the overlay's "Ambient" chip showed nothing about it, so users who had
+    // switched it on read it as broken transcription (#679, #696). Turn it off
+    // once when this build first loads an older settings.json. The marker is set
+    // in memory on every path, including a fresh install, so it is persisted by
+    // the same write that turns the setting back on and the reset never repeats.
+    private turnAmbientChatOffOnce(): void {
+        if (this.settings.ambientChatResetOnUpgrade) return;
+        this.settings.ambientChatResetOnUpgrade = true;
+        if (this.settings.ambientChatEnabled === true) {
+            console.warn('[SettingsManager] Turning Ambient AI Chat off once after the upgrade');
+            this.set('ambientChatEnabled', false);
         }
     }
 

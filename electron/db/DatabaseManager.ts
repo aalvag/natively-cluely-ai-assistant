@@ -2758,6 +2758,30 @@ export class DatabaseManager {
         }
     }
 
+    /**
+     * A mode's notes sections replaced by another set (a note template applied
+     * in the Modes Manager), in one transaction: a failed insert leaves the old
+     * sections, never a half-written list.
+     */
+    public replaceNoteSections(modeId: string, sections: Array<{ id: string; title: string; description: string }>): boolean {
+        if (!this.db) return false;
+        try {
+            const del = this.db.prepare('DELETE FROM mode_note_sections WHERE mode_id = ?');
+            const ins = this.db.prepare(`
+                INSERT INTO mode_note_sections (id, mode_id, title, description, sort_order)
+                VALUES (?, ?, ?, ?, ?)
+            `);
+            this.db.transaction(() => {
+                del.run(modeId);
+                sections.forEach((s, i) => ins.run(s.id, modeId, s.title, s.description, i));
+            })();
+            return true;
+        } catch (e) {
+            console.error('[DatabaseManager] replaceNoteSections failed:', e);
+            return false;
+        }
+    }
+
     public deleteAllNoteSections(modeId: string): void {
         if (!this.db) return;
         try {
@@ -4328,6 +4352,30 @@ export class DatabaseManager {
         } catch (error) {
             console.error('[DatabaseManager] listMeetingSummariesMentioning failed:', error);
             return [];
+        }
+    }
+
+    /** Every saved meeting's id and raw summary_json, for deterministic data
+     *  migrations that cannot narrow by text (placeholderNotesMigration). */
+    public listMeetingSummaries(): Array<{ id: string; summaryJson: string }> {
+        if (!this.db) return [];
+        try {
+            const rows = this.db.prepare('SELECT id, summary_json FROM meetings').all() as Array<{ id: string; summary_json: string }>;
+            return rows.map((r) => ({ id: r.id, summaryJson: r.summary_json || '{}' }));
+        } catch (error) {
+            console.error('[DatabaseManager] listMeetingSummaries failed:', error);
+            return [];
+        }
+    }
+
+    /** A notes rating follows its notes when a migration rewrites them. A rating
+     *  already stored under the new hash wins. */
+    public rekeyNotesRating(meetingId: string, fromHash: string, toHash: string): void {
+        if (!this.db || fromHash === toHash) return;
+        try {
+            this.db.prepare('UPDATE OR IGNORE meeting_notes_ratings SET notes_hash = ? WHERE meeting_id = ? AND notes_hash = ?').run(toHash, meetingId, fromHash);
+        } catch (error) {
+            console.warn(`[DatabaseManager] rekeyNotesRating failed for ${meetingId}:`, error);
         }
     }
 

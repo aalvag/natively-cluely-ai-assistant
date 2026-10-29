@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { SkillUploadPayload } from './services/skills/SkillValidator';
 import type { NativelyUsageResponse, NativelyPlansResponse } from '../src/types/nativelyUsage';
 import type { MeetingOutputsApi } from '../src/types/meetingOutputs';
@@ -135,7 +135,7 @@ interface ElectronAPI {
   getScreenshots: () => Promise<Array<{ path: string; preview: string }>>;
   deleteScreenshot: (path: string) => Promise<{ success: boolean; error?: string }>;
   onScreenshotTaken: (callback: (data: { path: string; preview: string }) => void) => () => void;
-  onScreenshotAttached: (callback: (data: { path: string; preview: string }) => void) => () => void;
+  onScreenshotAttached: (callback: (data: { path: string; preview: string; formulaCapture?: string; quiet?: boolean }) => void) => () => void;
   onCaptureAndProcess: (callback: (data: { path: string; preview: string }) => void) => () => void;
   onSolutionsReady: (callback: (solutions: string) => void) => () => void;
   onResetView: (callback: () => void) => () => void;
@@ -151,6 +151,10 @@ interface ElectronAPI {
   onDebugError: (callback: (error: string) => void) => () => void;
   takeScreenshot: () => Promise<void>;
   takeSelectiveScreenshot: () => Promise<{ path: string; preview: string; cancelled?: boolean }>;
+  /** Paste a clipboard image into the overlay tray (issue #351). */
+  attachClipboardImage: () => Promise<{ empty?: true; success?: true; path?: string; error?: string }>;
+  /** Drag-drop a local image file into the overlay tray (issue #351). */
+  attachLocalImage: (file: File) => Promise<{ success?: boolean; path?: string; error?: string }>;
   moveWindowLeft: () => Promise<void>;
   moveWindowRight: () => Promise<void>;
   moveWindowUp: () => Promise<void>;
@@ -295,6 +299,7 @@ interface ElectronAPI {
     hasIbmWatsonKey: boolean;
     ibmWatsonRegion: string;
     hasSonioxKey: boolean;
+    hasQwenAsrKey: boolean;
   }>;
   // Free Trial
   startTrial: (surface?: string) => Promise<{
@@ -371,6 +376,7 @@ interface ElectronAPI {
       | 'azure'
       | 'ibmwatson'
       | 'soniox'
+      | 'qwen'
       | 'nvidia_nim'
       | 'natively'
       | 'local-whisper' | 'apple-speech',
@@ -445,11 +451,12 @@ interface ElectronAPI {
   setIbmWatsonApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>;
   setGroqSttModel: (model: string) => Promise<{ success: boolean; error?: string }>;
   setSonioxApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>;
+  setQwenAsrApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>;
   setNvidiaNimSttModel: (model: string) => Promise<{ success: boolean; error?: string }>;
   setSttModel: (provider: 'deepgram' | 'openai', model: string) => Promise<{ success: boolean; error?: string }>;
   setIbmWatsonRegion: (region: string) => Promise<{ success: boolean; error?: string }>;
   testSttConnection: (
-    provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim',
+    provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'qwen' | 'nvidia_nim',
     apiKey: string,
     region?: string,
   ) => Promise<{ success: boolean; error?: string }>;
@@ -476,6 +483,7 @@ interface ElectronAPI {
   onSuggestionError: (callback: (error: { error: string }) => void) => () => void;
   generateSuggestion: (context: string, lastQuestion: string) => Promise<{ suggestion: string }>;
   getInputDevices: () => Promise<Array<{ id: string; name: string }>>;
+  setMeetingInputDevice: (deviceId: string | null) => Promise<{ success: boolean }>;
   getOutputDevices: () => Promise<Array<{ id: string; name: string }>>;
   setRecognitionLanguage: (key: string) => Promise<{ success: boolean; error?: string }>;
   getAiResponseLanguages: () => Promise<Array<{ label: string; code: string }>>;
@@ -535,6 +543,8 @@ interface ElectronAPI {
     ocrTextLength?: number;
     imageCount?: number;
     usedImageInput?: boolean;
+    /** #647 Problem A: the screenshot answer was an assessment refusal that was retried with the capture cropped to the browser's page area. */
+    refusalRetry?: { cropped: boolean; improved: boolean };
   }>;
   startDirectAssist: (
     request: DirectAssistRequest,
@@ -930,6 +940,12 @@ interface ElectronAPI {
   setScreenShareSnapshots: (on: boolean) => Promise<{ success: boolean; error?: string }>;
   /** The overlay's auto-stop notice: Keep going. */
   meetingAutoStopKeepGoing: () => Promise<{ success: boolean }>;
+  /** Pause / resume transcription during a meeting (the notepad's pill). */
+  getTranscriptionPaused: () => Promise<boolean>;
+  setTranscriptionPaused: (paused: boolean) => Promise<{ success: boolean; paused: boolean }>;
+  onTranscriptionPaused: (callback: (data: { paused: boolean }) => void) => () => void;
+  /** 0..1, the louder of mic and call audio, sent to the notepad while it is open. */
+  onMeetingAudioLevel: (callback: (level: number) => void) => () => void;
   /** The user is typing in the overlay (throttled by the caller). */
   meetingAutoStopTyping: () => void;
   /** Assist (electron/services/assist): the daily brief, You owe, Brief me, the catch-up, Last time. */
@@ -954,6 +970,25 @@ interface ElectronAPI {
   onNotesWindowVisibility: (callback: (open: boolean) => void) => () => void;
   /** The notes window's text and the meeting it belongs to. */
   liveNotesGetState: () => Promise<{ phase: 'idle' | 'live' | 'ended'; meetingId: string | null; text: string }>;
+  liveNotesMeetingInfo: () => Promise<{ live: boolean; title: string | null; people: number; event?: { id: string; title: string | null; startTime: string | null; endTime: string | null; link: string | null } | null; attendees?: Array<{ email: string; name: string | null }>; selfEmail?: string | null; speakers?: { me: string; them: string } }>;
+  /** The notepad's title, typed by the user (the meeting is saved under it). */
+  /** Copy text from the notepad (main's clipboard: the window is never focused). */
+  notesWindowCopyText: (text: string) => Promise<{ success: boolean }>;
+  /** Write the OS clipboard from main: the Windows overlay is never a focused
+   *  document, which navigator.clipboard needs (src/lib/copyText.ts). */
+  clipboardWriteText: (text: string) => Promise<{ success: boolean }>;
+  liveNotesSetTitle: (title: string) => Promise<{ success: boolean; title?: string | null }>;
+  /** The note template for the running (or next) meeting's notes; null clears. */
+  liveNotesSetTemplate: (id: string | null) => Promise<{ success: boolean; error?: 'pro_required' | 'unknown_template' }>;
+  liveNotesGetTemplate: () => Promise<string | null>;
+  liveNotesFolders: () => Promise<Array<{ id: string; name: string; inFolder: boolean }>>;
+  liveNotesSetFolder: (folderId: string, inFolder: boolean) => Promise<{ success: boolean }>;
+  liveNotesCreateFolder: (name: string) => Promise<{ id: string; name: string } | null>;
+  /** The calendar's events around now, for "Link a different event". */
+  liveNotesCalendarCandidates: () => Promise<Array<{ id: string; title: string; startTime: string; endTime: string; people: number }>>;
+  liveNotesLinkEvent: (eventId: string | null) => Promise<{ success: boolean }>;
+  /** Add or remove a person on the linked event, for this meeting only. */
+  liveNotesSetAttendees: (change: { add?: string; remove?: string }) => Promise<{ success: boolean; error?: string }>;
   /** Every change of the notes window's text (main keeps it with the meeting). */
   liveNotesSetText: (text: string) => void;
   onLiveNotesState: (callback: (state: { phase: 'idle' | 'live' | 'ended'; meetingId: string | null; text?: string }) => void) => () => void;
@@ -1074,6 +1109,10 @@ interface ElectronAPI {
   stealthTapAvailable: () => Promise<boolean>;
   stealthTapOpenSettings: () => Promise<void>;
   stealthTapStop: () => Promise<void>;
+  /** Clipboard text for the stealth-typed box's paste (overlay only). */
+  stealthReadClipboard: () => Promise<string>;
+  /** Copy/cut from the stealth-typed box (overlay only). */
+  stealthWriteClipboard: (text: string) => Promise<void>;
   stealthTapStart: () => Promise<boolean>;
   /** False on macOS when a composition IME (Pinyin/Hangul/Kanji/…) is
    *  enabled — the tap captures below the IME and breaks composition, so
@@ -1087,7 +1126,7 @@ interface ElectronAPI {
   stealthTapRefreshIme: () => Promise<boolean>;
   /** Ollama runtime failure notifications (F-119). */
   onOllamaError: (cb: (data: { message: string }) => void) => () => void;
-  onStealthTapState: (cb: (state: { active: boolean; reason?: string }) => void) => () => void;
+  onStealthTapState: (cb: (state: { active: boolean; reason?: string; target?: 'overlay' | 'notes' }) => void) => () => void;
   onStealthKeyCaptured: (
     cb: (ev: { keyCode: number; chars: string; flags: number; isKeyDown: boolean }) => void,
   ) => () => void;
@@ -1224,6 +1263,9 @@ interface ElectronAPI {
   // Ambient AI Chat — when enabled, meetings run without mic/system audio capture
   getAmbientChatEnabled: () => Promise<boolean>;
   setAmbientChatEnabled: (enabled: boolean) => Promise<{ success: boolean }>;
+  // The running meeting captures no audio (started with Ambient AI Chat on)
+  getMeetingAudioCapture: () => Promise<{ withoutAudio: boolean }>;
+  onMeetingAudioCapture: (callback: (data: { withoutAudio: boolean }) => void) => () => void;
   getAutoAnswerEnabled: () => Promise<boolean>;
   setAutoAnswerEnabled: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
   getDirectAssistEnabled: () => Promise<boolean>;
@@ -1434,6 +1476,8 @@ interface ElectronAPI {
   ) => Promise<{ success: boolean; error?: string }>;
   modesDeleteNoteSection: (id: string) => Promise<{ success: boolean; error?: string }>;
   modesRemoveAllNoteSections: (modeId: string) => Promise<{ success: boolean; error?: string }>;
+  modesApplyNoteTemplate: (modeId: string, templateId: string) => Promise<{ success: boolean; sections?: any[]; error?: string }>;
+  modesGetDefaultNoteSections: (modeId: string) => Promise<Array<{ title: string; description: string }>>;
 
   // Meeting interface theme — cross-window propagation. The settings window
   // writes the new theme to localStorage and calls `setMeetingInterfaceTheme`,
@@ -1445,6 +1489,9 @@ interface ElectronAPI {
   // Settings → Advanced → "Genie animation", passed to every window the same way.
   setGenieAnimationEnabled: (enabled: boolean) => void;
   onGenieAnimationChanged: (callback: (enabled: boolean) => void) => () => void;
+  // Settings › Overlay: the meeting overlay's button order, passed to every window the same way.
+  setOverlayButtonOrder: (order: string[]) => void;
+  onOverlayButtonOrderChanged: (callback: (order: string[]) => void) => () => void;
 
   // Cancel the in-flight gemini-chat-stream. Renderer wires this to "drop
   // the current answer" user actions (Escape, navigation, chat-overlay unmount).
@@ -1567,6 +1614,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getRecognitionLanguages: () => ipcRenderer.invoke('get-recognition-languages'),
   takeScreenshot: () => ipcRenderer.invoke('take-screenshot'),
   takeSelectiveScreenshot: () => ipcRenderer.invoke('take-selective-screenshot'),
+  attachClipboardImage: () => ipcRenderer.invoke('attach-clipboard-image'),
+  // The path stays out of the renderer: Electron 32 removed File.path, and
+  // only a File the user dropped has one (getPathForFile gives '' otherwise).
+  attachLocalImage: (file: File) => ipcRenderer.invoke('attach-local-image', webUtils.getPathForFile(file)),
   getScreenshots: () => ipcRenderer.invoke('get-screenshots'),
   deleteScreenshot: (path: string) => ipcRenderer.invoke('delete-screenshot', path),
 
@@ -1578,8 +1629,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.removeListener('screenshot-taken', subscription);
     };
   },
-  onScreenshotAttached: (callback: (data: { path: string; preview: string }) => void) => {
-    const subscription = (_: any, data: { path: string; preview: string }) => callback(data);
+  onScreenshotAttached: (callback: (data: { path: string; preview: string; formulaCapture?: string; quiet?: boolean }) => void) => {
+    const subscription = (_: any, data: { path: string; preview: string; formulaCapture?: string; quiet?: boolean }) => callback(data);
     ipcRenderer.on('screenshot-attached', subscription);
     return () => {
       ipcRenderer.removeListener('screenshot-attached', subscription);
@@ -1792,6 +1843,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.send('phone-mirror:attachments', items),
   phoneMirrorImagesSent: (id: string, paths: string[]) =>
     ipcRenderer.send('phone-mirror:images-sent', id, paths),
+  // The Answer button is recording the mic (reads Stop); the phone's chip follows.
+  phoneMirrorSetRecording: (active: boolean) =>
+    ipcRenderer.send('phone-mirror:recording', active),
   // The phone took a screenshot or photo off the tray; the overlay removes it.
   onPhoneMirrorDetach: (callback: (data: { path: string }) => void) => {
     const subscription = (_: any, data: any) => callback(data);
@@ -1950,6 +2004,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       | 'azure'
       | 'ibmwatson'
       | 'soniox'
+      | 'qwen'
       | 'nvidia_nim'
       | 'natively'
       | 'local-whisper' | 'apple-speech',
@@ -1973,11 +2028,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setIbmWatsonApiKey: (apiKey: string) => ipcRenderer.invoke('set-ibmwatson-api-key', apiKey),
   setGroqSttModel: (model: string) => ipcRenderer.invoke('set-groq-stt-model', model),
   setSonioxApiKey: (apiKey: string) => ipcRenderer.invoke('set-soniox-api-key', apiKey),
+  setQwenAsrApiKey: (apiKey: string) => ipcRenderer.invoke('set-qwen-asr-api-key', apiKey),
   setNvidiaNimSttModel: (model: string) => ipcRenderer.invoke('set-nvidia-nim-stt-model', model),
   setSttModel: (provider: 'deepgram' | 'openai', model: string) => ipcRenderer.invoke('set-stt-model', provider, model),
   setIbmWatsonRegion: (region: string) => ipcRenderer.invoke('set-ibmwatson-region', region),
   testSttConnection: (
-    provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim',
+    provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'qwen' | 'nvidia_nim',
     apiKey: string,
     region?: string,
   ) => ipcRenderer.invoke('test-stt-connection', provider, apiKey, region),
@@ -2139,6 +2195,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   getNativeAudioStatus: () => ipcRenderer.invoke('native-audio-status'),
   getInputDevices: () => ipcRenderer.invoke('get-input-devices'),
+  setMeetingInputDevice: (deviceId: string | null) => ipcRenderer.invoke('meeting:set-input-device', deviceId),
   getOutputDevices: () => ipcRenderer.invoke('get-output-devices'),
   setRecognitionLanguage: (key: string) => ipcRenderer.invoke('set-recognition-language', key),
   getAiResponseLanguages: () => ipcRenderer.invoke('get-ai-response-languages'),
@@ -2259,18 +2316,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   }) => ipcRenderer.invoke('test-inject-transcript', segment),
   testGetModeContext: () => ipcRenderer.invoke('test-get-mode-context'),
   resetIntelligence: () => ipcRenderer.invoke('reset-intelligence'),
-
-  // Action Button Mode (Dynamic Recap / Brainstorm toggle)
-  getActionButtonMode: () => ipcRenderer.invoke('get-action-button-mode'),
-  setActionButtonMode: (mode: 'recap' | 'brainstorm') =>
-    ipcRenderer.invoke('set-action-button-mode', mode),
-  onActionButtonModeChanged: (callback: (mode: 'recap' | 'brainstorm') => void) => {
-    const subscription = (_: any, mode: 'recap' | 'brainstorm') => callback(mode);
-    ipcRenderer.on('action-button-mode-changed', subscription);
-    return () => {
-      ipcRenderer.removeListener('action-button-mode-changed', subscription);
-    };
-  },
 
   onModeChanged: (callback: (data: { id: string | null; name: string | null; fileCount?: number; indexedCount?: number }) => void) => {
     const subscription = (_: any, data: { id: string | null; name: string | null }) =>
@@ -2463,8 +2508,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('update-meeting-title', { id, title }),
   updateMeetingSummary: (id: string, updates: any) =>
     ipcRenderer.invoke('update-meeting-summary', { id, updates }),
-  regenerateMeetingSummary: (id: string, opts?: { templateType?: string; modeId?: string; tone?: 'professional' | 'warm' | 'concise' | 'friendly' | 'your_style' }) =>
-    ipcRenderer.invoke('regenerate-meeting-summary', { id, templateType: opts?.templateType, modeId: opts?.modeId, tone: opts?.tone }),
+  regenerateMeetingSummary: (id: string, opts?: { templateType?: string; modeId?: string; noteTemplateId?: string | null; tone?: 'professional' | 'warm' | 'concise' | 'friendly' | 'your_style' }) =>
+    ipcRenderer.invoke('regenerate-meeting-summary', { id, templateType: opts?.templateType, modeId: opts?.modeId, noteTemplateId: opts?.noteTemplateId, tone: opts?.tone }),
   regenerateMeetingFollowUp: (id: string, tone?: 'professional' | 'warm' | 'concise' | 'friendly' | 'your_style') =>
     ipcRenderer.invoke('regenerate-meeting-followup', { id, tone }),
   updateMeetingSpeakerLabels: (id: string, labels: Record<string, string>) =>
@@ -2974,6 +3019,22 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getMeetingAutoStopEnabled: () => ipcRenderer.invoke('get-meeting-auto-stop-enabled'),
   setMeetingAutoStopEnabled: (on: boolean) => ipcRenderer.invoke('set-meeting-auto-stop-enabled', on),
   meetingAutoStopKeepGoing: () => ipcRenderer.invoke('meeting-auto-stop-keep-going'),
+  getTranscriptionPaused: () => ipcRenderer.invoke('meeting:get-transcription-paused'),
+  setTranscriptionPaused: (paused: boolean) => ipcRenderer.invoke('meeting:set-transcription-paused', paused),
+  onTranscriptionPaused: (callback: (data: { paused: boolean }) => void) => {
+    const subscription = (_: any, data: any) => callback({ paused: data?.paused === true });
+    ipcRenderer.on('meeting-transcription-paused', subscription);
+    return () => {
+      ipcRenderer.removeListener('meeting-transcription-paused', subscription);
+    };
+  },
+  onMeetingAudioLevel: (callback: (level: number) => void) => {
+    const subscription = (_: any, level: any) => callback(typeof level === 'number' ? level : 0);
+    ipcRenderer.on('meeting-audio-level', subscription);
+    return () => {
+      ipcRenderer.removeListener('meeting-audio-level', subscription);
+    };
+  },
   meetingAutoStopTyping: () => ipcRenderer.send('meeting-auto-stop-typing'),
   assistGetDailyBrief: (events: unknown[]) => ipcRenderer.invoke('assist:get-daily-brief', events),
   assistGetMeetingBrief: (event: unknown, opts?: { refresh?: boolean }) => ipcRenderer.invoke('assist:get-meeting-brief', event, opts),
@@ -3016,6 +3077,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   notesWindowToggle: () => ipcRenderer.invoke('notes-window:toggle'),
   notesWindowClose: () => ipcRenderer.invoke('notes-window:close'),
   notesWindowIsOpen: () => ipcRenderer.invoke('notes-window:is-open'),
+  getMeetingSurface: () => ipcRenderer.invoke('meeting-surface:get'),
+  setMeetingSurface: (surface: 'overlay' | 'notepad') => ipcRenderer.invoke('meeting-surface:set', surface),
   onNotesWindowVisibility: (callback: (open: boolean) => void) => {
     const subscription = (_: any, value: any) => callback(value === true);
     ipcRenderer.on('notes-window-visibility', subscription);
@@ -3024,6 +3087,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
     };
   },
   liveNotesGetState: () => ipcRenderer.invoke('live-notes:get-state'),
+  liveNotesMeetingInfo: () => ipcRenderer.invoke('live-notes:meeting-info'),
+  notesWindowCopyText: (text: string) => ipcRenderer.invoke('notes-window:copy-text', text),
+  clipboardWriteText: (text: string) => ipcRenderer.invoke('clipboard:write-text', text),
+  liveNotesSetTitle: (title: string) => ipcRenderer.invoke('live-notes:set-title', title),
+  liveNotesSetTemplate: (id: string | null) => ipcRenderer.invoke('live-notes:set-template', id),
+  liveNotesGetTemplate: () => ipcRenderer.invoke('live-notes:get-template'),
+  liveNotesFolders: () => ipcRenderer.invoke('live-notes:folders'),
+  liveNotesSetFolder: (folderId: string, inFolder: boolean) => ipcRenderer.invoke('live-notes:set-folder', { folderId, inFolder }),
+  liveNotesCreateFolder: (name: string) => ipcRenderer.invoke('live-notes:create-folder', name),
+  liveNotesCalendarCandidates: () => ipcRenderer.invoke('live-notes:calendar-candidates'),
+  liveNotesLinkEvent: (eventId: string | null) => ipcRenderer.invoke('live-notes:link-event', { eventId }),
+  liveNotesSetAttendees: (change: { add?: string; remove?: string }) => ipcRenderer.invoke('live-notes:set-attendees', change),
   liveNotesSetText: (text: string) => ipcRenderer.send('live-notes:set-text', text),
   onLiveNotesState: (callback: (state: { phase: 'idle' | 'live' | 'ended'; meetingId: string | null; text?: string }) => void) => {
     const subscription = (_: any, value: any) => callback(value);
@@ -3271,6 +3346,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   stealthTapAvailable: () => ipcRenderer.invoke('stealth-tap:available'),
   stealthTapOpenSettings: () => ipcRenderer.invoke('stealth-tap:open-settings'),
   stealthTapStop: () => ipcRenderer.invoke('stealth-tap:stop'),
+  stealthReadClipboard: () => ipcRenderer.invoke('stealth-edit:read-clipboard'),
+  stealthWriteClipboard: (text: string) => ipcRenderer.invoke('stealth-edit:write-clipboard', text),
   stealthTapStart: () => ipcRenderer.invoke('stealth-tap:start'),
   stealthTapShouldAutoEngage: () => ipcRenderer.invoke('stealth-tap:should-auto-engage'),
   stealthTapRefreshIme: () => ipcRenderer.invoke('stealth-tap:refresh-ime'),
@@ -3284,8 +3361,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.removeListener('ollama-error', sub);
     };
   },
-  onStealthTapState: (cb: (state: { active: boolean; reason?: string }) => void) => {
-    const sub = (_: any, state: { active: boolean; reason?: string }) => cb(state);
+  onStealthTapState: (cb: (state: { active: boolean; reason?: string; target?: 'overlay' | 'notes' }) => void) => {
+    const sub = (_: any, state: { active: boolean; reason?: string; target?: 'overlay' | 'notes' }) => cb(state);
     ipcRenderer.on('stealth-tap-state', sub);
     return () => {
       ipcRenderer.removeListener('stealth-tap-state', sub);
@@ -3426,6 +3503,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Ambient AI Chat — when enabled, meetings run without mic/system audio capture
   getAmbientChatEnabled: () => ipcRenderer.invoke('get-ambient-chat-enabled'),
   setAmbientChatEnabled: (enabled: boolean) => ipcRenderer.invoke('set-ambient-chat-enabled', enabled),
+  // The running meeting captures no audio (started with Ambient AI Chat on)
+  getMeetingAudioCapture: () => ipcRenderer.invoke('meeting:get-audio-capture'),
+  onMeetingAudioCapture: (callback: (data: { withoutAudio: boolean }) => void) => {
+    const subscription = (_: any, data: { withoutAudio: boolean }) => callback(data);
+    ipcRenderer.on('meeting-audio-capture', subscription);
+    return () => {
+      ipcRenderer.removeListener('meeting-audio-capture', subscription);
+    };
+  },
   getAutoAnswerEnabled: () => ipcRenderer.invoke('get-auto-answer-enabled'),
   setAutoAnswerEnabled: (enabled: boolean) => ipcRenderer.invoke('set-auto-answer-enabled', enabled),
   getDirectAssistEnabled: () => ipcRenderer.invoke('get-direct-assist-enabled'),
@@ -3656,6 +3742,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   modesDeleteNoteSection: (id: string) => ipcRenderer.invoke('modes:delete-note-section', id),
   modesRemoveAllNoteSections: (modeId: string) =>
     ipcRenderer.invoke('modes:remove-all-note-sections', modeId),
+  modesApplyNoteTemplate: (modeId: string, templateId: string) =>
+    ipcRenderer.invoke('modes:apply-note-template', modeId, templateId),
+  modesGetDefaultNoteSections: (modeId: string) => ipcRenderer.invoke('modes:get-default-note-sections', modeId),
 
   // Meeting interface theme — see ElectronAPI interface for rationale.
   setMeetingInterfaceTheme: (theme: string) => {
@@ -3676,6 +3765,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('genie-animation:changed', handler);
     return () => {
       ipcRenderer.removeListener('genie-animation:changed', handler);
+    };
+  },
+  setOverlayButtonOrder: (order: string[]) => {
+    ipcRenderer.send('overlay-buttons:set', order);
+  },
+  onOverlayButtonOrderChanged: (callback: (order: string[]) => void) => {
+    const handler = (_evt: unknown, order: string[]) => callback(order);
+    ipcRenderer.on('overlay-buttons:changed', handler);
+    return () => {
+      ipcRenderer.removeListener('overlay-buttons:changed', handler);
     };
   },
 

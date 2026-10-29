@@ -456,6 +456,13 @@
   filter: brightness(0) invert(1) !important;
 }
 
+/* Default light: the top pill's logo is drawn 15% bolder (the owner's call).
+   Black on a pale pill read thin beside the Hide label; same outline, only
+   the ring, bars and diagonal are thicker. */
+[data-theme='light'] [data-interface-theme='default'] .top-pill-logo {
+  content: url('./components/ui/natively-mark-bold.svg');
+}
+
 /* liquid-glass and modern themes always have a dark background panel,
    so the logo must always render white regardless of system light/dark mode. */
 [data-interface-theme="liquid-glass"] .force-black-icon,
@@ -474,7 +481,7 @@
    CLOUD_PROVIDERS has no `natively` entry, and the sidebar's Natively API item
    uses the <NativelyLogoMark> SVG. The app icon is a WHITE monochrome glyph on
    transparency, drawn for the dark theme, and an <img> cannot take the tile's
-   own ink the way `.natively-key-mark` does with a mask. On the pale light
+   own ink the way a CSS mask can. On the pale light
    tile it was therefore an invisible ghost. Light theme flattens it to black;
    dark theme leaves the artwork untouched.
 
@@ -549,6 +556,10 @@
   --overlay-shell-blur:         48px;
   --overlay-pill-blur:          28px;
 
+  /* The panel is dark whatever the app theme, so the accent must be the
+     dark-mode one: without this the light theme's periwinkle-600 landed on
+     the navy glass (the modern block already does the same with #8FB4F7). */
+  --accent-primary: var(--periwinkle-300);
 }
 
 /* Glass shell — pure CSS liquid-glass.
@@ -868,6 +879,90 @@
 }
 .overlay-bare-icon[data-state="on"] {
   color: var(--accent-primary);
+}
+
+/* Click-through pill (ClickThroughToggle). Idle it is the bare icon above;
+   while `data-phase="expanded"` it opens to the width its label needs and
+   takes a tinted box. Edge strength is a per-theme token: the dark panels
+   carry a 42% accent line, the pale light shell only a 20% hairline with the
+   caps as small white tiles, so the pill sits in the same family as the
+   `Ctrl + Shift + H` caps in the input above it. The two dark interface themes
+   paint a dark panel even under the light app theme, so they take the dark
+   values back. */
+.ov-ct {
+  --ov-ct-pill-bg: 16%;
+  --ov-ct-pill-line: 42%;
+  --ov-ct-key-line: 45%;
+  --ov-ct-key-bg: color-mix(in srgb, var(--accent-primary) 8%, transparent);
+  justify-content: flex-start;
+  padding: 0 0 0 6px;
+  overflow: hidden;
+  gap: 7px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+/* Doubled with .interaction-base, which comes later in this file and would
+   otherwise replace the list, dropping width and padding: the pill would snap.
+   transform stays for interaction-press. */
+.ov-ct.interaction-base {
+  transition: color 200ms, background-color 200ms, border-color 200ms,
+              transform 200ms cubic-bezier(0.25, 1, 0.5, 1), opacity 200ms,
+              width 280ms cubic-bezier(0.2, 0, 0, 1), padding 280ms cubic-bezier(0.2, 0, 0, 1);
+}
+[data-theme='light'] .ov-ct {
+  --ov-ct-pill-bg: 9%;
+  --ov-ct-pill-line: 20%;
+  --ov-ct-key-line: 26%;
+  --ov-ct-key-bg: rgba(255, 255, 255, 0.78);
+}
+[data-theme='light'] [data-interface-theme="liquid-glass"] .ov-ct,
+[data-theme='light'] [data-interface-theme="modern"] .ov-ct {
+  --ov-ct-pill-bg: 16%;
+  --ov-ct-pill-line: 42%;
+  --ov-ct-key-line: 45%;
+  --ov-ct-key-bg: color-mix(in srgb, var(--accent-primary) 8%, transparent);
+}
+.ov-ct[data-phase="expanded"] {
+  width: var(--ov-ct-w);
+  padding-left: 8px;
+  background: color-mix(in srgb, var(--accent-primary) var(--ov-ct-pill-bg), transparent);
+  border-color: color-mix(in srgb, var(--accent-primary) var(--ov-ct-pill-line), transparent);
+}
+.ov-ct-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 500;
+  opacity: 0;
+  transition: opacity 180ms;
+}
+.ov-ct[data-phase="expanded"] .ov-ct-label {
+  opacity: 1;
+  transition-delay: 80ms;
+}
+.ov-ct-key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--accent-primary) var(--ov-ct-key-line), transparent);
+  background: var(--ov-ct-key-bg);
+  color: var(--accent-primary);
+  font: 500 10.5px/1 ui-sans-serif, system-ui, sans-serif;
+  flex: none;
+}
+/* Secondary, not muted: muted fell below 3:1 on the light pill; primary read
+   as foreign next to it. */
+.ov-ct-exit {
+  color: var(--overlay-text-secondary);
+  margin-left: 1px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ov-ct.interaction-base, .ov-ct-label { transition: none; }
 }
 
 [data-interface-theme="modern"] .glass-shortcut-key,
@@ -3816,10 +3911,19 @@ html[data-platform="linux"] body {
 
 /* The launcher matches the 16px macOS gives its window natively (where the
    rounding comes from the OS, not from CSS — nothing to change there). Only
-   the launcher: the aux windows keep 8px. */
+   the launcher: the aux windows keep 8px.
+
+   `contain: paint` is what makes the radius hold in EVERY launcher state.
+   `overflow: hidden` alone does not clip `position: fixed` descendants —
+   their containing block is the viewport, not body — so full-window fixed
+   layers (the boot splash's `fixed inset-0 bg-[#000000]`, the modal dimmer
+   in App.tsx) punched square corners back through the rounded window.
+   Containment makes body their containing block AND clips them to its
+   rounded border box. Body is already viewport-sized, so nothing moves. */
 html[data-platform="win32"][data-window="launcher"] body,
 html[data-platform="linux"][data-window="launcher"] body {
   border-radius: 16px !important;
+  contain: paint;
 }
 
 /* ───────────────────────────────────────────────────────────────────────
@@ -8554,26 +8658,6 @@ html[data-platform="linux"][data-window="launcher"] body {
     0 6px 20px rgba(0, 0, 0, 0.28) !important;
 }
 
-/* The same 24px blueprint grid the pricing surfaces carry, in neutral ink.
-   Individually invisible; it is one of the things that makes them read as a
-   set, and it costs no colour to keep. */
-.natively-key-card::before {
-  content: '' !important;
-  position: absolute !important;
-  inset: 0 !important;
-  background-image:
-    linear-gradient(rgba(255, 255, 255, 0.020) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.020) 1px, transparent 1px) !important;
-  background-size: 24px 24px !important;
-  pointer-events: none !important;
-  z-index: 0 !important;
-}
-
-.natively-key-card > * {
-  position: relative !important;
-  z-index: 1 !important;
-}
-
 /* Light: same construction, no hue — but CLEAN at the bottom. It used to fall
    to #EAECEF with an inner bottom shade and an 18px floor blur; on a white page
    those three stacked into a grey smudge along the lower edge (the owner's
@@ -8589,10 +8673,84 @@ html[data-platform="linux"][data-window="launcher"] body {
     0 4px 12px rgba(0, 0, 0, 0.035) !important;
 }
 
-[data-theme='light'] .natively-key-card::before {
-  background-image:
-    linear-gradient(rgba(0, 0, 0, 0.028) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(0, 0, 0, 0.028) 1px, transparent 1px) !important;
+/* ── 1b. The plaque as a group of rows (SettingsPlaque, SettingsRow.tsx) ──
+   A hairline between rows, starting at the text column (1px border + 16px
+   padding + 40px tile + 16px gap = 73px) and stopping on the tile edge at the
+   right, as macOS System Settings insets its separators. Drawn as a pseudo
+   on each row after the first, so a row that folds in or out (Collapse,
+   CollapseItem) brings its own line and fades with it. Explicit colours:
+   dark --border-subtle is transparent. */
+.settings-plaque-rows > * { position: relative; }
+.settings-plaque-rows > * + *::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 73px;
+  right: 17px;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.07);
+  pointer-events: none;
+}
+[data-theme='light'] .settings-plaque-rows > * + *::before { background: rgba(0, 0, 0, 0.07); }
+
+/* A sunken well on the plaque (SETTINGS_WELL): forms and previews that open
+   under a row. Darker than the plaque with a soft inner top shadow in dark;
+   a faint grey with a hairline in light, where an inner shadow reads as dirt. */
+.settings-plaque-well {
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22);
+}
+[data-theme='light'] .settings-plaque-well {
+  background: rgba(0, 0, 0, 0.025);
+  border-color: rgba(0, 0, 0, 0.07);
+  box-shadow: none;
+}
+/* A well that is itself a text field (About you): the edge takes the accent
+   while the field inside has focus, as SETTINGS_INPUT's border does. No ring. */
+.settings-well-field {
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+.settings-well-field:focus-within {
+  border-color: color-mix(in srgb, var(--accent-primary) 60%, transparent);
+}
+[data-theme='light'] .settings-well-field:focus-within {
+  background: #fff;
+}
+
+/* The Skills plaque while a file is dragged over it: a periwinkle ring and a
+   frosted veil carrying one line, so the whole card reads as the target. It
+   materialises (blur and scale with the fade) in 180ms ease-out and leaves
+   in 120ms; pointer-events stay off so the card underneath keeps the drag. */
+.settings-drop-veil {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: inherit;
+  pointer-events: none;
+  color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+  box-shadow: inset 0 0 0 2px var(--accent-primary);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  opacity: 0;
+  transform: scale(0.985);
+  transition: opacity 120ms ease-out, transform 120ms ease-out;
+}
+.settings-drop-veil[data-open='true'] {
+  opacity: 1;
+  transform: none;
+  transition: opacity 180ms cubic-bezier(0.23, 1, 0.32, 1), transform 180ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .settings-drop-veil, .settings-drop-veil[data-open='true'] { transform: none; transition: opacity 120ms ease; }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .settings-drop-veil { -webkit-backdrop-filter: none; backdrop-filter: none; background: var(--bg-card); }
 }
 
 /* ── 2. The input, as a pressed-in well ───────────────────────────────────
@@ -8948,35 +9106,6 @@ html[data-platform="linux"][data-window="launcher"] body {
 
 [data-theme='light'] .natively-key-sub {
   color: var(--text-secondary) !important;
-}
-
-/* ── 5. The Natively mark ─────────────────────────────────────────────────
-   src/assets/logo.webp is a WHITE monochrome glyph on transparency, so on the
-   pale light plaque an <img> would be invisible. It is painted as a MASK
-   instead, which lets the mark take the plaque's own ink per theme. Both inks
-   are now achromatic: it was tier-card periwinkle in light theme, which made
-   the mark a second coloured element competing with the Activate button.
-
-   No squircle, no tinted well, no boxed header — just the mark, set on the
-   supporting-copy line. The URL arrives as a custom property set from the
-   TSX import so the bundler still fingerprints the asset. */
-.natively-key-mark {
-  width: 22px !important;
-  height: 22px !important;
-  flex-shrink: 0 !important;
-  background-color: rgba(255, 255, 255, 0.92) !important;
-  -webkit-mask-image: var(--natively-key-mark-src) !important;
-  mask-image: var(--natively-key-mark-src) !important;
-  -webkit-mask-size: contain !important;
-  mask-size: contain !important;
-  -webkit-mask-repeat: no-repeat !important;
-  mask-repeat: no-repeat !important;
-  -webkit-mask-position: center !important;
-  mask-position: center !important;
-}
-
-[data-theme='light'] .natively-key-mark {
-  background-color: #4B5563 !important;
 }
 
 /* ══ Pro License Active — the receipt, in the pricing cards' material ══════
@@ -9378,6 +9507,20 @@ html[data-platform="linux"][data-window="launcher"] body {
     --toggle-on: #6688F5;
     --toggle-thumb: #e1ebfe;
     --toggle-focus-ring: rgba(102, 136, 245, 0.22);
+}
+/* Light theme only (2026-10-24): the near-black #474949 off track read as a
+   heavy dark pill on the white plaques, louder than the ON switches beside
+   it. Off is now Apple's light-mode track (systemGray5 on white), and the
+   knob goes white with a small lift shadow, which is what keeps it visible
+   on a light track. Dark mode keeps the shared values above. */
+[data-theme='light'] {
+    --toggle-off: #DEDEE3;
+    --toggle-thumb: #FFFFFF;
+}
+[data-theme='light'] .t-toggle-thumb {
+    box-shadow:
+        0 1px 2.5px rgba(0, 0, 0, 0.18),
+        0 0 0 0.5px rgba(0, 0, 0, 0.04);
 }
 .t-toggle {
     position: relative;
@@ -12016,6 +12159,16 @@ html[data-platform="linux"][data-window="launcher"] body {
   visibility: hidden;
   flex: none;
 }
+/* Select all (Ctrl/Cmd+A while stealth typing): the input can't show its own
+   selection (never focused on Windows, readOnly under the tap), so the mirror
+   paints one: the glyph-width copy turns visible with transparent glyphs and a
+   selection-coloured fill laid over the real text. */
+.nat-caret-mirror > .nat-caret-text.nat-caret-selected {
+  visibility: visible;
+  color: transparent;
+  background: color-mix(in srgb, var(--accent-primary) 32%, transparent);
+  border-radius: 2px;
+}
 .nat-caret {
   flex: none;
   display: inline-block;
@@ -12469,6 +12622,223 @@ html[data-tooltips='off'] .t-tt {
   }
 }
 /* @overlay-motion:end */
+
+/* The notes window's listening bars (NotesWindow.tsx, 2026-10-20): three green
+   bars that move while the meeting runs, as Granola's pill shows. Still for
+   reduced motion. */
+.notes-listening-bars { display: inline-flex; align-items: center; gap: 2px; height: 14px; }
+.notes-listening-bars > span { width: 3px; height: 100%; border-radius: 2px; background: #34c759; transform-origin: center; animation: notes-listening-bar 1.1s ease-in-out infinite; }
+.notes-listening-bars > span:nth-child(2) { animation-delay: -0.35s; }
+.notes-listening-bars > span:nth-child(3) { animation-delay: -0.7s; }
+@keyframes notes-listening-bar { 0%, 100% { transform: scaleY(0.45); } 50% { transform: scaleY(1); } }
+@media (prefers-reduced-motion: reduce) { .notes-listening-bars > span { animation: none; transform: scaleY(0.8); } }
+/* The bars follow the real level once main sends it (NotesWindow: meeting-audio-level). */
+.notes-listening-bars.notes-level > span { animation: none; transition: transform 120ms linear; }
+
+/* The notepad's page (components/notes/NotesEditor.tsx, Tiptap). */
+.notes-editor { font-size: 15px; line-height: 1.65; color: var(--text-primary); caret-color: var(--text-primary); min-height: 100%; }
+.notes-editor > * + * { margin-top: 0.35em; }
+.notes-editor h1 { font-size: 21px; line-height: 1.3; font-weight: 600; margin-top: 0.9em; }
+.notes-editor h2 { font-size: 17.5px; line-height: 1.35; font-weight: 600; margin-top: 0.8em; }
+.notes-editor h3 { font-size: 15.5px; line-height: 1.4; font-weight: 600; margin-top: 0.7em; }
+.notes-editor > :first-child { margin-top: 0; }
+.notes-editor ul:not([data-type="taskList"]) { list-style: disc; padding-left: 1.3em; }
+.notes-editor ol { list-style: decimal; padding-left: 1.45em; }
+.notes-editor li > p { margin: 0; }
+.notes-editor li + li { margin-top: 0.15em; }
+.notes-editor ul[data-type="taskList"] { list-style: none; padding-left: 0.1em; }
+.notes-editor ul[data-type="taskList"] li { display: flex; align-items: flex-start; gap: 0.55em; }
+.notes-editor ul[data-type="taskList"] li > label { flex: none; margin-top: 0.28em; user-select: none; }
+.notes-editor ul[data-type="taskList"] li > div { flex: 1; min-width: 0; }
+.notes-editor ul[data-type="taskList"] li[data-checked="true"] > div { color: var(--text-tertiary); text-decoration: line-through; }
+.notes-editor .contains-task-list { list-style: none; padding-left: 0.1em; }
+.notes-editor .task-list-item input[type="checkbox"] { margin-right: 0.5em; vertical-align: -1px; }
+.notes-editor input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--text-primary); cursor: pointer; }
+.notes-editor a { color: var(--text-primary); text-decoration: underline; text-underline-offset: 2px; text-decoration-color: var(--text-tertiary); }
+.notes-editor hr { border: none; border-top: 1px solid color-mix(in srgb, var(--text-tertiary) 40%, transparent); margin: 1em 0; }
+.notes-editor p.is-editor-empty:first-child::before { content: attr(data-placeholder); float: left; height: 0; pointer-events: none; color: var(--text-tertiary); }
+.notes-editor .notes-find-hit { background: rgba(255, 204, 0, 0.28); border-radius: 2px; }
+.notes-editor .notes-find-current { background: rgba(255, 204, 0, 0.6); }
+.notes-editor .notes-hook-selection { background: rgba(10, 132, 255, 0.28); }
+/* Typing through the hook the page has no focus, so its caret is drawn. */
+.notes-editor .notes-hook-caret { display: inline-block; width: 0; height: 1.15em; vertical-align: text-bottom; border-left: 1.5px solid var(--text-primary); margin-right: -1.5px; animation: notes-hook-caret 1.1s steps(1) infinite; pointer-events: none; }
+@keyframes notes-hook-caret { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .notes-editor .notes-hook-caret { animation: none; } }
+
+/* ── The notepad in Granola's look (2026-10-20) ─────────────────────────────
+   Values read from Granola 7.663's own stylesheet (tokens, editor, bottom bar)
+   and measured against its live notes window at 500×923. Scoped to the
+   notepad (NotesWindow root `.notepad`); the meeting page keeps Natively's. */
+.notepad {
+  --np-surface: #f7f7f2; --np-elevated: #ffffff; --np-ink: #292929; --np-ink-strong: #1e1e1e;
+  --np-ink-secondary: #72726e; --np-ink-tertiary: #acada8; --np-placeholder: #acada8; --np-title-placeholder: #acada8;
+  --np-hairline: #47432a33; --np-ring: #47432a33; --np-wash: #625a220f; --np-wash-strong: #625a221a;
+  --np-caret: #5b6f00; --np-selection: #5b6f0033; --np-accent: #5b6f00; --np-focus: #5b6f00; --np-focus-ring: #788c1533;
+  --np-green: #74bd00; --np-red: #bd4a30; --np-chevron: #72726e; --np-stop: #72726e; --np-ask-placeholder: #72726e;
+  --np-marker: #72726e; --np-track: #f2f2ec; --np-thumb-border: #d2cfc6; --np-grip: #eaebe5;
+  --np-bubble-me: #b2c24866; --np-bubble-me-ink: #313225; --np-bubble-them: #f2f2ec; --np-bubble-them-ink: #292929;
+  --np-highlight-faint: #625a220a; --np-shadow-pill: 0px 4px 6px -2px #0000000d;
+  --np-shadow-pop: 0 10px 15px -3px #0000001a, 0 4px 6px -4px #0000001a;
+  --np-event: #a855f7;
+  /* Note templates gallery (2026-10-21), measured on Granola's: labels, the
+     section text, the icon tiles and the scrim behind the dialog. */
+  --np-label: #72726e; --np-ink-soft: #292929e6; --np-tile: #625a221a; --np-scrim: #0000004d;
+  background: var(--np-surface); color: var(--np-ink);
+}
+.notepad[data-np-theme="dark"] {
+  --np-surface: #292929; --np-elevated: #363635; --np-ink: #eaebe5; --np-ink-strong: #ffffff;
+  --np-ink-secondary: #9e9e99; --np-ink-tertiary: #818179; --np-placeholder: #72726e; --np-title-placeholder: #818179;
+  --np-hairline: #ffffff33; --np-ring: #ffffff26; --np-wash: #ffffff0f; --np-wash-strong: #ffffff14;
+  --np-caret: #d1e043; --np-selection: #b2c24833; --np-accent: #b2c248; --np-focus: #788c15; --np-focus-ring: #788c1533;
+  --np-chevron: #acada8; --np-stop: #9e9e99; --np-ask-placeholder: #acada8;
+  --np-marker: #acada8; --np-track: #212121; --np-thumb-border: #424242; --np-grip: #72726e;
+  --np-bubble-me: #292929; --np-bubble-me-ink: #f2f6e1; --np-bubble-them: #4e4d4b; --np-bubble-them-ink: #fcfcf8;
+  --np-highlight-faint: #ffffff0a;
+  --np-label: #acada8; --np-ink-soft: #eaebe5e6; --np-tile: #ffffff1f; --np-scrim: #00000099;
+}
+/* The Note templates gallery in Natively's own colours (2026-10-21), not
+   Granola's cream: lavender paper, violet ink, lavender rules and washes, white
+   cards, a periwinkle Apply (the website's colour doc: paper #FAF8FE, ink
+   #2E2A38 / #6B5F7D / #9C90AC, rule #DED4EB, core #9C6FF3, periwinkle #8050D4).
+   Only the gallery takes these; the notepad around it keeps its own. */
+.notepad .np-lavender {
+  --np-surface: #faf8fe; --np-elevated: #ffffff; --np-ink: #2e2a38; --np-ink-strong: #241f33;
+  --np-ink-secondary: #6b5f7d; --np-ink-tertiary: #9c90ac; --np-placeholder: #9c90ac; --np-label: #6b5f7d;
+  --np-ink-soft: #2e2a38e0; --np-hairline: #ded4eb; --np-ring: #ded4eb;
+  --np-wash: #9c6ff314; --np-wash-strong: #9c6ff324; --np-accent: #8050d4;
+  --np-tile: #efe6fd; --np-tile-ink: #643ea6;
+  --np-card: linear-gradient(176deg, #ffffff 0%, #fcfaff 60%, #f8f5fe 100%);
+  --np-cta: #8050d4; --np-cta-ink: #ffffff; --np-scrim: #241f3352;
+  --np-search-fill: #f1ecfb; --np-search-hover: #ebe4f9; --np-search-lift: 0 2px 8px -2px #4c2e7a1f;
+  --np-shadow-pop: 0 24px 60px -24px #4c2e7a59, 0 4px 12px -4px #4c2e7a1f;
+}
+.notepad[data-np-theme="dark"] .np-lavender {
+  --np-surface: #241f33; --np-elevated: #2e2843; --np-ink: #ece7f6; --np-ink-strong: #ffffff;
+  --np-ink-secondary: #a99ebd; --np-ink-tertiary: #7d7291; --np-placeholder: #7d7291; --np-label: #a99ebd;
+  --np-ink-soft: #ece7f6e0; --np-hairline: #ffffff1f; --np-ring: #ffffff1a;
+  --np-wash: #b9a1f61a; --np-wash-strong: #b9a1f629; --np-accent: #b9a1f6;
+  --np-tile: #b9a1f624; --np-tile-ink: #cdbdf9;
+  --np-card: #1c1829; --np-cta: #b9a1f6; --np-cta-ink: #241f33; --np-scrim: #000000a6;
+  --np-search-fill: #ffffff0f; --np-search-hover: #ffffff17; --np-search-lift: 0 2px 8px -2px #00000066;
+}
+/* The gallery's search: a filled pill, no outline at rest; typing lifts it to
+   the card colour with a hairline and a soft shadow (no focus ring). */
+.np-search {
+  background: var(--np-search-fill, var(--np-wash));
+  box-shadow: inset 0 0 0 1px transparent;
+  transition: background-color 150ms ease-out, box-shadow 150ms ease-out;
+}
+.np-search:hover { background: var(--np-search-hover, var(--np-wash-strong)); }
+.np-search:focus-within {
+  background: var(--np-elevated);
+  box-shadow: inset 0 0 0 1px var(--np-ring), var(--np-search-lift, 0 1px 2px #0000000f);
+}
+.np-search-clear { transition: background-color 120ms ease-out, transform 120ms ease-out; }
+.np-search-clear:hover { background: var(--np-wash-strong); }
+.np-search-clear:active { transform: scale(0.92); }
+@media (prefers-reduced-motion: reduce) { .np-search, .np-search-clear { transition: none; } }
+.notepad ::selection { background: var(--np-selection); }
+/* The pills, panels and popovers: the elevated surface with a 0.5px ring. */
+.np-elevated { background: var(--np-elevated); box-shadow: var(--np-shadow-pill), 0 0 0 0.5px var(--np-ring); }
+.notepad[data-np-theme="dark"] .np-elevated { box-shadow: var(--np-shadow-pill), inset 0 0 0 0.5px var(--np-ring); }
+.np-pop { background: var(--np-elevated); border-radius: 12px; box-shadow: var(--np-shadow-pop), 0 0 0 0.5px var(--np-ring); transform-origin: top left; animation: np-pop-in 75ms ease-out; }
+@keyframes np-pop-in { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+/* Granola's popups leave as they came: 75 ms back to .95 and out. */
+.np-pop[data-closing] { animation: np-pop-out 75ms ease-in forwards; pointer-events: none; }
+@keyframes np-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes np-pop-out { from { opacity: 1; transform: scale(1); } to { opacity: 0; transform: scale(0.95); } }
+/* The floating panel's plate (Granola's m5): the pills sit on it once a panel opens. */
+.np-plate { background: var(--np-elevated); box-shadow: var(--np-shadow-pill), 0 0 0 0.5px var(--np-ring); }
+.notepad[data-np-theme="dark"] .np-plate { box-shadow: var(--np-shadow-pill), inset 0 0 0 0.5px var(--np-ring); }
+/* A pill on the open plate drops its own ring and shadow (Granola: ring only when idle). */
+.np-elevated.np-flat { box-shadow: none; }
+/* The panel's top edge drags its height: hidden, half on the panel's hover, full on its own. */
+.np-grip > span { opacity: 0; background: var(--np-grip); transition: opacity 150ms, background-color 150ms; }
+.np-shell:hover .np-grip > span { opacity: 0.5; }
+.np-grip:hover > span, .np-grip[data-resizing] > span { opacity: 1; }
+.np-grip[data-resizing] > span { background: var(--np-ink-tertiary); }
+/* Find in the transcript (Granola's): every match yellow, the current one amber with a short blink. */
+.np-hit { background: #fde047; color: #18181b; border-radius: 0.25rem; box-shadow: -1px 0 #fde047, 1px 0 #fde047; }
+.np-hit[data-current] { background: #f59e0b; box-shadow: -1px 0 #f59e0b, 1px 0 #f59e0b; animation: np-beep 200ms ease-in-out; }
+@keyframes np-beep { from { box-shadow: 1px 0 0 4px #f59e0b, -1px 0 0 4px #f59e0b; } to { box-shadow: -1px 0 #f59e0b, 1px 0 #f59e0b; } }
+/* Words still being heard: three dots, 1 s, a quarter second apart. */
+.np-dots > span { width: 4px; height: 4px; border-radius: 9999px; background: currentColor; animation: np-jump 1s infinite; }
+.np-dots > span:nth-child(2) { animation-delay: 250ms; }
+.np-dots > span:nth-child(3) { animation-delay: 500ms; }
+@keyframes np-jump { 0%, 100% { opacity: 0.3; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-2px); } }
+/* A new question or answer arrives from 10px below. */
+.np-arrive { animation: np-arrive 200ms ease-out; }
+@keyframes np-arrive { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+/* The closed Ask pill lights faintly under the pointer. */
+.np-glow { position: relative; isolation: isolate; }
+.np-glow::before {
+  content: ''; position: absolute; inset: 0; border-radius: inherit; z-index: -1; pointer-events: none; opacity: 0; transition: opacity 300ms;
+  background: radial-gradient(1024px circle at var(--np-x, 50%) var(--np-y, 50%), hsla(0, 0%, 100%, 0.05) 0, transparent 500px);
+}
+.np-glow:hover::before { opacity: 1; }
+/* Back to the newest line, over the transcript. */
+.np-jump { background: #fcfcf8cc; box-shadow: 0 10px 15px -3px #0000001a, 0 4px 6px -4px #0000001a, 0 0 0 0.5px var(--np-ring); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); transition: background-color 150ms; }
+.np-jump:hover { background: #eaebe5cc; }
+.notepad[data-np-theme="dark"] .np-jump { background: #4e4d4b80; }
+.notepad[data-np-theme="dark"] .np-jump:hover { background: #72726e80; }
+.np-outline { box-shadow: inset 0 0 0 0.5px var(--np-hairline); }
+.np-wash:hover, .np-wash[aria-expanded="true"] { background: var(--np-wash); }
+/* The chip and folder button paint their hover 3px inside the hairline, as Granola's do. */
+.np-chip { position: relative; isolation: isolate; }
+.np-chip::before { content: ''; position: absolute; inset: 3px; border-radius: 9999px; z-index: -1; background: transparent; transition: background-color 75ms; }
+.np-chip:hover::before, .np-chip[aria-expanded="true"]::before { background: var(--np-wash); }
+/* Listening bars: 3 bars 3px wide, 2px apart, in a 13×20 box; red after 3s of silence. */
+.notepad .notes-listening-bars { height: 20px; width: 13px; gap: 2px; }
+.notepad .notes-listening-bars > span { width: 3px; border-radius: 9999px; background: var(--np-green); transition: background-color 300ms; }
+.notepad .notes-listening-bars.np-silent > span { background: var(--np-red); }
+.notepad .notes-listening-bars.np-paused > span { background: var(--np-ink-tertiary); animation: none; transform: scaleY(0.55); }
+.notepad .notes-listening-bars.notes-level > span { transition: transform 300ms ease-in-out, background-color 300ms; }
+/* The editor: 15px, line height 1.5, no space between paragraphs; headings at body size. */
+.notepad .notes-editor { font-size: 15px; line-height: 1.5; color: var(--np-ink); caret-color: var(--np-caret); }
+.notepad .notes-editor > * + * { margin-top: 0; }
+.notepad .notes-editor h1, .notepad .notes-editor h2, .notepad .notes-editor h3 { font-size: 15px; line-height: 1.5; font-weight: 600; color: var(--np-ink-strong); margin-top: 0; }
+.notepad .notes-editor h1 { position: relative; }
+.notepad .notes-editor h1::before { content: '#'; position: absolute; left: -20px; color: var(--np-ink-tertiary); opacity: 0.6; font-weight: 400; }
+.notepad .notes-editor ul:not([data-type="taskList"]) { list-style: disc; padding-left: 0; margin-left: 24px; padding-bottom: 8px; }
+.notepad .notes-editor ul:not([data-type="taskList"]) ul { list-style: circle; }
+.notepad .notes-editor ul:not([data-type="taskList"]) ul ul { list-style: square; }
+.notepad .notes-editor ol { list-style: decimal; padding-left: 0; margin-left: 24px; padding-bottom: 8px; }
+.notepad .notes-editor ol ol { list-style: lower-alpha; }
+.notepad .notes-editor ol ol ol { list-style: lower-roman; }
+.notepad .notes-editor li::marker { color: var(--np-marker); }
+.notepad .notes-editor li + li { margin-top: 0; }
+.notepad .notes-editor ul[data-type="taskList"] { padding-left: 0; padding-bottom: 8px; }
+.notepad .notes-editor ul[data-type="taskList"] li { gap: 8px; }
+.notepad .notes-editor ul[data-type="taskList"] li > label { margin-top: 3px; }
+.notepad .notes-editor ul[data-type="taskList"] li[data-checked="true"] > div { color: inherit; text-decoration: none; }
+.notepad .notes-editor input[type="checkbox"] {
+  appearance: none; -webkit-appearance: none; width: 16px; height: 16px; margin: 0; border-radius: 5px;
+  background: var(--np-elevated); box-shadow: inset 0 0 0 1px var(--np-hairline); display: grid; place-content: center; cursor: pointer;
+}
+.notepad .notes-editor input[type="checkbox"]:checked { background: var(--np-ink); box-shadow: none; }
+.notepad .notes-editor input[type="checkbox"]:checked::after {
+  content: ''; width: 9px; height: 5px; border-left: 1.75px solid var(--np-surface); border-bottom: 1.75px solid var(--np-surface);
+  transform: translateY(-1px) rotate(-45deg);
+}
+.notepad .notes-editor a { color: inherit; text-decoration-color: var(--np-ink-tertiary); }
+.notepad .notes-editor p.is-editor-empty:first-child::before { color: var(--np-placeholder); }
+.notepad .notes-editor .notes-find-hit { background: #fde04766; }
+.notepad .notes-editor .notes-find-current { background: #f59e0b99; border-radius: 0.25rem; animation: np-beep 200ms ease-in-out; }
+.notepad .notes-editor .notes-hook-selection { background: var(--np-selection); }
+.notepad .notes-editor .notes-hook-caret { border-left-color: var(--np-caret); }
+/* Ctrl/Cmd+A in a hook-typed one-line field: the window has no focus, so the
+   input's own selection would not paint. NotesWindow sets the text's width. */
+.notepad input[data-hook-selected="true"] { background-image: linear-gradient(var(--np-selection), var(--np-selection)); background-repeat: no-repeat; background-origin: content-box; background-position: left center; background-size: var(--hook-sel-w, 0px) 1.3em; }
+/* The scroll fades under the toolbar and above the bottom bar. */
+.np-fade-top { background: linear-gradient(to bottom, var(--np-surface), transparent); }
+.np-fade-bottom { background: linear-gradient(to top, var(--np-surface) 40%, transparent); }
+/* The Ask field's focus (a hook-typed field shows it too: the window has no focus then). */
+.np-ask { box-shadow: inset 0 0 0 1px transparent; transition: box-shadow 150ms; }
+.np-ask[data-engaged="true"] { box-shadow: inset 0 0 0 1px var(--np-focus), 0 0 0 3px var(--np-focus-ring); }
+/* After Stop: the My notes / Enhanced / Transcript switch, its thumb sliding. */
+.np-track { background: var(--np-track); box-shadow: inset 0 0 0 0.5px var(--np-ring); }
+.np-thumb { background: var(--np-elevated); box-shadow: inset 0 0 0 0.5px var(--np-thumb-border); transition: left 260ms cubic-bezier(.16,1,.3,1), width 260ms cubic-bezier(.16,1,.3,1); }
+@media (prefers-reduced-motion: reduce) { .np-pop, .np-pop[data-closing], .np-hit[data-current], .np-dots > span, .np-arrive, .notepad .notes-editor .notes-find-current { animation: none; } .np-thumb, .np-glow::before { transition: none; } }
 
 /* ── Theme switch: one tight dissolve of the whole window ───────────────────
    lib/themeTransition.mjs flips html[data-theme] inside a View Transition and

@@ -4,8 +4,9 @@ import * as crypto from 'crypto';
 import { repairCapReached, endsInsideFence } from './llm/repairCap';
 import { AntigravityService, initializeAntigravityLifecycle } from './services/AntigravityService';
 import { buildEmbeddingConfig } from './rag/embeddingConfigIdentity';
-import { app, BrowserWindow, dialog, desktopCapturer, ipcMain, nativeImage, shell, systemPreferences } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, desktopCapturer, ipcMain, nativeImage, shell, systemPreferences } from 'electron';
 import { setOpenAtLogin, getOpenAtLogin } from './utils/windowsTaskbarPolicy';
+import { normalizeMeetingSurface } from './utils/meetingSurface';
 import { micSettingsUri } from '../src/lib/micPermissionPolicy.mjs';
 import { resolveMacScreenStatus } from '../src/lib/permissionAttentionPolicy.mjs';
 import { hasOwnAiKey, resolveExpiredTrial } from '../src/lib/trialPolicy.mjs';
@@ -36,7 +37,8 @@ import { PHONE_THUMB_MAX_CHARS, PhoneMirrorService } from './services/PhoneMirro
 import { sanitizeContextEnvelope } from './services/browser-context/sanitize';
 import { formatEnvelopeForPrompt } from './services/browser-context/formatEnvelopeForPrompt';
 import { BrowserMetadataClassifierService } from './services/browser-context/BrowserMetadataClassifierService';
-import type { BrowserContextCategory, SafeWebsiteMetadata } from './services/browser-context/types';
+import { autoContextVerdict, buildAutoContextRequest, codingAutoAttachEnabled } from './services/browser-context/autoContextRequest';
+import type { SafeWebsiteMetadata } from './services/browser-context/types';
 import { SettingsManager } from './services/SettingsManager';
 import { RERANK_CANDIDATE_POOL, resolveRerankPoolSize } from './services/modes/rerankPool';
 import { buildRerankProbe } from './services/reranking/rerankProbe';
@@ -265,28 +267,28 @@ const DIRECT_ASSIST_IMAGE_MIMES: Readonly<Record<string, string>> = Object.freez
  * ring. They previously derived it independently — typed chat off a webContents
  * id, what-to-answer off the meeting id — so each surface built a history the
  * other could not read, and a screenshot described on one was invisible to the
- * other. `fallbackKey` covers a turn with no engine at all, where nothing else
- * is going to read the ring either.
+ * other. Outside a meeting the overlay's typed chat shares the key its hotkeys
+ * use, and any other window keeps its own (chatConversationKey). `fallbackKey`
+ * is the sender's webContents id.
  */
 function v3ConversationSessionId(appState: AppState, fallbackKey: string | number): string {
-  const {
-    resolveConversationSessionId, NO_CONVERSATION_SCOPE,
-  } = require('./context-intelligence/question/conversation-state-store') as
+  const { chatConversationKey } = require('./context-intelligence/question/conversation-state-store') as
     typeof import('./context-intelligence/question/conversation-state-store');
+  let engineKey: string | undefined;
   try {
     const manager = appState.getIntelligenceManager?.() as
       { conversationSessionId?: () => string } | undefined;
-    const key = manager?.conversationSessionId?.();
-    // `NO_CONVERSATION_SCOPE` means the engine has no meeting and no session, so
-    // its key is a shared bucket rather than an identity. Returning it here was
-    // truthy, so the per-sender fallback below was unreachable and every window
-    // — typed chat, what-to-answer, assist — collapsed into one ring. That is
-    // the failure the comment at IntelligenceEngine.conversationSessionId
-    // documents, and it made the renderer-destroyed clear below wipe the live
-    // ring that what-to-answer and assist were using.
-    if (key && key !== NO_CONVERSATION_SCOPE) return key;
-  } catch { /* no engine on this turn — fall through */ }
-  return resolveConversationSessionId(null, fallbackKey);
+    engineKey = manager?.conversationSessionId?.();
+  } catch { /* no engine on this turn — the sender's own key */ }
+  return chatConversationKey(engineKey, { id: fallbackKey, isOverlay: isOverlaySender(appState, fallbackKey) });
+}
+
+/** Whether `senderId` is the overlay window's renderer. */
+function isOverlaySender(appState: AppState, senderId: string | number): boolean {
+  try {
+    const overlay = appState.getWindowHelper?.()?.getOverlayWindow?.();
+    return Boolean(overlay && !overlay.isDestroyed() && overlay.webContents.id === Number(senderId));
+  } catch { return false; }
 }
 
 function isDirectAssistCanonicalPathInsideRoot(root: string, candidate: string): boolean {
@@ -638,10 +640,40 @@ export function initializeIpcHandlers(appState: AppState): void {
     const { LiveModelCatalogService } = require('./services/LiveModelCatalogService');
     LiveModelCatalogService.getInstance().setOnUpdated((provider: string, models: { id: string; label: string }[]) => {
       broadcastLiveCatalogUpdated(provider, models);
+      if (provider === 'agentrouter') void followAgentRouterCatalogue(models);
     });
   } catch (e: any) {
     console.warn('[IPC] Could not initialize LiveModelCatalogService update listener:', e?.message);
   }
+
+  /**
+   * AgentRouter retires models between releases (agentRouter.ts fact 7). When a
+   * fresh catalogue no longer lists the user's preferred AgentRouter model, move
+   * the preference to pickAgentRouterModel()'s choice, then let the
+   * runtime-default repair replace a retired default (isRetiredId treats an id
+   * the catalogue dropped as retired). A model the user picked that is still
+   * listed is never touched.
+   */
+  const followAgentRouterCatalogue = async (models: { id: string; label?: string }[]): Promise<void> => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const { isAgentRouterModelRetired, pickAgentRouterModel } = require('./llm/agentRouter') as typeof import('./llm/agentRouter');
+      const cm = CredentialsManager.getInstance();
+      const ids = models.map((m) => m.id);
+      const preferred: string | undefined = cm.getPreferredModel?.('agentrouter');
+      let changed = false;
+      if (preferred && isAgentRouterModelRetired(preferred, ids)) {
+        const next = pickAgentRouterModel(undefined, ids);
+        console.log(`[IPC] AgentRouter retired ${preferred}; preferred model is now ${next}`);
+        cm.setPreferredModel('agentrouter', next);
+        changed = true;
+      }
+      if (await refreshRuntimeDefaultIfUnavailable()) changed = true;
+      if (changed) broadcastCredentialsChanged();
+    } catch (e: any) {
+      console.warn('[IPC] Could not follow the AgentRouter catalogue:', e?.message);
+    }
+  };
 
   // A saved key re-reads that provider's catalogue (forced: the old one belonged
   // to the previous key). Not awaited, so a slow /models never delays the save.
@@ -726,9 +758,15 @@ export function initializeIpcHandlers(appState: AppState): void {
       // 410'd on every call. Repair it the same way.
       const { isNvidiaNimRetiredModelId } =
         require('./llm/nvidiaNimModels') as typeof import('./llm/nvidiaNimModels');
+      // AgentRouter's retired set is not a list in the code: it is whatever the
+      // key's last fetched catalogue stopped listing (agentRouter.ts fact 7).
+      const { isAgentRouterModelRetired, pickAgentRouterModel } =
+        require('./llm/agentRouter') as typeof import('./llm/agentRouter');
+      const agentrouterCatalogueIds: string[] = (cm.getCloudFetchedModels?.('agentrouter') || []).map((m: any) => m?.id);
       const isRetiredId = (modelId: string): boolean =>
         _isRetiredGroqId(modelId) ||
-        (!!modelId && modelId.startsWith('nvidia_nim/') && isNvidiaNimRetiredModelId(modelId));
+        (!!modelId && modelId.startsWith('nvidia_nim/') && isNvidiaNimRetiredModelId(modelId)) ||
+        isAgentRouterModelRetired(modelId, agentrouterCatalogueIds);
       // Which provider a model id belongs to. Mirrors the family checks below, kept
       // as one helper so the disabled-provider test and the credential test can
       // never disagree about what a given id is. The renderer's
@@ -866,12 +904,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       // modelAvailable() classifies. Do not re-prefix.
       const fluxionFallbackModel: string | null = cm.getPreferredModel?.('fluxion') || null;
       // Stored prefixed like the two above. Unlike them it has a default when
-      // the user never promoted one: AGENTROUTER_DEFAULT_MODEL (DeepSeek, the
-      // one model not rationed per day). modelAvailable() still gates it on the
+      // the user never promoted one: AGENTROUTER_DEFAULT_MODEL (the fastest
+      // model), and either is swapped for a catalogue entry when the fetched
+      // catalogue no longer lists it. modelAvailable() still gates it on the
       // key, the disabled switch and the allow-list.
       const agentrouterFallbackModel: string =
-        cm.getPreferredModel?.('agentrouter')
-        || (require('./llm/agentRouter') as typeof import('./llm/agentRouter')).AGENTROUTER_DEFAULT_MODEL;
+        pickAgentRouterModel(cm.getPreferredModel?.('agentrouter'), agentrouterCatalogueIds);
       // Same contract again: stored fully prefixed (`ninerouter/<alias>/<model>`),
       // the form modelAvailable() classifies. Do not re-prefix.
       const ninerouterFallbackModel: string | null = cm.getPreferredModel?.('ninerouter') || null;
@@ -1578,6 +1616,31 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  // Issue #351: paste a clipboard image into the overlay attachment tray.
+  // Prefer this over renderer clipboardData — Windows stealth typing never
+  // focuses the overlay document, so paste must go through main.
+  safeHandle('attach-clipboard-image', async () => {
+    try {
+      return await appState.attachClipboardImage();
+    } catch (error) {
+      console.warn('[IPC] attach-clipboard-image failed:', error);
+      return { empty: true, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  // Issue #351: drag-drop a local image file onto the overlay.
+  safeHandle('attach-local-image', async (_event, filePath: unknown) => {
+    if (typeof filePath !== 'string' || !filePath.trim()) {
+      return { success: false, error: 'invalid_path' };
+    }
+    try {
+      return await appState.attachLocalImageFile(filePath);
+    } catch (error) {
+      console.warn('[IPC] attach-local-image failed:', error);
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
   safeHandle('take-selective-screenshot', async () => {
     try {
       const screenshotPath = await appState.takeSelectiveScreenshot();
@@ -1624,6 +1687,10 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   safeHandle('show-window', async (event, inactive?: boolean) => {
+    // A notepad meeting keeps the overlay hidden against its own renderer's
+    // show requests (WindowHelper.isOverlayHeldHidden).
+    const wh = appState.getWindowHelper();
+    if (wh.isOverlayHeldHidden() && wh.getOverlayWindow()?.webContents.id === event.sender.id) return;
     // Default show main window (Launcher usually)
     appState.showMainWindow(inactive);
   });
@@ -2052,6 +2119,13 @@ export function initializeIpcHandlers(appState: AppState): void {
             try {
               PhoneMirrorService.getInstance().publishUserMessage(String(myStreamId), String(message || ''), { awaitingAnswer: true });
             } catch { /* mirror only */ }
+            // The Answer button's follow-ups come here too (issue #552), and the
+            // mic has already stored what was said. Checked now, as the legacy
+            // record site does, so the two-minute window starts from the ask.
+            try {
+              questionOnRecordAsSpeech = options?.liveQuestion === true
+                && spokenLineAlreadyInTranscript(appState.getIntelligenceManager()?.getCurrentMeetingTranscript(SPOKEN_DEDUPE_TAIL_LINES), message, Date.now());
+            } catch { /* not on record: stored as typed below */ }
             const { buildV3Prompt } = require('./context-intelligence/orchestration/engine-bridge');
             const { resolveModePolicy, isModeId, resolveModeIdOrWarn } = require('./context-intelligence/policies/mode-policy-registry');
             const { ModesManager } = require('./services/ModesManager');
@@ -2213,6 +2287,9 @@ export function initializeIpcHandlers(appState: AppState): void {
             // it was before this block existed (bytes only), because the port is
             // simply omitted. It must never fail a live answer.
             let v3ScreenDescription = '';
+            // The text came from the description cache, which only a dedicated
+            // transcription fills: the record needs no second read.
+            let v3ScreenIsTranscription = false;
             if (imagePaths?.length) {
               try {
                 const screenStore = require('./services/screen/ScreenshotDescriptionStore') as
@@ -2239,6 +2316,7 @@ export function initializeIpcHandlers(appState: AppState): void {
                     try { return appState.processingHelper.getLLMHelper().selectionStaysOnDevice() === true; } catch { return false; }
                   })();
                   v3ScreenDescription = hasOnDeviceScreenText(cachedDescription) && !turnOnDevice ? '' : cachedDescription;
+                  v3ScreenIsTranscription = Boolean(v3ScreenDescription);
                 }
                 const {
                   getScreenUnderstandingService,
@@ -2859,18 +2937,55 @@ export function initializeIpcHandlers(appState: AppState): void {
               if (!v3Truncated) {
                 try {
                   const {
-                    recordAnswerSummary,
+                    recordAnswerSummary, finishedTurnKey,
                   } = require('./context-intelligence/question/conversation-state-store');
                   // Third argument is what makes a screenshot survive its own
                   // turn: the description enters the conversation ring, so a
                   // later "what was in that screenshot?" has something to read.
                   // The key MUST match the one the scope above was built with,
                   // or this writes a ring nothing ever reads.
-                  recordAnswerSummary(
-                    v3ConversationSessionId(appState, senderId),
+                  // The key the turn STARTED under: a meeting starting while it
+                  // streamed must not move it to another ring, and a meeting
+                  // that ENDED took its ring with it, so the turn is not kept.
+                  const ringKey = v3ConversationKey;
+                  const ringOpen = finishedTurnKey(ringKey, v3ConversationSessionId(appState, senderId)) !== null;
+                  const { SCREEN_BEING_READ, SCREEN_NOT_TRANSCRIBED } = require('./services/screen/screenDescription') as
+                    typeof import('./services/screen/screenDescription');
+                  // A screenshot whose first reading came back empty was still
+                  // SHARED: recorded with no marker, a failed transcription below
+                  // left later turns told no screenshot was ever sent.
+                  const screenPlaceholder = v3ScreenDescription || (imagePaths?.length ? SCREEN_BEING_READ : undefined);
+                  const turn = ringOpen ? recordAnswerSummary(
+                    ringKey,
                     finalText,
-                    v3ScreenDescription || undefined,
-                  );
+                    screenPlaceholder,
+                    // THIS turn's question, captured when it started. Read from
+                    // the state at write time instead, a hotkey or Auto Answer
+                    // turn that advanced the same meeting ring while this one
+                    // streamed filed this answer, and its screenshot, under the
+                    // other turn's question.
+                    v3Question.trim() || undefined,
+                    { screenSource: (require('./context-intelligence/question/conversation-state') as
+                      typeof import('./context-intelligence/question/conversation-state')).screenSourceKey({ imagePaths }) },
+                  ) : null;
+                  // The screen text above is the ANSWERING pre-pass's paraphrase
+                  // ("your build failed due to disk quota"), with the error code
+                  // and ticket id a follow-up asks for already gone. Replaced by
+                  // a dedicated transcription, as What-to-answer does, after the
+                  // answer and off its path.
+                  if (turn && imagePaths?.length && !v3ScreenIsTranscription) {
+                    const { transcribeScreenForMemory } = require('./services/screen/screenTranscription') as
+                      typeof import('./services/screen/screenTranscription');
+                    const { attachScreenToAnsweredTurn } = require('./context-intelligence/question/conversation-state-store') as
+                      typeof import('./context-intelligence/question/conversation-state-store');
+                    void transcribeScreenForMemory(imagePaths, v3Question.trim() || undefined)
+                      .catch((): string => '')
+                      .then((screenText) => {
+                        if (screenText) attachScreenToAnsweredTurn(ringKey, finalText, screenText, { turn, placeholder: screenPlaceholder });
+                        else if (screenPlaceholder === SCREEN_BEING_READ) attachScreenToAnsweredTurn(ringKey, finalText, SCREEN_NOT_TRANSCRIBED, { turn, placeholder: screenPlaceholder });
+                      })
+                      .catch(() => { /* the pre-pass text stays */ });
+                  }
                 } catch { /* continuity only */ }
                 try {
                   // The user/answer PAIR is the antecedent unit for follow-up
@@ -2888,8 +3003,10 @@ export function initializeIpcHandlers(appState: AppState): void {
               } // end answer-side sinks
               try {
                 const im = appState.getIntelligenceManager();
-                im?.addTranscript?.({ text: String(message || ''), speaker: 'user', timestamp: Date.now(), final: true, origin: 'manual_chat' }, true);
-                if (!v3Truncated) im?.addAssistantMessage?.(finalText, undefined, 'manual_chat');
+                if (!questionOnRecordAsSpeech) {
+                  im?.addTranscript?.({ text: String(message || ''), speaker: 'user', timestamp: Date.now(), final: true, origin: 'manual_chat' }, true);
+                }
+                if (!v3Truncated) im?.addAssistantMessage?.(finalText, forThisTurn(undefined), 'manual_chat');
                 // Usage too: ai_interactions ("usage" in Meeting Notes) is
                 // populated solely from SessionTracker's usage log at
                 // saveMeeting time. Every legacy exit logs it; without this,
@@ -2957,14 +3074,27 @@ export function initializeIpcHandlers(appState: AppState): void {
         try {
           if (!_convoCleanupRegistered.has(senderId)) {
             _convoCleanupRegistered.add(senderId);
+            // The window's OWN out-of-meeting ring, decided now. MUST be the key
+            // the writers use outside a meeting: this was String(senderId)
+            // while writes moved to v3ConversationSessionId, which left "clear"
+            // deleting an empty bucket and the real ring alive behind it.
+            //
+            // And never the meeting's ring. The key was worked out when the
+            // window was DESTROYED, which mid-meeting is `m:<meeting>`: closing
+            // or reloading the launcher wiped the history the overlay's typed
+            // chat and hotkeys were using, every screenshot included, while the
+            // window's own ring was left behind. The meeting's ring is the
+            // engine's to clear, when the meeting ends.
+            let ownRingKey: string | null = null;
+            try {
+              ownRingKey = (require('./context-intelligence/question/conversation-state-store') as
+                typeof import('./context-intelligence/question/conversation-state-store'))
+                .outOfMeetingConversationKey({ id: senderId, isOverlay: isOverlaySender(appState, senderId) });
+            } catch { /* noop */ }
             event.sender?.once?.('destroyed', () => {
               _convoCleanupRegistered.delete(senderId);
               try { _manualConversationMemory.clearSession(String(senderId)); } catch { /* noop */ }
-              // MUST be the same key the writers use. This was String(senderId)
-              // while writes moved to v3ConversationSessionId, which would have
-              // left "clear" deleting an empty bucket and the real ring — the
-              // user's screenshots included — alive behind it.
-              try { require('./context-intelligence/question/conversation-state-store').clearConversationState(v3ConversationSessionId(appState, senderId)); } catch { /* noop */ }
+              try { if (ownRingKey) require('./context-intelligence/question/conversation-state-store').clearConversationState(ownRingKey); } catch { /* noop */ }
             });
           }
         } catch { /* noop */ }
@@ -5135,7 +5265,10 @@ export function initializeIpcHandlers(appState: AppState): void {
             inputTokens: _estimatePerfTokens(`${message ?? ''}${context ?? ''}`),
             isUserCancelled: () => manualSuperseded || myController?.signal.aborted === true,
             onDiagnostics: (record) => {
-              if (record.terminationReason === 'done') return;
+              if (record.terminationReason === 'done') {
+                if (record.heldPastStallMs > 0) console.log('[Perf] manual chat answer held past the stall budget', record);
+                return;
+              }
               console.log('[Perf] manual chat turn ended early', record);
             },
           });
@@ -7569,6 +7702,13 @@ export function initializeIpcHandlers(appState: AppState): void {
     return { success: true };
   });
 
+  // Whether the running meeting captures no audio (it started with Ambient AI
+  // Chat on and nothing has started a capture since). Changes are pushed as
+  // 'meeting-audio-capture'.
+  safeHandle('meeting:get-audio-capture', async () => {
+    return { withoutAudio: appState.isMeetingWithoutAudio() };
+  });
+
   safeHandle('get-auto-answer-enabled', async () => {
     return appState.getAutoAnswerEnabled();
   });
@@ -8076,8 +8216,23 @@ export function initializeIpcHandlers(appState: AppState): void {
     return { success: true };
   });
 
+  // A ⌘/Ctrl+Y capture's screenshot for formulas its page text could not
+  // carry, when it was still being taken as this request started (#645). Added
+  // before validation, which checks it like any other attachment.
+  const withPageFormulaScreenshot = async (raw: unknown): Promise<unknown> => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+    const r = raw as Record<string, unknown>;
+    const page = r.pageContext;
+    const dom = page && typeof page === 'object' ? (page as Record<string, unknown>).dom : undefined;
+    if (typeof dom !== 'string' || (r.imagePaths !== undefined && !Array.isArray(r.imagePaths))) return raw;
+    const merged = await appState.withFormulaScreenshot(dom, r.imagePaths as string[] | undefined);
+    const text = appState.formulaTextFor(dom, merged);
+    if (merged === r.imagePaths && text === dom) return raw;
+    return { ...r, imagePaths: merged, pageContext: { ...(page as Record<string, unknown>), dom: text } };
+  };
+
   safeHandle('direct-assist-stream', async (event, rawRequest: unknown) => {
-    const normalized = normalizeDirectAssistRequest(rawRequest);
+    const normalized = normalizeDirectAssistRequest(await withPageFormulaScreenshot(rawRequest));
     if (normalized.error || !normalized.request) {
       return rejectDirectAssist(
         event.sender,
@@ -8991,7 +9146,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   // mismatch (overlay falls back to default), at worst an attribute-injection
   // vector if any consumer ever switched from `setAttribute` to template
   // literals. Hardening the trust boundary at the broadcast point is cheap.
-  const VALID_INTERFACE_THEMES = new Set(['default', 'liquid-glass', 'modern']);
+  const VALID_INTERFACE_THEMES = new Set(['default', 'liquid-glass', 'modern', 'lavender']);
   /**
    * The launcher's boot reveal has fully landed — restore background throttling.
    *
@@ -9065,6 +9220,32 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (win.isDestroyed()) return;
       try {
         win.webContents.send('genie-animation:changed', enabled);
+      } catch {
+        // Renderer may be tearing down between isDestroyed() and send.
+      }
+    });
+  });
+
+  // Settings › Overlay: which buttons the meeting overlay shows and in what
+  // order (every button once; the first five are the row), passed on the same
+  // way. Only the known ids, each once, are passed on; the renderer
+  // re-normalises whatever arrives (src/lib/overlayButtonOrder.ts).
+  const OVERLAY_BUTTON_IDS = new Set([
+    'what_to_answer', 'clarify', 'recap', 'follow_up', 'answer',
+    'brainstorm', 'catch_me_up', 'define', 'sound_smart',
+  ]);
+  safeOn('overlay-buttons:set', (_event, order: unknown) => {
+    if (
+      !Array.isArray(order) ||
+      order.length !== OVERLAY_BUTTON_IDS.size ||
+      new Set(order).size !== order.length ||
+      !order.every((id) => typeof id === 'string' && OVERLAY_BUTTON_IDS.has(id))
+    ) return;
+    const copy = [...order] as string[];
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (win.isDestroyed()) return;
+      try {
+        win.webContents.send('overlay-buttons:changed', copy);
       } catch {
         // Renderer may be tearing down between isDestroyed() and send.
       }
@@ -13237,6 +13418,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasIbmWatsonKey: hasKey(creds.ibmWatsonApiKey),
         ibmWatsonRegion: creds.ibmWatsonRegion || 'us-south',
         hasSonioxKey: hasKey(creds.sonioxApiKey),
+        hasQwenAsrKey: hasKey(creds.qwenAsrApiKey),
         // STT key values — returned so the settings UI can pre-populate input fields.
         // SECURITY FIX (P0): Return masked keys only, never raw API keys.
         // The hasSttGroqKey boolean tells UI if key exists — no raw key needed.
@@ -13247,6 +13429,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         sttAzureKey: creds.azureApiKey ? `sk-...${creds.azureApiKey.slice(-4)}` : '',
         sttIbmKey: creds.ibmWatsonApiKey ? `sk-...${creds.ibmWatsonApiKey.slice(-4)}` : '',
         sttSonioxKey: creds.sonioxApiKey ? `sk-...${creds.sonioxApiKey.slice(-4)}` : '',
+        sttQwenAsrKey: creds.qwenAsrApiKey ? `...${creds.qwenAsrApiKey.slice(-4)}` : '',
         openAiSttBaseUrl: creds.openAiSttBaseUrl || '',
         hasTavilyKey: hasKey(creds.tavilyApiKey),
         // Dynamic Model Discovery - preferred models
@@ -13314,6 +13497,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasIbmWatsonKey: false,
         ibmWatsonRegion: 'us-south',
         hasSonioxKey: false,
+        hasQwenAsrKey: false,
         hasTavilyKey: false,
         sttGroqKey: '',
         sttOpenaiKey: '',
@@ -13322,6 +13506,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         sttAzureKey: '',
         sttIbmKey: '',
         sttSonioxKey: '',
+        sttQwenAsrKey: '',
       };
     }
   });
@@ -13433,6 +13618,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         | 'azure'
         | 'ibmwatson'
         | 'soniox'
+        | 'qwen'
         | 'nvidia_nim'
         | 'natively'
         | 'local-whisper'
@@ -13753,6 +13939,21 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  safeHandle('set-qwen-asr-api-key', async (_, apiKey: string) => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const persisted = CredentialsManager.getInstance().setQwenAsrApiKey(apiKey);
+      await appState.reconfigureSttProvider();
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) win.webContents.send('credentials-changed');
+      });
+      return sttKeyPersistenceWarning(apiKey, persisted) ?? { success: true };
+    } catch (error: any) {
+      console.error('Error saving Qwen ASR API key:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
   safeHandle('set-ibmwatson-region', async (_, region: string) => {
     try {
       // SSRF guard: region is interpolated into the IBM Watson STT hostname
@@ -13792,7 +13993,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     'test-stt-connection',
     async (
       _,
-      provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim',
+      provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'qwen' | 'nvidia_nim',
       apiKey: string,
       region?: string,
     ) => {
@@ -13871,6 +14072,46 @@ export function initializeIpcHandlers(appState: AppState): void {
               clearTimeout(timeout);
               console.error(`[IPC] Deepgram test error: ${err.message}`);
               resolve({ success: false, error: err.message || 'Connection failed' });
+            });
+          });
+        }
+
+        if (provider === 'qwen') {
+          const WebSocket = require('ws');
+          return await new Promise<{ success: boolean; error?: string }>((resolve) => {
+            let settled = false;
+            const ws = new WebSocket(
+              'wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=qwen3-asr-flash-realtime',
+              { headers: { Authorization: `Bearer ${apiKey}` }, handshakeTimeout: 10000 },
+            );
+            const timeout = setTimeout(() => done({ success: false, error: 'Qwen ASR connection timed out' }), 12000);
+            const done = (result: { success: boolean; error?: string }) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timeout);
+              ws.terminate();
+              resolve(result);
+            };
+            ws.on('message', (data: Buffer) => {
+              try {
+                const event = JSON.parse(data.toString());
+                if (event.type === 'session.created') {
+                  ws.send(JSON.stringify({ event_id: `natively_qwen_test_${Date.now()}`, type: 'session.finish' }));
+                } else if (event.type === 'session.finished') {
+                  done({ success: true });
+                } else if (event.type === 'error') {
+                  done({ success: false, error: event.error?.message || 'Qwen ASR rejected the connection' });
+                }
+              } catch {
+                done({ success: false, error: 'Invalid Qwen ASR response' });
+              }
+            });
+            ws.on('unexpected-response', (_request: unknown, response: { statusCode?: number }) => {
+              done({ success: false, error: `Qwen ASR returned HTTP ${response.statusCode ?? 'error'}` });
+            });
+            ws.on('error', (error: Error) => done({ success: false, error: error.message }));
+            ws.on('close', () => {
+              if (!settled) done({ success: false, error: 'Qwen ASR closed the connection' });
             });
           });
         }
@@ -14213,13 +14454,29 @@ export function initializeIpcHandlers(appState: AppState): void {
     const name = pathMod.basename(src).slice(0, 80);
     const dest = pathMod.join(dir, `${Date.now()}-${name.replace(/[^\w.-]+/g, '_')}`);
     await fsp.copyFile(src, dest);
-    let description = '';
+    // The description is waited for only as long as a cloud provider takes
+    // (the 6 s pre-pass budget). A slower reader — a signed-in Codex /
+    // Antigravity model gets 30 s, Ollama 45 s — finishes in the background
+    // and fills the entry in, so the button never hangs on it. The notes
+    // prompt reads the description when the notes are written, not now.
+    // The notes writer waits for a description still pending at Stop
+    // (awaitPendingImageDescriptions), so a late one is not lost.
+    //
+    // A description that never comes leaves "(not described)": the notes just
+    // say an image was attached.
+    const entry = { path: dest, name, description: `Image "${name}" (not described)`, at: Date.now() };
     try {
-      const { transcribeScreenForMemory } = require('./services/screen/screenTranscription');
-      description = String((await transcribeScreenForMemory([dest], 'A picture the user attached to their meeting notes: describe what it shows, including any text, in a few sentences.')) ?? '').trim();
-    } catch { /* kept without a description; the notes just say an image was attached */ }
+      const { transcribeScreenForMemory, awaitDescriptionWithin, notePendingImageDescription } = require('./services/screen/screenTranscription');
+      const { SCREEN_UNDERSTANDING_TOTAL_BUDGET_MS } = require('./services/screen/ScreenUnderstandingService');
+      const { text, late } = await awaitDescriptionWithin(
+        Promise.resolve().then(() => transcribeScreenForMemory([dest], 'A picture the user attached to their meeting notes: describe what it shows, including any text, in a few sentences.')),
+        SCREEN_UNDERSTANDING_TOTAL_BUDGET_MS,
+      );
+      if (text) entry.description = text;
+      else notePendingImageDescription(entry, late.then((lateText: string) => { if (lateText) entry.description = lateText; return lateText; }));
+    } catch { /* kept without a description */ }
     const list = Array.isArray(meta.attachedImages) ? meta.attachedImages : [];
-    list.push({ path: dest, name, description: description || `Image "${name}" (not described)`, at: Date.now() });
+    list.push(entry);
     meta.attachedImages = list.slice(-12);
     return { count: meta.attachedImages.length };
   });
@@ -14356,12 +14613,9 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   safeHandle('local-whisper-preload', async (_, modelId: string) => {
-    if (process.platform === 'darwin') {
-      const os = require('os') as typeof import('os');
-      const darwinMajor = parseInt(os.release().split('.')[0], 10);
-      if (Number.isNaN(darwinMajor) || darwinMajor < 22) {
-        return { success: false, error: 'Local Whisper models require macOS 13 Ventura or later.' };
-      }
+    {
+      const { onnxRuntimeSupportedOnThisMac, ONNX_MAC_UNSUPPORTED_MESSAGE } = require('./audio/whisper/onnxMacSupport');
+      if (!onnxRuntimeSupportedOnThisMac()) return { success: false, error: ONNX_MAC_UNSUPPORTED_MESSAGE };
     }
     try {
       const { modelPreloader } = require('./audio/whisper/modelPreloader');
@@ -15137,6 +15391,18 @@ export function initializeIpcHandlers(appState: AppState): void {
     return { success: true };
   });
 
+  // The notepad's mic picker: the running meeting switches at once (the
+  // renderer saves the choice for the next meeting, as Settings › Audio does).
+  safeHandle('meeting:set-input-device', async (_, deviceId: unknown) => {
+    if (deviceId !== null && typeof deviceId !== 'string') return { success: false };
+    try {
+      return { success: await appState.switchMeetingInputDevice(deviceId as string | null) };
+    } catch (err) {
+      console.warn('[IPC] meeting:set-input-device failed:', err);
+      return { success: false };
+    }
+  });
+
   safeHandle('set-recognition-language', async (_, key: string) => {
     appState.setRecognitionLanguage(key);
     return { success: true };
@@ -15485,10 +15751,15 @@ export function initializeIpcHandlers(appState: AppState): void {
   // Meeting Notes V3 — regenerate the full structured notes for a saved meeting, optionally
   // with a different mode (templateType) and follow-up tone. Runs the map-reduce pipeline on
   // the stored transcript off the UI thread; honors the post_call_summary data scope.
-  safeHandle('regenerate-meeting-summary', async (_, { id, templateType, modeId, tone }: { id: string; templateType?: string; modeId?: string; tone?: 'professional' | 'warm' | 'concise' | 'friendly' | 'your_style' }) => {
+  safeHandle('regenerate-meeting-summary', async (_, { id, templateType, modeId, noteTemplateId, tone }: { id: string; templateType?: string; modeId?: string; noteTemplateId?: string | null; tone?: 'professional' | 'warm' | 'concise' | 'friendly' | 'your_style' }) => {
     if (!id || typeof id !== 'string') return { success: false, error: 'invalid id' };
     if (modeId !== undefined && typeof modeId !== 'string') modeId = undefined;
     if (templateType !== undefined && typeof templateType !== 'string') templateType = undefined;
+    // A note template (noteTemplates.ts): null writes the notes without one.
+    if (noteTemplateId !== undefined && noteTemplateId !== null) {
+      const { noteTemplateById } = require('./services/meeting/noteTemplates') as typeof import('./services/meeting/noteTemplates');
+      if (!noteTemplateById(noteTemplateId)) return { success: false, error: 'unknown_template' };
+    }
     const mgr = appState.getIntelligenceManager();
     if (!mgr) return { success: false, error: 'intelligence manager unavailable' };
     // Regenerating AS a different mode (the "Regenerate notes as Sales" suggestion
@@ -15498,7 +15769,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     // regenerate (no override) keeps the meeting's own mode and is never gated.
     // The meeting page's template picker goes through here too (notesTemplateGate.ts).
     const { regenerateGate } = require('./services/meeting/notesTemplateGate') as typeof import('./services/meeting/notesTemplateGate');
-    const refused = regenerateGate({ modeId, templateType }, {
+    const refused = regenerateGate({ modeId, templateType, noteTemplateId }, {
       templateOfMode: (id) => {
         const { ModesManager } = require('./services/ModesManager');
         return ModesManager.getInstance().getModes().find((m: { id: string }) => m.id === id)?.templateType;
@@ -15506,7 +15777,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       isProOrTrialActive,
     });
     if (refused) return { success: false, error: refused };
-    const ok = await mgr.regenerateMeetingSummary(id, { templateType, modeId, tone });
+    const ok = await mgr.regenerateMeetingSummary(id, { templateType, modeId, noteTemplateId, tone });
     return { success: ok };
   });
 
@@ -15795,6 +16066,16 @@ export function initializeIpcHandlers(appState: AppState): void {
         let visionAttempts: number | undefined;
         let visionFailureReason: string | undefined;
 
+        // A ⌘/Ctrl+Y capture's screenshot for formulas its page text could not
+        // carry, when it was still being taken as this answer started (#645).
+        if (imagePaths === undefined || Array.isArray(imagePaths)) {
+          imagePaths = await appState.withFormulaScreenshot(options?.domContext, imagePaths);
+          // Formula images that did not fit in this request: its text must not point at them.
+          if (typeof options?.domContext === 'string') {
+            options = { ...options, domContext: appState.formulaTextFor(options.domContext, imagePaths) };
+          }
+        }
+
         const validatedImagePaths: string[] | undefined = imagePaths?.length ? [] : undefined;
 
         // SECURITY (P0): Validate image paths if provided from renderer
@@ -15942,7 +16223,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         });
 
         // Question and imagePaths are now optional - IntelligenceManager infers from transcript
-        const answer = await intelligenceManager.runWhatShouldISay(
+        let answer = await intelligenceManager.runWhatShouldISay(
           question,
           0.8,
           validatedImagePaths,
@@ -15971,6 +16252,79 @@ export function initializeIpcHandlers(appState: AppState): void {
                 : undefined,
           },
         );
+        // The refusal-triggered retry of #647's Problem A. The refusal ("I
+        // can't provide a solution for a live HackerRank test") is the MODEL's
+        // judgement of a FULL-SCREEN capture: a background "Test Login" tab
+        // read as a live test. When a screenshot turn comes back refused, try
+        // ONE retry with the capture cropped to the browser's page area — the
+        // tab strip and address bar gone, the page exactly as it is. Nothing
+        // is cropped until a refusal happened, and the original image is
+        // never modified. Set NATIVELY_ASSESSMENT_RETRY=off to leave
+        // refusals unretried.
+        let refusalRetry: { cropped: boolean; improved: boolean } | undefined;
+        if (
+          answer
+          && validatedImagePaths?.length
+          && process.env.NATIVELY_ASSESSMENT_RETRY !== 'off'
+        ) {
+          const { isAssessmentRefusal } = require('./llm/AnswerValidator') as typeof import('./llm/AnswerValidator');
+          if (isAssessmentRefusal(answer)) {
+            try {
+              // Crop and retry failures leave `answer` (the refusal) as the
+              // answer: the banner alone carries the suggestion.
+              const { cropToBrowserPageArea, croppedImagePathFor } = require('./services/screen/BrowserPageCrop') as typeof import('./services/screen/BrowserPageCrop');
+              const { screen: electronScreen } = require('electron');
+              const lastImagePath = validatedImagePaths[validatedImagePaths.length - 1];
+              const croppedImagePath = croppedImagePathFor(lastImagePath);
+              const crop = await cropToBrowserPageArea(
+                lastImagePath,
+                croppedImagePath,
+                electronScreen.getAllDisplays().map(({ bounds, scaleFactor }: Electron.Display) => ({ ...bounds, scaleFactor })),
+              );
+              if (crop) {
+                const retryPaths = validatedImagePaths.slice(0, -1).concat(croppedImagePath);
+                const retryAnswer = await intelligenceManager.runWhatShouldISay(
+                  question,
+                  0.8,
+                  retryPaths,
+                  {
+                    skipCooldown: true,
+                    forceFresh: true,
+                    promptInstruction:
+                      typeof options?.promptInstruction === 'string'
+                        ? options.promptInstruction
+                        : undefined,
+                    domContext: effectiveDomContext,
+                    // No screenContext on the retry: the pre-pass described
+                    // the original capture, tab strip and all, and its text
+                    // would re-tell the model what we cropped away.
+                  },
+                );
+                if (retryAnswer) {
+                  // Both runs recorded a turn, each with the screenshot: the
+                  // refusal is dropped from the conversation, so it neither
+                  // takes a screen's room nor steers the next follow-up toward
+                  // refusing. The retry's own turn stands, whatever it said.
+                  try {
+                    (require('./context-intelligence/question/conversation-state-store') as
+                      typeof import('./context-intelligence/question/conversation-state-store'))
+                      // runWhatShouldISay recorded the retry before returning,
+                      // so it is the newest turn, even when it gave the refusal's text.
+                      .removeAnsweredTurn(intelligenceManager.conversationSessionId(), answer, { skipNewest: true });
+                  } catch { /* continuity only */ }
+                  // The retry replaces the refusal; `improved` tells the
+                  // renderer whether the retry ANSWERED (true) or refused
+                  // again (false).
+                  refusalRetry = { cropped: true, improved: !isAssessmentRefusal(retryAnswer) };
+                  if (refusalRetry.improved) answer = retryAnswer;
+                  console.log('[AssessmentRetry] retried the refused screenshot answer with the browser page area', refusalRetry);
+                }
+              }
+            } catch (retryErr: any) {
+              console.warn('[AssessmentRetry] retry with the page-area crop failed:', retryErr?.message ?? retryErr);
+            }
+          }
+        }
         if (answer) {
           // The conversation-ring write lives in IntelligenceEngine.runWhatShouldISay
           // now, not here. Placed at this IPC handler it only ever recorded a
@@ -15997,6 +16351,12 @@ export function initializeIpcHandlers(appState: AppState): void {
           visionFailureReason,
           imageCount: validatedImagePaths?.length || 0,
           usedImageInput: Boolean(validatedImagePaths?.length),
+          // #647 Problem A: the screenshot answer came back as an assessment
+          // refusal and was retried with the capture cropped to the browser's
+          // page area. `cropped`: a crop was made; `improved`: the retry
+          // answered. The renderer shows its banner on `cropped` and re-asks
+          // on `improved` only.
+          refusalRetry,
         };
       } catch (error: any) {
         console.error('[IPC] generate-what-to-say error:', error);
@@ -16060,6 +16420,9 @@ export function initializeIpcHandlers(appState: AppState): void {
       for (const p of paths) {
         try {
           const out = await optimizer.optimize(p, { profile, provider: 'openai', cacheKey: p });
+          // So the conversation reads and names the screenshot, not the copy.
+          (require('./context-intelligence/question/conversation-state') as
+            typeof import('./context-intelligence/question/conversation-state')).noteScreenshotCopy(out.path, p);
           optimized.push(out.path);
         } catch (err: any) {
           console.warn(
@@ -16192,31 +16555,10 @@ export function initializeIpcHandlers(appState: AppState): void {
     });
   });
 
-  // Dynamic Action Button Mode (Recap vs Brainstorm)
-  safeHandle('get-action-button-mode', () => {
-    const { SettingsManager } = require('./services/SettingsManager');
-    const sm = SettingsManager.getInstance();
-    return sm.get('actionButtonMode') ?? 'recap';
-  });
-
-  safeHandle('set-action-button-mode', (_, mode: 'recap' | 'brainstorm') => {
-    const { SettingsManager } = require('./services/SettingsManager');
-    const sm = SettingsManager.getInstance();
-    if (!sm.set('actionButtonMode', mode)) {
-      // R-24: the write was refused (degraded settings store). Returning
-      // success — and broadcasting below — put every window on a value disk
-      // never received, which silently reverted on the next launch.
-      return { success: false, error: 'settings_store_degraded' };
-    }
-
-    BrowserWindow.getAllWindows().forEach((win) => {
-      if (!win.isDestroyed()) {
-        win.webContents.send('action-button-mode-changed', mode);
-      }
-    });
-
-    return { success: true };
-  });
+  // The Recap/Brainstorm slot ("Interview Mode", get/set-action-button-mode)
+  // was removed on 2026-10-20: Brainstorm is its own overlay button, picked in
+  // Settings › Overlay (overlay-buttons:set below). SettingsManager still
+  // carries actionButtonMode so an old settings file loads; nothing reads it.
 
   // MODE 3: Follow-Up (Refinement)
   safeHandle('generate-follow-up', async (_, intent: string, userRequest?: string) => {
@@ -16677,6 +17019,13 @@ export function initializeIpcHandlers(appState: AppState): void {
     appState.getMeetingAutoStop?.()?.keepGoing();
     return { success: true };
   });
+  // Pause / resume transcription (the notepad's pill; services/meeting/transcriptionPause.ts).
+  safeHandle('meeting:get-transcription-paused', async () => appState.isTranscriptionPaused());
+  safeHandle('meeting:set-transcription-paused', async (_, paused: unknown) => {
+    if (typeof paused !== 'boolean') return { success: false, paused: appState.isTranscriptionPaused() };
+    const ok = appState.setTranscriptionPaused(paused);
+    return { success: ok, paused: appState.isTranscriptionPaused() };
+  });
   // The user is typing in the overlay: no auto-stop under their hands.
   // Fire-and-forget from the renderer, throttled there.
   safeOn('meeting-auto-stop-typing', () => {
@@ -16697,11 +17046,205 @@ export function initializeIpcHandlers(appState: AppState): void {
     return { success: true };
   });
   safeHandle('notes-window:is-open', async () => appState.notesWindowHelper.isVisible());
+  // Settings › Overlay's switcher: what a meeting opens, the overlay or the
+  // notepad (utils/meetingSurface.ts; read at every meeting start).
+  safeHandle('meeting-surface:get', async () => normalizeMeetingSurface(SettingsManager.getInstance().get('meetingSurface')));
+  safeHandle('meeting-surface:set', async (_, surface: unknown) => {
+    if (surface !== 'overlay' && surface !== 'notepad') return { success: false };
+    if (!SettingsManager.getInstance().set('meetingSurface', surface)) return { success: false, error: 'settings_store_degraded' };
+    return { success: true };
+  });
   safeHandle('live-notes:get-state', async () => appState.getLiveNotes().getState());
+  // The notes window's heading (2026-10-20, laid out like Granola's): the
+  // running meeting's title and how many people, from its calendar event once
+  // linked (SessionCalendarLinker fills that in a few seconds after the start,
+  // so the window asks again while the meeting runs).
+  // The notepad's heading (NotesWindow.tsx): the running meeting's title, its
+  // event (time, Join, people) and the names its transcript uses. The title is
+  // the session's (the user's, else the linked event's), then the event's.
+  const liveMeta = (create: boolean): any => {
+    let meta: any = null;
+    try { meta = appState.getIntelligenceManager().liveMeetingMetadata(); } catch { /* no session */ }
+    if (!meta && create) {
+      meta = {};
+      appState.getIntelligenceManager().setMeetingMetadata(meta);
+    }
+    return meta;
+  };
+  safeHandle('live-notes:meeting-info', async () => {
+    if (!appState.getIsMeetingActive()) return { live: false, title: null, people: 0 };
+    const meta = liveMeta(false);
+    const event = meta?.calendarEvent;
+    const title = typeof meta?.title === 'string' && meta.title.trim() ? meta.title.trim()
+      : typeof event?.title === 'string' && event.title.trim() ? event.title.trim() : null;
+    const attendees: Array<{ email: string; name: string | null }> = Array.isArray(event?.attendees)
+      ? event.attendees
+        .filter((a: any) => a && typeof a.email === 'string' && a.email)
+        .map((a: any) => ({ email: a.email, name: typeof a.name === 'string' && a.name.trim() ? a.name.trim() : null }))
+      : [];
+    let selfEmail: string | null = null;
+    try {
+      const { CalendarManager } = require('./services/CalendarManager');
+      selfEmail = CalendarManager.getInstance().getConnectionStatus()?.email ?? null;
+    } catch { /* no calendar */ }
+    let speakers = { me: 'You', them: 'Them' };
+    try {
+      const { calendarSpeakerLabels } = require('./services/calendar/calendarSessionMatch');
+      const labels = calendarSpeakerLabels(event, appState.getCurrentUserName?.() ?? undefined);
+      // A first name for the other side only in a two-person call; "You" stays "You".
+      if (labels?.speaker_1 && attendees.length === 2) speakers = { me: 'You', them: labels.speaker_1 };
+    } catch { /* the plain names */ }
+    return {
+      live: true,
+      title,
+      people: attendees.length,
+      event: event && typeof event.id === 'string'
+        ? { id: event.id, title: event.title ?? null, startTime: event.startTime ?? null, endTime: event.endTime ?? null, link: typeof event.link === 'string' ? event.link : null }
+        : null,
+      attendees,
+      selfEmail,
+      speakers,
+    };
+  });
+  // The heading's title, typed by the user: the meeting is saved under it (the
+  // calendar linker and the notes' own title never replace a title it did not set).
+  // The folder button beside the chip: the folders and which this meeting is in (held until it is saved).
+  safeHandle('live-notes:folders', async () => {
+    const { organiseStore } = require('./services/organise/organiseService');
+    const folders = organiseStore()?.listFolders?.() ?? [];
+    const live = appState.getLiveNotes();
+    let mine = new Set<string>(live.getFolders());
+    const { phase, meetingId } = live.getState();
+    if (phase === 'ended' && meetingId) {
+      try { mine = new Set(organiseStore()?.foldersOfMeeting?.(meetingId) ?? [...mine]); } catch { /* the held set */ }
+    }
+    return folders.map((f: any) => ({ id: f.id, name: f.name, inFolder: mine.has(f.id) }));
+  });
+  safeHandle('live-notes:set-folder', async (_event, args: { folderId?: unknown; inFolder?: unknown }) => {
+    return { success: appState.getLiveNotes().setFolder(args?.folderId, args?.inFolder) };
+  });
+  safeHandle('live-notes:create-folder', async (_event, name: unknown) => {
+    if (typeof name !== 'string' || !name.trim()) return null;
+    const { organiseStore } = require('./services/organise/organiseService');
+    const folder = organiseStore()?.createFolder?.(name.trim().slice(0, 80)) ?? null;
+    return folder ? { id: folder.id, name: folder.name } : null;
+  });
+  // The notepad's template ("/" › Templates, All templates…): the sections the
+  // running (or next) meeting's notes are written in. Notes only, live answers
+  // keep the mode. Pro or a live trial, as Regenerate in a template; clearing
+  // (null) never asks for either.
+  safeHandle('live-notes:set-template', async (_event, id: unknown) => {
+    const mgr = appState.getIntelligenceManager();
+    if (!mgr) return { success: false };
+    if (id === null) return { success: mgr.setLiveNoteTemplate(null) };
+    const { noteTemplateById } = require('./services/meeting/noteTemplates') as typeof import('./services/meeting/noteTemplates');
+    if (!noteTemplateById(id)) return { success: false, error: 'unknown_template' };
+    const { noteTemplateGate } = require('./services/meeting/notesTemplateGate') as typeof import('./services/meeting/notesTemplateGate');
+    if (noteTemplateGate(id as string, isProOrTrialActive)) return { success: false, error: 'pro_required' };
+    return { success: mgr.setLiveNoteTemplate(id as string) };
+  });
+  safeHandle('live-notes:get-template', async () => appState.getIntelligenceManager()?.getLiveNoteTemplate() ?? null);
+  safeHandle('live-notes:set-title', async (_event, title: unknown) => {
+    if (!appState.getIsMeetingActive() || typeof title !== 'string') return { success: false };
+    const next = title.replace(/\s+/g, ' ').trim().slice(0, 120);
+    const meta = liveMeta(true);
+    if (next) meta.title = next;
+    else delete meta.title;
+    return { success: true, title: next || null };
+  });
+  // The event popover's "Link a different event": the calendar's events around now.
+  safeHandle('live-notes:calendar-candidates', async () => {
+    if (!appState.getIsMeetingActive()) return [];
+    try {
+      const { CalendarManager } = require('./services/CalendarManager');
+      const { toEventSnapshot } = require('./services/calendar/calendarSessionMatch');
+      const now = Date.now();
+      const events = await CalendarManager.getInstance().getEventsBetween(now - 3 * 60 * 60_000, now + 60 * 60_000);
+      return events
+        .filter((e: any) => e.selfResponse !== 'declined')
+        .sort((a: any, b: any) => Math.abs(Date.parse(a.startTime) - now) - Math.abs(Date.parse(b.startTime) - now))
+        .slice(0, 8)
+        .map((e: any) => {
+          const snap = toEventSnapshot(e, 'user');
+          return { id: snap.id, title: snap.title, startTime: snap.startTime, endTime: snap.endTime, people: Array.isArray(snap.attendees) ? snap.attendees.length : 0 };
+        });
+    } catch (error: any) {
+      console.error('[IPC] live-notes:calendar-candidates failed:', error?.message);
+      return [];
+    }
+  });
+  // Link the running meeting to an event the user picked (or none). The title
+  // follows the event unless the user typed one.
+  safeHandle('live-notes:link-event', async (_event, input: { eventId?: unknown; keepTitle?: unknown }) => {
+    if (!appState.getIsMeetingActive()) return { success: false };
+    const eventId = input?.eventId;
+    const meta = liveMeta(true);
+    const oldEventTitle = typeof meta.calendarEvent?.title === 'string' ? meta.calendarEvent.title : null;
+    const titleFollowsEvent = !meta.title || meta.title === oldEventTitle;
+    if (eventId === null) {
+      delete meta.calendarEventId;
+      delete meta.calendarEvent;
+      meta.source = 'manual';
+      if (titleFollowsEvent) delete meta.title;
+      return { success: true };
+    }
+    if (typeof eventId !== 'string' || !eventId) return { success: false };
+    try {
+      const { CalendarManager } = require('./services/CalendarManager');
+      const { toEventSnapshot } = require('./services/calendar/calendarSessionMatch');
+      const now = Date.now();
+      // Looked up again here rather than trusting the renderer's copy.
+      const event = (await CalendarManager.getInstance().getEventsBetween(now - 3 * 60 * 60_000, now + 60 * 60_000)).find((e: any) => e.id === eventId);
+      if (!event || !appState.getIsMeetingActive()) return { success: false };
+      meta.calendarEventId = event.id;
+      meta.calendarEvent = toEventSnapshot(event, 'user');
+      meta.source = 'calendar';
+      if (titleFollowsEvent) meta.title = event.title;
+      return { success: true };
+    } catch (error: any) {
+      console.error('[IPC] live-notes:link-event failed:', error?.message);
+      return { success: false };
+    }
+  });
+  // Add or remove a person on the linked event, for this meeting only (the
+  // notes' people; the calendar itself is never written).
+  safeHandle('live-notes:set-attendees', async (_event, input: { add?: unknown; remove?: unknown }) => {
+    if (!appState.getIsMeetingActive()) return { success: false };
+    const meta = liveMeta(false);
+    const event = meta?.calendarEvent;
+    if (!event || !Array.isArray(event.attendees)) return { success: false };
+    const add = typeof input?.add === 'string' ? input.add.trim().toLowerCase() : '';
+    const remove = typeof input?.remove === 'string' ? input.remove.trim().toLowerCase() : '';
+    if (add) {
+      if (!/^[^\s@<>()]+@[^\s@<>()]+\.[^\s@<>()]+$/.test(add) || add.length > 254) return { success: false, error: 'invalid_email' };
+      if (!event.attendees.some((a: any) => typeof a?.email === 'string' && a.email.toLowerCase() === add)) {
+        event.attendees = [...event.attendees, { email: add }];
+      }
+    }
+    if (remove) {
+      event.attendees = event.attendees.filter((a: any) => !(typeof a?.email === 'string' && a.email.toLowerCase() === remove));
+    }
+    return { success: true };
+  });
   safeOn('live-notes:set-text', (_event, text: unknown) => {
     if (typeof text !== 'string') return;
     appState.getLiveNotes().setText(text);
   });
+  // Copy from a window that never takes focus: the notepad, and the overlay on
+  // Windows (WS_EX_NOACTIVATE). The page's clipboard API needs a focused
+  // document; main's clipboard does not. Every renderer copy button goes through
+  // 'clipboard:write-text' (src/lib/copyText.ts).
+  const writeClipboardText = (text: unknown) => {
+    if (typeof text !== 'string' || !text || text.length > 2_000_000) return { success: false };
+    try {
+      clipboard.writeText(text);
+    } catch {
+      return { success: false };
+    }
+    return { success: true };
+  };
+  safeHandle('notes-window:copy-text', async (_event, text: unknown) => writeClipboardText(text));
+  safeHandle('clipboard:write-text', async (_event, text: unknown) => writeClipboardText(text));
   // "Open meeting" in the notes window after Stop: the launcher opens that
   // meeting's page (App's launcher request, as Settings › About's demo meeting).
   safeHandle('notes-window:open-meeting', async (_event, meetingId: unknown) => {
@@ -17246,6 +17789,14 @@ export function initializeIpcHandlers(appState: AppState): void {
     const { ModesManager } = require('./services/ModesManager');
     const manualActiveMode = ModesManager.getInstance().getActiveMode();
 
+    // The phone's Answer chip shows this turn too: the question once the first
+    // words arrive (a fallback before then publishes it itself), then the
+    // answer under the same id, which resolves the chip's Thinking.
+    let onPhone = false;
+    const mirrorToPhone = (send: (phone: PhoneMirrorService) => void) => {
+      try { send(PhoneMirrorService.getInstance()); } catch { /* mirror only */ }
+    };
+
     try {
       const stream = ragManager.queryMeeting(liveMeetingId, query, abortController.signal);
 
@@ -17260,6 +17811,11 @@ export function initializeIpcHandlers(appState: AppState): void {
         if (abortController.signal.aborted) break;
         ragLiveAnswer += chunk;
         event.sender.send('rag:stream-chunk', { live: true, chunk });
+        mirrorToPhone((phone) => {
+          if (!onPhone) phone.publishUserMessage(queryKey, query, { awaitingAnswer: true });
+          onPhone = true;
+          phone.publishToken(queryKey, chunk);
+        });
       }
 
       // See the meeting-scoped handler's identical comment above — a stale
@@ -17268,9 +17824,14 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (!abortController.signal.aborted) {
         event.sender.send('rag:stream-complete', { live: true });
         recordLiveRagTurn(event.sender.id, query, ragLiveAnswer, manualActiveMode);
+        if (onPhone) mirrorToPhone((phone) => phone.publishDone(queryKey, ragLiveAnswer));
+      } else if (onPhone) {
+        mirrorToPhone((phone) => phone.publishError(queryKey, 'a newer question replaced it'));
       }
       return { success: true };
     } catch (error: any) {
+      // Cut off mid-answer (a fallback below publishes the question again).
+      if (onPhone) mirrorToPhone((phone) => phone.publishError(queryKey, error?.name === 'AbortError' ? 'a newer question replaced it' : 'it was cut off'));
       if (error.name !== 'AbortError') {
         const msg = error.message || '';
         // If JIT RAG failed (no embeddings yet, no relevant context), fallback to regular chat
@@ -19546,6 +20107,38 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  // A note template's sections as this mode's notes template (Modes Manager ›
+  // Notes template › Use a template). Same Pro gate as editing a section.
+  safeHandle('modes:apply-note-template', async (_, modeId: string, templateId: string) => {
+    try {
+      if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
+      const { noteTemplateById, MODE_DEFAULT_NOTE_TEMPLATE_ID } = require('./services/meeting/noteTemplates') as typeof import('./services/meeting/noteTemplates');
+      const toDefault = templateId === MODE_DEFAULT_NOTE_TEMPLATE_ID;
+      const template = toDefault ? null : noteTemplateById(templateId);
+      if (!toDefault && !template) return { success: false, error: 'unknown_template' };
+      const { ModesManager } = require('./services/ModesManager');
+      const mgr = ModesManager.getInstance();
+      if (!mgr.getModes().some((m: { id: string }) => m.id === modeId)) return { success: false, error: 'unknown_mode' };
+      // "This mode": the sections its type starts with, back after a Remove template.
+      const sections = mgr.replaceNoteSectionsWith(modeId, toDefault ? mgr.defaultNoteSectionsFor(modeId) : template!.sections);
+      return sections ? { success: true, sections } : { success: false, error: 'write_failed' };
+    } catch (e: any) {
+      console.error('[IPC] modes:apply-note-template error:', e);
+      return { success: false, error: e.message };
+    }
+  });
+
+  // What "This mode" in Use a template puts back: read only, for its label and check.
+  safeHandle('modes:get-default-note-sections', async (_, modeId: string) => {
+    try {
+      const { ModesManager } = require('./services/ModesManager');
+      return ModesManager.getInstance().defaultNoteSectionsFor(modeId);
+    } catch (e: any) {
+      console.error('[IPC] modes:get-default-note-sections error:', e);
+      return [];
+    }
+  });
+
   safeHandle('modes:remove-all-note-sections', async (_, modeId: string) => {
     try {
       if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
@@ -19642,7 +20235,13 @@ export function initializeIpcHandlers(appState: AppState): void {
         safeMeta,
         safeMeta?.hasSensitiveSignals === true,
       );
-      return { autoPolicy: decision.autoPolicy, category: decision.category };
+      // The coding switches and "Hold back unsure pages" apply to the AI path too.
+      const settings = SettingsManager.getInstance().getBrowserContextSettings();
+      const autoPolicy = autoContextVerdict(decision, {
+        codingEnabled: codingAutoAttachEnabled(settings),
+        holdBackUnsure: settings.askBeforeUnknown,
+      });
+      return { autoPolicy, category: decision.category };
     });
   }
 
@@ -19899,39 +20498,15 @@ export function initializeIpcHandlers(appState: AppState): void {
   // Smart Browser Context v2 — pre-answer auto-context pull. The renderer calls
   // this just before generating an answer; the extension auto-attaches a coding
   // page if one is in front, otherwise resolves attached:false and the answer
-  // proceeds without browser context. Honors the user's auto-attach setting.
+  // proceeds without browser context. Honors the user's auto-detect and
+  // auto-attach settings (see buildAutoContextRequest).
   safeHandle('phone-mirror:request-auto-context', async () => {
     try {
-      const settings = SettingsManager.getInstance().getBrowserContextSettings();
-      // Opted-in extra categories that should auto-attach beyond coding (their
-      // registry policy is 'ask'). The extension treats these as eligible locally
-      // (no AI needed) when their toggle is on.
-      const extraCategories: BrowserContextCategory[] = [];
-      if (settings.autoDetectJobDescriptions) extraCategories.push('job_description');
-      if (settings.autoDetectDeveloperDocs) extraCategories.push('developer_docs');
-
-      // Proceed when ANY auto path is enabled: coding auto-attach, an extra
-      // category, the opt-in AI classifier, or experimental full-page mode. All
-      // of them relax only the coding-only gate — NEVER the sensitive floor
-      // (email/chat/banking/auth stay blocked in the extension).
-      const anyEnabled =
-        settings.autoAttachCoding ||
-        settings.experimentalFullPageCapture ||
-        settings.aiClassifierEnabled ||
-        extraCategories.length > 0;
-      if (!anyEnabled) {
+      const request = buildAutoContextRequest(SettingsManager.getInstance().getBrowserContextSettings());
+      if (!request) {
         return { attached: false, reason: 'disabled' };
       }
-      return await PhoneMirrorService.getInstance().requestAutoContext({
-        // When "auto-attach coding" is OFF, tell the extension to NOT treat a
-        // high-confidence coding page as eligible — otherwise a coding page would
-        // still be captured whenever any OTHER auto path (JD/docs/AI/full-page) is
-        // on. The other paths are independent and unaffected.
-        codingEnabled: settings.autoAttachCoding,
-        fullPage: settings.experimentalFullPageCapture,
-        aiClassify: settings.aiClassifierEnabled,
-        extraCategories: extraCategories.length ? extraCategories : undefined,
-      });
+      return await PhoneMirrorService.getInstance().requestAutoContext(request);
     } catch (e: any) {
       console.error('[IPC] phone-mirror:request-auto-context error:', e);
       return { attached: false, reason: e?.message || 'failed to request auto context' };
@@ -19990,10 +20565,14 @@ export function initializeIpcHandlers(appState: AppState): void {
     overlayTrayLive = true;
     if (!phoneTrayReporters.has(event.sender)) {
       phoneTrayReporters.add(event.sender);
-      // A closed overlay has no tray; the phone must not keep showing one.
+      // A closed overlay has no tray and records nothing; the phone must not
+      // keep showing either.
       event.sender.once('destroyed', () => {
         overlayTrayLive = false;
-        try { PhoneMirrorService.getInstance().setAttachments([]); } catch { /* mirror only */ }
+        try {
+          PhoneMirrorService.getInstance().setAttachments([]);
+          PhoneMirrorService.getInstance().setRecording(false);
+        } catch { /* mirror only */ }
       });
     }
     return true;
@@ -20035,6 +20614,15 @@ export function initializeIpcHandlers(appState: AppState): void {
       );
     } catch (e) {
       console.warn('[PhoneMirror] attachments mirror failed:', e);
+    }
+  });
+  // The overlay's Answer button recording (it reads Stop), for the phone's chip.
+  safeOn('phone-mirror:recording', (event, active: unknown) => {
+    if (!fromOverlayWindow(event) || typeof active !== 'boolean') return;
+    try {
+      PhoneMirrorService.getInstance().setRecording(active);
+    } catch (e) {
+      console.warn('[PhoneMirror] recording mirror failed:', e);
     }
   });
   safeOn('phone-mirror:images-sent', (event, id: unknown, paths: unknown) => {
@@ -20421,7 +21009,10 @@ export function initializeIpcHandlers(appState: AppState): void {
           inputTokens: _estimatePerfTokens(`${message ?? ''}${context ?? ''}`),
           isUserCancelled: () => phoneSuperseded,
           onDiagnostics: (record) => {
-            if (record.terminationReason === 'done') return;
+            if (record.terminationReason === 'done') {
+              if (record.heldPastStallMs > 0) console.log('[Perf] phone-mirror answer held past the stall budget', record);
+              return;
+            }
             console.log('[Perf] phone-mirror turn ended early', record);
           },
         });

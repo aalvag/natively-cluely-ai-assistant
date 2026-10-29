@@ -19,6 +19,7 @@
 // Pure module: no electron imports, safe in a worker and under plain node.
 
 import { VC_REDIST_DOWNLOAD_URL } from './windowsVcRuntime';
+import { ONNX_MAC_UNSUPPORTED_MESSAGE } from './onnxMacSupport';
 
 export type LocalModelLoadFailureKind =
     | 'unsupported-macos'        // libonnxruntime needs libc++ symbols macOS 12 lacks
@@ -102,6 +103,18 @@ export function classifyLocalModelLoadFailure(
         return 'corrupt-files';
     }
 
+    // macOS only: the Parakeet Neural Engine helper (parakeet/aneBackend.ts)
+    // could not parse the vocabulary file it was given — FluidAudio's reading
+    // of one JSON file on disk, nothing else. CoreML's own load errors ("failed
+    // to build the model execution plan", "compile the model with Xcode") are
+    // NOT matched: CoreML also raises them when the Neural Engine compiler
+    // fails on intact files, and deleting those would only re-download the same
+    // bytes. Damaged CoreML bundles are caught before any load instead, by
+    // their exact pinned sizes (isParakeetCoreMlCached), and fetched again.
+    if (platform === 'darwin' && m.includes('vocabulary parsing failed')) {
+        return 'corrupt-files';
+    }
+
     return 'unknown';
 }
 
@@ -130,7 +143,7 @@ export function describeLocalModelLoadFailure(
 ): string {
     switch (classifyLocalModelLoadFailure(message, ctx)) {
         case 'unsupported-macos':
-            return 'Local Whisper is not supported on macOS 12 (Monterey) or earlier. Please upgrade to macOS 13 Ventura or later, or use a cloud STT provider.';
+            return ONNX_MAC_UNSUPPORTED_MESSAGE;
         case 'missing-windows-runtime':
             return 'Local speech models need the Microsoft Visual C++ runtime, and this PC does not have it. '
                 + `Install the "Microsoft Visual C++ Redistributable (x64)" from ${VC_REDIST_DOWNLOAD_URL}, restart Natively, and try again. `

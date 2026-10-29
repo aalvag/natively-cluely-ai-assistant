@@ -192,7 +192,11 @@ export interface ElectronAPI {
     callback: (data: { path: string; preview: string }) => void
   ) => () => void
   onScreenshotAttached: (
-    callback: (data: { path: string; preview: string }) => void
+    /**
+     * `formulaCapture`: a page capture's formula images (#645), which replace an earlier capture's.
+     * `quiet`: the phone asked for or sent it, so the overlay lists it without showing itself.
+     */
+    callback: (data: { path: string; preview: string; formulaCapture?: string; quiet?: boolean }) => void
   ) => () => void
   onCaptureAndProcess: (
     callback: (data: { path: string; preview: string }) => void
@@ -210,6 +214,10 @@ export interface ElectronAPI {
   onDebugError: (callback: (error: string) => void) => () => void
   takeScreenshot: () => Promise<{ path: string; preview: string }>
   takeSelectiveScreenshot: () => Promise<{ path: string; preview: string; cancelled?: boolean }>
+  /** Paste a clipboard image into the overlay tray (issue #351). */
+  attachClipboardImage: () => Promise<{ empty?: true; success?: true; path?: string; error?: string }>
+  /** Drag-drop a local image file into the overlay tray (issue #351). */
+  attachLocalImage: (file: File) => Promise<{ success?: boolean; path?: string; error?: string }>
   moveWindowLeft: () => Promise<void>
   moveWindowRight: () => Promise<void>
   moveWindowUp: () => Promise<void>
@@ -344,7 +352,7 @@ export interface ElectronAPI {
   // bridge. Four user-facing categories over five server-side meters.
   getNativelyUsage: (force?: boolean) => Promise<import('./nativelyUsage').NativelyUsageResponse>
   getNativelyPlans: () => Promise<import('./nativelyUsage').NativelyPlansResponse>
-  getStoredCredentials: () => Promise<{ hasNativelyKey?: boolean; hasOwnAiKey?: boolean; hasGeminiKey: boolean; hasGroqKey: boolean; hasOpenaiKey: boolean; hasClaudeKey: boolean; hasDeepseekKey: boolean; hasNvidiaNimKey?: boolean; hasOpenrouterKey?: boolean; hasFluxionKey?: boolean; fluxionProtocol?: 'openai' | 'anthropic'; hasAgentRouterKey?: boolean; hasLitellmBaseURL?: boolean; litellmBaseURL?: string | null; litellmMaxTokens?: number | null; hasNinerouterBaseURL?: boolean; hasNinerouterKey?: boolean; ninerouterBaseURL?: string | null; ninerouterMaxTokens?: number | null; ninerouterThinking?: string | null; ninerouterModelMeta?: Record<string, { reasoning?: boolean; thinkingCanDisable?: boolean; thinkingFormat?: string }>; googleServiceAccountPath: string | null; sttProvider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim' | 'natively' | 'local-whisper' | 'apple-speech'; hasSttGroqKey: boolean; hasSttOpenaiKey: boolean; hasDeepgramKey: boolean; hasElevenLabsKey: boolean; hasAzureKey: boolean; azureRegion: string; hasIbmWatsonKey: boolean; ibmWatsonRegion: string; groqSttModel?: string; nvidiaNimSttModel?: string; sttModels?: { deepgram?: string; openai?: string }; hasSonioxKey?: boolean; hasTavilyKey?: boolean; geminiPreferredModel?: string; groqPreferredModel?: string; openaiPreferredModel?: string; claudePreferredModel?: string; deepseekPreferredModel?: string; nvidia_nimPreferredModel?: string; openrouterPreferredModel?: string; fluxionPreferredModel?: string; agentrouterPreferredModel?: string; litellmPreferredModel?: string; ninerouterPreferredModel?: string; disabledProviders?: string[]; cloudEnabledModels?: Record<string, string[]>; sttGroqKey?: string; sttOpenaiKey?: string; sttDeepgramKey?: string; sttElevenLabsKey?: string; sttAzureKey?: string; sttIbmKey?: string; sttSonioxKey?: string; openAiSttBaseUrl?: string }>
+  getStoredCredentials: () => Promise<{ hasNativelyKey?: boolean; hasOwnAiKey?: boolean; hasGeminiKey: boolean; hasGroqKey: boolean; hasOpenaiKey: boolean; hasClaudeKey: boolean; hasDeepseekKey: boolean; hasNvidiaNimKey?: boolean; hasOpenrouterKey?: boolean; hasFluxionKey?: boolean; fluxionProtocol?: 'openai' | 'anthropic'; hasAgentRouterKey?: boolean; hasLitellmBaseURL?: boolean; litellmBaseURL?: string | null; litellmMaxTokens?: number | null; hasNinerouterBaseURL?: boolean; hasNinerouterKey?: boolean; ninerouterBaseURL?: string | null; ninerouterMaxTokens?: number | null; ninerouterThinking?: string | null; ninerouterModelMeta?: Record<string, { reasoning?: boolean; thinkingCanDisable?: boolean; thinkingFormat?: string }>; googleServiceAccountPath: string | null; sttProvider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'qwen' | 'nvidia_nim' | 'natively' | 'local-whisper' | 'apple-speech'; hasSttGroqKey: boolean; hasSttOpenaiKey: boolean; hasDeepgramKey: boolean; hasElevenLabsKey: boolean; hasAzureKey: boolean; azureRegion: string; hasIbmWatsonKey: boolean; ibmWatsonRegion: string; groqSttModel?: string; nvidiaNimSttModel?: string; sttModels?: { deepgram?: string; openai?: string }; hasSonioxKey?: boolean; hasQwenAsrKey?: boolean; hasTavilyKey?: boolean; geminiPreferredModel?: string; groqPreferredModel?: string; openaiPreferredModel?: string; claudePreferredModel?: string; deepseekPreferredModel?: string; nvidia_nimPreferredModel?: string; openrouterPreferredModel?: string; fluxionPreferredModel?: string; agentrouterPreferredModel?: string; litellmPreferredModel?: string; ninerouterPreferredModel?: string; disabledProviders?: string[]; cloudEnabledModels?: Record<string, string[]>; sttGroqKey?: string; sttOpenaiKey?: string; sttDeepgramKey?: string; sttElevenLabsKey?: string; sttAzureKey?: string; sttIbmKey?: string; sttSonioxKey?: string; sttQwenAsrKey?: string; openAiSttBaseUrl?: string }>
   // R-10 resolution flow: ambiguous credential stores (names + last-4 only; null when nothing to resolve).
   getAmbiguousCredentialStores: () => Promise<{
     keyring: { keys: { name: string; last4: string }[]; mtimeIso: string | null };
@@ -382,7 +390,7 @@ export interface ElectronAPI {
   onTrialAutoStart: (cb: (data: { state: 'pending' | 'settled' } | { state: 'failed'; reason: 'unreachable' | 'rate_limited' }) => void) => () => void
 
   // STT Provider Management
-  setSttProvider: (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim' | 'natively' | 'local-whisper' | 'apple-speech') => Promise<{ success: boolean; error?: string }>
+  setSttProvider: (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'qwen' | 'nvidia_nim' | 'natively' | 'local-whisper' | 'apple-speech') => Promise<{ success: boolean; error?: string }>
   getSttProvider: () => Promise<string>
   getAppleSpeechLocales: () => Promise<{ available: boolean; supported: string[]; installed: string[]; reserved: string[]; maxReserved: number }>
   installAppleSpeechLocale: (locale: string) => Promise<{ ok: boolean; error?: string }>
@@ -398,8 +406,9 @@ export interface ElectronAPI {
   setIbmWatsonApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setGroqSttModel: (model: string) => Promise<{ success: boolean; error?: string }>
   setSonioxApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
+  setQwenAsrApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setIbmWatsonRegion: (region: string) => Promise<{ success: boolean; error?: string }>
-  testSttConnection: (provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim', apiKey: string, region?: string) => Promise<{ success: boolean; error?: string }>
+  testSttConnection: (provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'qwen' | 'nvidia_nim', apiKey: string, region?: string) => Promise<{ success: boolean; error?: string }>
 
   // STT Config Events (fired when STT provider/key changes during a meeting)
   onSttConfigChanged: (callback: (data: { configured: boolean; provider: string }) => void) => () => void
@@ -416,7 +425,7 @@ export interface ElectronAPI {
   disableHindsight: () => Promise<{ success: boolean; error?: string }>
 
   // Native Audio Service Events
-  onNativeAudioTranscript: (callback: (transcript: { speaker: string; text: string; final: boolean }) => void) => () => void
+  onNativeAudioTranscript: (callback: (transcript: { speaker: string; text: string; final: boolean; timestamp?: number }) => void) => () => void
   onNativeAudioSuggestion: (callback: (suggestion: { context: string; lastQuestion: string; confidence: number }) => void) => () => void
   onNativeAudioConnected: (callback: () => void) => () => void
   onNativeAudioDisconnected: (callback: () => void) => () => void
@@ -425,6 +434,7 @@ export interface ElectronAPI {
   onSuggestionError: (callback: (error: { error: string }) => void) => () => void
   generateSuggestion: (context: string, lastQuestion: string) => Promise<{ suggestion: string }>
   getInputDevices: () => Promise<Array<{ id: string; name: string }>>
+  setMeetingInputDevice?: (deviceId: string | null) => Promise<{ success: boolean }>
   getOutputDevices: () => Promise<Array<{ id: string; name: string }>>
   setRecognitionLanguage: (key: string) => Promise<{ success: boolean; error?: string }>
   getAiResponseLanguages: () => Promise<Array<{ label: string; code: string }>>
@@ -465,6 +475,8 @@ export interface ElectronAPI {
     visionFailureReason?: 'no_vision_provider' | 'all_vision_failed' | 'privacy_blocked' | 'scope_blocked' | 'provider_timeout';
     imageCount?: number;
     usedImageInput?: boolean;
+    /** #647 Problem A: the screenshot answer was an assessment refusal that was retried with the capture cropped to the browser's page area. */
+    refusalRetry?: { cropped: boolean; improved: boolean };
   }>
   startDirectAssist: (request: DirectAssistRequest) => Promise<{
     accepted: boolean
@@ -489,9 +501,6 @@ export interface ElectronAPI {
   resetIntelligence: () => Promise<{ success: boolean; error?: string }>
 
   // Dynamic Action Button Mode
-  getActionButtonMode: () => Promise<'recap' | 'brainstorm'>
-  setActionButtonMode: (mode: 'recap' | 'brainstorm') => Promise<{ success: boolean }>
-  onActionButtonModeChanged: (callback: (mode: 'recap' | 'brainstorm') => void) => () => void
   onModeChanged: (callback: (data: { id: string | null; name: string | null; fileCount?: number; indexedCount?: number }) => void) => () => void
 
   // Modes
@@ -531,6 +540,8 @@ export interface ElectronAPI {
   modesUpdateNoteSection: (id: string, updates: { title?: string; description?: string }) => Promise<{ success: boolean; error?: string }>
   modesDeleteNoteSection: (id: string) => Promise<{ success: boolean; error?: string }>
   modesRemoveAllNoteSections: (modeId: string) => Promise<{ success: boolean; error?: string }>
+  modesGetDefaultNoteSections?: (modeId: string) => Promise<Array<{ title: string; description: string }>>
+  modesApplyNoteTemplate?: (modeId: string, templateId: string) => Promise<{ success: boolean; sections?: Array<{ id: string; modeId: string; title: string; description: string; sortOrder: number }>; error?: 'pro_required' | 'unknown_template' | 'unknown_mode' | 'write_failed' | string }>
 
   // Meeting Lifecycle
   startMeeting: (metadata?: any) => Promise<{ success: boolean; error?: string; code?: string }>
@@ -827,7 +838,7 @@ export interface ElectronAPI {
   testHindsightConnection: () => Promise<{ healthy: boolean; error?: string }>
   updateMeetingTitle: (id: string, title: string) => Promise<boolean>
   updateMeetingSummary: (id: string, updates: { overview?: string, actionItems?: string[], keyPoints?: string[], actionItemsTitle?: string, keyPointsTitle?: string }) => Promise<boolean>
-  regenerateMeetingSummary: (id: string, opts?: { templateType?: string; modeId?: string; tone?: 'professional' | 'warm' | 'concise' | 'friendly' | 'your_style' }) => Promise<{ success: boolean; error?: string }>
+  regenerateMeetingSummary: (id: string, opts?: { templateType?: string; modeId?: string; noteTemplateId?: string | null; tone?: 'professional' | 'warm' | 'concise' | 'friendly' | 'your_style' }) => Promise<{ success: boolean; error?: string }>
   regenerateMeetingFollowUp: (id: string, tone?: 'professional' | 'warm' | 'concise' | 'friendly' | 'your_style') => Promise<{ success: boolean; error?: string }>
   updateMeetingSpeakerLabels: (id: string, labels: Record<string, string>) => Promise<{ success: boolean; labels?: Record<string, string>; notesUpdated?: boolean; error?: string }>
   deleteMeeting: (id: string) => Promise<boolean>
@@ -836,6 +847,8 @@ export interface ElectronAPI {
   onMeetingInterfaceThemeChanged: (callback: (theme: string) => void) => () => void
   setGenieAnimationEnabled: (enabled: boolean) => void
   onGenieAnimationChanged: (callback: (enabled: boolean) => void) => () => void
+  setOverlayButtonOrder: (order: string[]) => void
+  onOverlayButtonOrderChanged: (callback: (order: string[]) => void) => () => void
 
   // Phase 3 — Cluely-style dynamic action cards.
   onIntelligenceDynamicAction: (callback: (data: { action: DynamicActionPayload }) => void) => () => void
@@ -1039,6 +1052,12 @@ export interface ElectronAPI {
   getScreenShareSnapshots?: () => Promise<boolean>
   setScreenShareSnapshots?: (on: boolean) => Promise<{ success: boolean; error?: string }>
   meetingAutoStopKeepGoing?: () => Promise<{ success: boolean }>
+  /** Pause / resume transcription during a meeting (the notepad's pill). */
+  getTranscriptionPaused?: () => Promise<boolean>
+  setTranscriptionPaused?: (paused: boolean) => Promise<{ success: boolean; paused: boolean }>
+  onTranscriptionPaused?: (callback: (data: { paused: boolean }) => void) => () => void
+  /** 0..1, the louder of mic and call audio, sent to the notepad while it is open. */
+  onMeetingAudioLevel?: (callback: (level: number) => void) => () => void
   /** Assist (electron/services/assist): the daily brief, You owe, Brief me, the catch-up, Last time. */
   assistGetDailyBrief?: (events: AssistEvent[]) => Promise<AssistDailyBrief>
   assistGetMeetingBrief?: (event: AssistEvent, opts?: { refresh?: boolean }) => Promise<{ ok: true; brief: AssistMeetingBrief } | { ok: false; error: string }>
@@ -1058,6 +1077,28 @@ export interface ElectronAPI {
   notesWindowToggle?: () => Promise<{ open: boolean }>
   notesWindowClose?: () => Promise<{ success: boolean }>
   notesWindowIsOpen?: () => Promise<boolean>
+  liveNotesMeetingInfo?: () => Promise<{ live: boolean; title: string | null; people: number; event?: { id: string; title: string | null; startTime: string | null; endTime: string | null; link: string | null } | null; attendees?: Array<{ email: string; name: string | null }>; selfEmail?: string | null; speakers?: { me: string; them: string } }>
+  /** The notepad's title, typed by the user (the meeting is saved under it). */
+  /** Copy text from the notepad (main's clipboard: the window is never focused). */
+  notesWindowCopyText?: (text: string) => Promise<{ success: boolean }>
+  /** Write the OS clipboard from main: the Windows overlay is never a focused
+   *  document, which navigator.clipboard needs (src/lib/copyText.ts). */
+  clipboardWriteText?: (text: string) => Promise<{ success: boolean }>
+  liveNotesSetTitle?: (title: string) => Promise<{ success: boolean; title?: string | null }>
+  /** The note template for the running (or next) meeting's notes (noteTemplates.ts); null clears. Pro or a live trial. */
+  liveNotesSetTemplate?: (id: string | null) => Promise<{ success: boolean; error?: 'pro_required' | 'unknown_template' }>
+  liveNotesGetTemplate?: () => Promise<string | null>
+  /** The notepad's folder button: every folder and whether this meeting is in it (held until Stop saves it). */
+  liveNotesFolders?: () => Promise<Array<{ id: string; name: string; inFolder: boolean }>>
+  liveNotesSetFolder?: (folderId: string, inFolder: boolean) => Promise<{ success: boolean }>
+  liveNotesCreateFolder?: (name: string) => Promise<{ id: string; name: string } | null>
+  /** The calendar's events around now, for "Link a different event". */
+  liveNotesCalendarCandidates?: () => Promise<Array<{ id: string; title: string; startTime: string; endTime: string; people: number }>>
+  liveNotesLinkEvent?: (eventId: string | null) => Promise<{ success: boolean }>
+  /** Add or remove a person on the linked event, for this meeting only. */
+  liveNotesSetAttendees?: (change: { add?: string; remove?: string }) => Promise<{ success: boolean; error?: string }>
+  getMeetingSurface?: () => Promise<'overlay' | 'notepad'>
+  setMeetingSurface?: (surface: 'overlay' | 'notepad') => Promise<{ success: boolean; error?: string }>
   onNotesWindowVisibility?: (callback: (open: boolean) => void) => () => void
   /** The notes window's text and the meeting it belongs to. */
   liveNotesGetState?: () => Promise<{ phase: 'idle' | 'live' | 'ended'; meetingId: string | null; text: string }>
@@ -1131,13 +1172,15 @@ export interface ElectronAPI {
   stealthTapAvailable: () => Promise<boolean>
   stealthTapOpenSettings: () => Promise<void>
   stealthTapStop: () => Promise<void>
+  stealthReadClipboard: () => Promise<string>
+  stealthWriteClipboard: (text: string) => Promise<void>
   stealthTapStart: () => Promise<boolean>
   /** False on macOS when a composition IME (Pinyin/Hangul/Kanji/…) is
    *  enabled — the tap captures below the IME and breaks composition, so
    *  the renderer falls back to plain DOM focus on click. */
   stealthTapShouldAutoEngage: () => Promise<boolean>
   stealthTapRefreshIme: () => Promise<boolean>
-  onStealthTapState: (cb: (state: { active: boolean; reason?: string }) => void) => () => void
+  onStealthTapState: (cb: (state: { active: boolean; reason?: string; target?: 'overlay' | 'notes' }) => void) => () => void
   onStealthKeyCaptured: (cb: (ev: { keyCode: number; chars: string; flags: number; isKeyDown: boolean }) => void) => () => void
 
   // Profile Engine API
@@ -1230,6 +1273,9 @@ export interface ElectronAPI {
   // Ambient AI Chat — when enabled, meetings run without mic/system audio capture
   getAmbientChatEnabled: () => Promise<boolean>;
   setAmbientChatEnabled: (enabled: boolean) => Promise<{ success: boolean }>;
+  // The running meeting captures no audio (started with Ambient AI Chat on)
+  getMeetingAudioCapture?: () => Promise<{ withoutAudio: boolean }>;
+  onMeetingAudioCapture?: (callback: (data: { withoutAudio: boolean }) => void) => () => void;
   getAutoAnswerEnabled: () => Promise<boolean>;
   setAutoAnswerEnabled: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
   getDirectAssistEnabled: () => Promise<boolean>;
@@ -1325,6 +1371,8 @@ export interface ElectronAPI {
   // question is sent, the screenshots it was sent with. Overlay window only.
   phoneMirrorSetAttachments?: (items: Array<{ path: string; preview: string }>) => void;
   phoneMirrorImagesSent?: (id: string, paths: string[]) => void;
+  // Phone Mirror's Answer chip reads Stop while the overlay's Answer button records.
+  phoneMirrorSetRecording?: (active: boolean) => void;
   onPhoneMirrorDetach?: (callback: (data: { path: string }) => void) => () => void;
   // Smart Browser Context v2 — auto-capture settings.
   browserContextGetSettings: () => Promise<BrowserContextSettings | { error: string }>;
@@ -1362,7 +1410,7 @@ export interface ElectronAPI {
  * electron/services/pageCaptureFallback.ts (main is the canonical source).
  */
 export interface PageCaptureFallbackNotice {
-  kind: 'not-connected' | 'needs-host-permission' | 'timeout' | 'no-tab' | 'error';
+  kind: 'not-connected' | 'needs-host-permission' | 'timeout' | 'no-tab' | 'error' | 'formulas';
   label: string;
   detail: string;
   reason: string;
