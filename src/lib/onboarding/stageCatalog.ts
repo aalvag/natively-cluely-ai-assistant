@@ -5,7 +5,8 @@
  * Order matters: stages are evaluated front-to-back and the first eligible
  * wins (single-slot invariant), so the promotional stages' order IS their
  * priority. A stage that names a `card` also obeys the card ledger (strikes,
- * retirement, day one, the 72 h budget, one card of its class per launch);
+ * retirement, day one, the 72 h budget, onboarding cards 24 h apart), and
+ * every visible stage shares one full-window card per launch;
  * those rules live in the orchestrator and src/lib/cards/cardPolicy.mjs. The
  * predicates here only say whether a card is relevant to this user at all.
  *
@@ -71,6 +72,7 @@ const promoAudience = (s: UserState) => !s.hasTrialToken && s.planTier !== 'max'
 export const STAGE_ORDER: ToasterId[] = [
   'permissions',
   'plans',
+  'demo_video',
   'natively_api_new',
   'browser_extension',
   'profile_intelligence',
@@ -86,7 +88,9 @@ export const STAGE_ORDER: ToasterId[] = [
 export const STAGES: StageConfig[] = [
   // ── Essential ─────────────────────────────────────────────────
   // Permissions — first launch, then only when a required permission needs
-  // attention (src/lib/permissionAttentionPolicy.mjs).
+  // attention (src/lib/permissionAttentionPolicy.mjs) and the user has not put
+  // it off (src/lib/permissionsCardPolicy.mjs, applied where App.tsx pushes
+  // permissionsNeedAttention).
   {
     id: 'permissions',
     order: 1,
@@ -97,6 +101,9 @@ export const STAGES: StageConfig[] = [
       (s.permsShown && !s.permissionsNeedAttention),
     reEligibility: (s) => s.permissionsNeedAttention,
     reopensWhenReEligible: true,
+    // A meeting that could not start for a missing permission: this card is
+    // the way out, even after this launch's one card.
+    bypassesLaunchCap: (s) => s.permissionsRecoveryRequested,
   },
 
   // ── Onboarding (day 1 allowed, one per launch) ────────────────
@@ -112,6 +119,20 @@ export const STAGES: StageConfig[] = [
     customPredicate: ({ userState: s }) => promoAudience(s) && !s.isPremium && !s.hasNativelyKey,
   },
 
+  // The full setup & demo film, for everyone, right after Plans: watching
+  // the setup is the most useful thing a new install can do after choosing
+  // how to pay. Help, not a sale, so no promo audience: trial users and
+  // subscribers see it too. Opening the film from the Welcome screen or
+  // Setup & Help retires it (src/lib/demoVideo.ts), as does watching it here.
+  {
+    id: 'demo_video',
+    order: 3,
+    card: 'demo_video',
+    triggers: home(6_000),
+    requiresStages: ['permissions'],
+    customPredicate: () => true,
+  },
+
   // There is no free-trial card: the trial starts by itself when a meeting
   // starts with no AI (src/lib/trial/autoTrial.mjs), and the overlay says so.
   // The card reached about one new install in twelve; half of them started
@@ -123,7 +144,7 @@ export const STAGES: StageConfig[] = [
   // card down for good, before it was removed.
   {
     id: 'natively_api_new',
-    order: 3,
+    order: 4,
     card: 'natively_api_new',
     triggers: home(6_000),
     requiresStages: ['permissions'],
@@ -137,7 +158,7 @@ export const STAGES: StageConfig[] = [
   // launch's one onboarding card before `order` could rank them.
   {
     id: 'browser_extension',
-    order: 4,
+    order: 5,
     card: 'browser_extension',
     triggers: home(6_000),
     requiresStages: ['permissions'],
@@ -147,7 +168,7 @@ export const STAGES: StageConfig[] = [
   // ── Gate-only markers (no UI; kept for their persisted completion) ──
   {
     id: 'profile_intelligence',
-    order: 5,
+    order: 6,
     onceEver: true,
     isGateOnly: true, // UI is the Launcher's header icon popover, not this stage
     triggers: home(4_000),
@@ -159,7 +180,7 @@ export const STAGES: StageConfig[] = [
   },
   {
     id: 'modes_manager',
-    order: 6,
+    order: 7,
     onceEver: true,
     isGateOnly: true, // UI is the Launcher's header icon popover, not this stage
     triggers: home(4_000),

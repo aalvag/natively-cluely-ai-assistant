@@ -95,10 +95,6 @@ export type AnswerType =
   // loaded + cite it, else say exact source isn't loaded and label any demo
   // conceptual — NEVER present generic code as the real implementation.
   | 'source_code_evidence_answer'
-  // A safety route for stealth / undetectability / proctoring-evasion asks. Must
-  // decline to help hide the tool from an interviewer or bypass detection, and
-  // redirect to privacy-first / consent / transparency / low-distraction themes.
-  | 'ethical_usage_answer'
   // A question ABOUT the product/project itself ("what kind of app is Natively?",
   // "how's its backend?") — grounded in loaded project metadata, no overclaim.
   | 'project_about_answer';
@@ -533,18 +529,6 @@ Rules:
 - 2-5 sentences, confident, speakable, no headings or bullet markers unless asked.
 - Never pull the user's resume, JD, or salary data into a sales answer.`;
 
-// Release 2026-06-06b — safety route for stealth/undetectability/evasion asks.
-const ETHICAL_USAGE_TEMPLATE = `The user is asking how to make this tool hidden, undetectable, invisible to an interviewer, or how to evade detection / proctoring / screen-share / network monitoring.
-
-You MUST NOT provide any guidance for hiding the tool from an interviewer, making it undetectable, evading screen-share or proctoring detection, bypassing monitoring, or otherwise using it to deceive or cheat. Do not describe hidden overlays, transparency tricks, secondary-monitor concealment, virtual-device evasion, or network-evasion.
-
-Instead, in 2-4 sentences:
-1. Briefly and politely decline to help make it undetectable or hidden from an interviewer.
-2. Redirect to what IS supported: privacy-first design, on-device/local processing, clear permissions and consent, a low-distraction minimal UI, accessibility, and transparent, user-controlled use in meetings.
-3. Note that the tool should be used openly and ethically, not to deceive interviewers or bypass rules.
-
-Do NOT lecture at length. Be concise, helpful, and firm.`;
-
 // Release 2026-06-06b — project link / repo / public URL.
 const PROJECT_LINK_TEMPLATE = `The user is asking for a project's link, repository, GitHub, website, or source URL.
 
@@ -625,37 +609,7 @@ const isLikelyTechnicalConcept = (text: string): boolean =>
 
 
 
-// ── SAFETY: stealth / undetectability / proctoring-evasion (release 2026-06-06b) ──
-// Asking how to hide the tool from an interviewer, make it undetectable/invisible
-// in a screen share, evade detection/proctoring/network-monitoring, or otherwise
-// cheat covertly. These route to `ethical_usage_answer` (a safe decline + redirect
-// to privacy/consent/transparency). Checked FIRST so a stealth ask can never reach
-// a route that would give specific evasion advice. The phrasing must combine an
-// EVASION verb/adjective with an interview/screen/detection OBJECT so legitimate
-// product questions ("is it low-distraction?", "does it process locally?") are
-// unaffected.
-// An EVASION token — wanting the tool unseen/undetected/concealed, OR a covert /
-// cheat / "get caught" / "under the radar" / "without them knowing" intent. Kept
-// broad on purpose: a missed stealth ask reaches the generic LLM with no decline
-// contract, so over-coverage (a few false safety-redirects) is far safer than
-// under-coverage (code-review 2026-06-06b CRITICAL). Soft verbs (notice / see /
-// realize / nobody / discreet / secret) are included.
-const STEALTH_INTENT_RE = /\b(undetect\w*|undetectible|undectable|invisible|invisibility|conceal\w*|covert\w*|stealth\w*|sneak\w*|discree\w*|secret\w*|surreptitious\w*|cheat\w*|hide\b|hidden\b|hiding\b|off[- ]?screen|keep (?:this|it|natively|the (?:app|tool|overlay)) off|under the radar|on the (?:dl|down[- ]?low)|(?:avoid|evade|bypass|beat|get around|defeat|fool|trick|dodge|escape)\s+(?:being\s+|getting\s+|the\s+)?(?:caught|seen|noticed|detected|detection|proctor\w*|monitor\w*|virtual (?:mic|microphone|camera)|network|webcam|camera)|without (?:them|the interviewer|anyone|him|her|people) (?:know|notic|see|find)\w*|so (?:nobody|no one|they|the interviewer|he|she) (?:can'?t|won'?t|doesn'?t|don'?t) (?:see|notice|detect|catch|find|know)|(?:not|don'?t|won'?t|can'?t) (?:get|getting|be) caught|avoid (?:being |getting )?(?:caught|seen|noticed|detected)|nobody (?:sees|notices|knows)|no one (?:sees|notices|knows))\b/i;
-// An INTERVIEW / detection OBJECT — the thing the user wants to evade.
-const STEALTH_OBJECT_RE = /\b(interview\w*|proctor\w*|invigilat\w*|recruiter|examiner|screen[- ]?shar\w*|screenshar\w*|share my screen|sharing my screen|webcam|web cam|camera|monitor\w*|detection|second(?:ary)? (?:screen|monitor|display)|virtual (?:mic|microphone|camera)|network monitor\w*|the (?:call|meeting|assessment|exam|test)|video call|video[- ]?conferenc\w*|zoom|google meet|ms teams|teams call)\b/i;
-// SOFT visibility verbs paired with an interview object even WITHOUT an explicit
-// evasion token ("can the interviewer SEE this overlay?", "will the recruiter
-// NOTICE the app?", "will it be VISIBLE in the screen share?").
-const STEALTH_SOFT_VISIBILITY_RE = /\b(see|sees|seeing|notice\w*|realize\w*|realise\w*|spot|catch\w*|find out|aware|visible|detect\w*|know about|figure out)\b/i;
-
-export const isStealthEvasionQuestion = (_question: string): boolean => {
-  return false;
-};
-
-
-
-
-
+// ── JD-SOURCE cue predicates (2026-07-07, JD/Resume JIT pipeline fix) ─────────
 
 
 
@@ -907,8 +861,6 @@ const templateFor = (answerType: AnswerType): string => {
       return DOCUMENT_ABSENT_FACT_TEMPLATE;
     case 'document_followup_answer':
       return DOCUMENT_FOLLOWUP_TEMPLATE;
-    case 'ethical_usage_answer':
-      return ETHICAL_USAGE_TEMPLATE;
     case 'project_link_answer':
       return PROJECT_LINK_TEMPLATE;
     case 'source_code_evidence_answer':
@@ -1009,10 +961,6 @@ export const requiredLayersFor = (answerType: AnswerType, documentGroundedCustom
       // metadata names the project. No JD/negotiation. The template enforces
       // honesty about what's loaded.
       return ['reference_files', 'custom_context', 'resume', 'active_mode'];
-    case 'ethical_usage_answer':
-      // A safety answer needs NO candidate context — it's a policy redirect about
-      // the product. Persona only (for tone). Never résumé/JD/negotiation.
-      return ['ai_persona'];
     default:
       return ['live_transcript', 'active_mode'];
   }
@@ -1106,9 +1054,6 @@ export const forbiddenLayersFor = (answerType: AnswerType): ContextLayer[] => {
       // so a genuine "And SQL?" becomes skill_experience (resume allowed) and
       // never lands here — this floor only bites truly context-free fragments.
       return ['resume', 'jd', 'negotiation'];
-    case 'ethical_usage_answer':
-      // A safety/policy answer must pull NO candidate context at all.
-      return ['resume', 'jd', 'negotiation', 'custom_context', 'reference_files'];
     case 'project_about_answer':
       // Product description — never the JD/negotiation/salary layer.
       return ['jd', 'negotiation'];
@@ -1158,9 +1103,6 @@ export const profileContextPolicyFor = (answerType: AnswerType): ProfileContextP
     case 'document_followup_answer':
     case 'general_meeting_answer':
       // Meeting recap is about the conversation, not the candidate — no profile.
-      return 'forbidden';
-    case 'ethical_usage_answer':
-      // Safety answer: NO profile at all.
       return 'forbidden';
     case 'identity_answer':
     case 'profile_fact_answer':
@@ -1677,14 +1619,7 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
   // ask is never a profile meta-directive.
   const metaDirective = (!hasWriteCodeVerb && question) ? classifyStandaloneFragment(text) : null;
 
-  // SAFETY (release 2026-06-06b): a stealth / undetectability / proctoring-evasion
-  // ask must be caught BEFORE any other route so it can never receive specific
-  // evasion advice. A SAFE product/privacy phrasing ("is it low-distraction?",
-  // "does it process locally?") with no evasion+interview combination is excluded.
-  // SAFETY: an evasion+object combination ALWAYS wins — the privacy carve-out can
-  // never exempt it (code-review 2026-06-06b HIGH). isStealthEvasionQuestion is the
-  // single authoritative predicate (also consulted by the manual fast-path).
-  const isStealthEvasion = isStealthEvasionQuestion(text);
+
   // SOURCE-CODE evidence: a request for the ACTUAL code of a loaded project. Must
   // win over the generic coding route (which would fabricate a plausible snippet).
   const wantsSourceEvidence = includesAny(text, SOURCE_CODE_EVIDENCE_PATTERNS);
@@ -1707,8 +1642,6 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
 
   if (!question) {
     answerType = 'unknown_answer';
-  } else if (isStealthEvasion) {
-    answerType = 'ethical_usage_answer';
   } else if (wantsSourceEvidence) {
     answerType = 'source_code_evidence_answer';
   } else if (wantsProjectLink) {

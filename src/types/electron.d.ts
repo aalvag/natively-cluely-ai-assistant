@@ -166,7 +166,7 @@ export interface ElectronAPI {
   // cast, so only the two read APIs SettingsOverlay calls are declared here.
   localWhisperGetModels?: () => Promise<{ models: any[]; activeModelId: string }>
   /** People sharing the microphone: diarize the mic channel and split its voices at save. */
-  /** "About you": a few lines the meeting notes prompt reads as the user's own bio. */
+  /** "About you" (Profile Intelligence › Cue Cards, Pro): a few lines the meeting notes prompt reads as the user's own bio. */
   userBioGet?: () => Promise<{ bio: string }>
   userBioSet?: (bio: string) => Promise<{ success: boolean; bio?: string; error?: string }>
   /** The notes window's "Shorten": the tightened line, or null when it must not replace the original. */
@@ -383,7 +383,8 @@ export interface ElectronAPI {
   funnelTrack: (eventType: string, props?: Record<string, string | number | boolean>) => Promise<{ ok: boolean; result?: string; error?: string }>
   cardsImportLegacy: (legacy: import('../lib/cards/cardPolicy.mjs').LegacyCardHistory) => Promise<{ ok: boolean; ledger?: import('../lib/cards/cardPolicy.mjs').Ledger; error?: string }>
   onCardsChanged: (cb: (ledger: import('../lib/cards/cardPolicy.mjs').Ledger) => void) => () => void
-  onTrialEnded:   (cb: (data: { choice: string }) => void) => () => void
+  onTrialEnded:   (cb: (data: { choice: string; expiresAt?: string; showEndedCard?: boolean }) => void) => () => void
+  onTrialAllowanceLow?: (cb: (data: { expiresAt?: string | null }) => void) => () => void
   /** Emitted by `trial:start`, so a trial claimed mid-session unlocks Pro surfaces without a relaunch. */
   onTrialStarted: (cb: (data: { expiresAt: string; startedAt: string; usage?: { ai: number; ai_tokens?: number; stt_seconds: number; search: number }; limits?: { duration_ms: number; ai_requests: number; stt_minutes: number; search_requests: number } }) => void) => () => void
   /** A meeting with no AI is starting the free trial by itself. `pending`: on its way. `failed`: it could not (offline, rate limited), so the overlay offers the manual start. `settled`: done, one way or the other. */
@@ -420,6 +421,8 @@ export interface ElectronAPI {
   onHindsightStatus: (callback: (data: { state: 'spawning' | 'ready' | 'unreachable' | 'spawn-failed' | 'auth-failed'; reason?: string; logPath?: string; at?: number }) => void) => () => void
   // Hindsight: open the server's log file in the OS default viewer. Path is resolved
   // server-side; renderer never supplies a path.
+  /** The last Hindsight lifecycle status broadcast, or null before the first. */
+  getHindsightStatus: () => Promise<{ state: 'spawning' | 'ready' | 'unreachable' | 'spawn-failed' | 'auth-failed'; reason?: string; logPath?: string; at?: number } | null>
   openHindsightLog: () => Promise<{ ok: boolean; logPath?: string; error?: string }>
   // Hindsight: user-initiated opt-out. Sets the explicit-disable sentinel.
   disableHindsight: () => Promise<{ success: boolean; error?: string }>
@@ -450,10 +453,10 @@ export interface ElectronAPI {
   // generic one.
   onSystemAudioPermissionDenied: (callback: (message: string, titleKey?: string) => void) => () => void
   onDeviceSelectionApplied: (callback: (payload: { kind: 'input' | 'output'; requested: string | null; actual: string | null; fellBack: boolean; reason?: string }) => void) => () => void
-  onAudioCaptureFailed: (callback: (payload: { channel: 'system' | 'mic'; message: string; attempt: number; maxAttempts: number; terminal?: boolean; stuck?: boolean; titleKey?: string }) => void) => () => void
+  onAudioCaptureFailed: (callback: (payload: { channel: 'system' | 'mic'; message: string; attempt: number; maxAttempts: number; terminal?: boolean; stuck?: boolean; titleKey?: string; /** Advice only (shown once per meeting). */ advisory?: boolean; /** A blocked permission: shown even on a hidden overlay. */ permission?: boolean; /** false: real audio on the channel does not clear it. */ clearsOnRecovery?: boolean; /** The channel carries real audio again: its stuck/terminal warning no longer holds. */ recovered?: boolean }) => void) => () => void
 
   // STT Status Events
-  onSttStatusChanged: (callback: (data: { state: 'connected' | 'reconnecting' | 'failed' | 'awaiting-audio' | 'preparing'; provider: string; error?: string; channel: 'user' | 'interviewer'; reconnectAttempts?: number; /** A stand-in carries the channel while `provider` is down. */ fallback?: { provider: string; notice: string } }) => void) => () => void
+  onSttStatusChanged: (callback: (data: { state: 'connected' | 'reconnecting' | 'failed' | 'awaiting-audio' | 'preparing'; provider: string; error?: string; channel: 'user' | 'interviewer'; reconnectAttempts?: number; /** A stand-in carries the channel while `provider` is down. */ fallback?: { provider: string; notice: string }; /** A local model is slower than speech: not a state change. */ behind?: true }) => void) => () => void
   onAudioInitStatus: (callback: (data: { stage: string; progress?: number; message?: string; modelId?: string }) => void) => () => void
   onLocalWhisperDownloadProgress: (callback: (data: { modelId: string; progress: number }) => void) => () => void
   onLocalWhisperDownloadComplete: (callback: (data: { modelId: string }) => void) => () => void
@@ -496,6 +499,11 @@ export interface ElectronAPI {
   generateRecap: () => Promise<{ summary: string | null }>
   /** The overlay's live helpers: What did I miss?, Define, Sound smart. Streams like Recap and Clarify. */
   generateLiveHelper?: (action: LiveHelperAction, opts?: { sinceMs?: number }) => Promise<{ text: string | null }>
+  runNoteRecipe?: (input: { recipeId: string; extra?: string; meetingId?: string | null; phase: 'live' | 'ended'; notes?: string }) => Promise<{ text: string | null; error?: string }>
+  /** Settings › Overlay › Your buttons: rewrite the user's description into the button's contract (a fallback when no model answers). */
+  compileCustomButton?: (input: { name: string; description: string }) => Promise<{ instruction: string; source: 'model' | 'fallback' }>
+  /** A press of a custom button: runs like a live helper and streams into Recap's card. */
+  generateCustomButton?: (input: { name: string; instruction: string; imagePaths?: string[]; readMinutes?: number }) => Promise<{ text: string | null; error?: string }>
   submitManualQuestion: (question: string) => Promise<{ answer: string | null; question: string }>
   getIntelligenceContext: () => Promise<{ context: string; lastAssistantMessage: string | null; activeMode: string }>
   resetIntelligence: () => Promise<{ success: boolean; error?: string }>
@@ -847,8 +855,12 @@ export interface ElectronAPI {
   onMeetingInterfaceThemeChanged: (callback: (theme: string) => void) => () => void
   setGenieAnimationEnabled: (enabled: boolean) => void
   onGenieAnimationChanged: (callback: (enabled: boolean) => void) => () => void
+  setKeepOverlaySizeEnabled: (enabled: boolean) => void
+  onKeepOverlaySizeChanged: (callback: (enabled: boolean) => void) => () => void
   setOverlayButtonOrder: (order: string[]) => void
   onOverlayButtonOrderChanged: (callback: (order: string[]) => void) => () => void
+  setOverlayCustomButtons: (buttons: { id: string; name: string; prompt: string; instruction: string; screenshot: boolean }[]) => void
+  onOverlayCustomButtonsChanged: (callback: (buttons: unknown) => void) => () => void
 
   // Phase 3 — Cluely-style dynamic action cards.
   onIntelligenceDynamicAction: (callback: (data: { action: DynamicActionPayload }) => void) => () => void
@@ -882,12 +894,14 @@ export interface ElectronAPI {
   onIntelligenceModeChanged: (callback: (data: { mode: string }) => void) => () => void
   onIntelligenceError: (callback: (data: { error: string, mode: string }) => void) => () => void;
   // Session Management
-  onSessionReset: (callback: () => void) => () => void;
+  /** With `resumedChat` when Resume continues a saved meeting: its earlier answers (src/lib/resumedChat.mjs). */
+  onSessionReset: (callback: (payload?: { resumedChat?: Array<{ type: string; timestamp: number; question: string; answer: string; source?: string; synthetic?: boolean; hasImages?: boolean }> }) => void) => () => void;
 
   // Streaming listeners
   streamGeminiChat: (message: string, imagePaths?: string[], context?: string, options?: { skipSystemPrompt?: boolean, ignoreKnowledgeMode?: boolean, liveQuestion?: boolean }) => Promise<void>
   onGeminiStreamToken: (callback: (token: string, meta?: { streamId?: number }) => void) => () => void
   onGeminiStreamDone: (callback: (data?: { finalText?: string; streamId?: number; incomplete?: boolean; incompleteReason?: string }) => void) => () => void
+  onGeminiStreamStarted: (callback: (data: { streamId: number }) => void) => () => void
   onGeminiStreamError: (callback: (error: string, meta?: { streamId?: number | null; source?: string }) => void) => () => void;
 
   // NOTE: onSkillsChanged broadcast subscription was removed. Skills are
@@ -1089,9 +1103,6 @@ export interface ElectronAPI {
   liveNotesSetTemplate?: (id: string | null) => Promise<{ success: boolean; error?: 'pro_required' | 'unknown_template' }>
   liveNotesGetTemplate?: () => Promise<string | null>
   /** The notepad's folder button: every folder and whether this meeting is in it (held until Stop saves it). */
-  liveNotesFolders?: () => Promise<Array<{ id: string; name: string; inFolder: boolean }>>
-  liveNotesSetFolder?: (folderId: string, inFolder: boolean) => Promise<{ success: boolean }>
-  liveNotesCreateFolder?: (name: string) => Promise<{ id: string; name: string } | null>
   /** The calendar's events around now, for "Link a different event". */
   liveNotesCalendarCandidates?: () => Promise<Array<{ id: string; title: string; startTime: string; endTime: string; people: number }>>
   liveNotesLinkEvent?: (eventId: string | null) => Promise<{ success: boolean }>
@@ -1107,6 +1118,8 @@ export interface ElectronAPI {
   onLiveNotesState?: (callback: (state: { phase: 'idle' | 'live' | 'ended'; meetingId: string | null; text?: string }) => void) => () => void
   /** "Open meeting" in the notes window: the launcher opens that meeting. */
   notesWindowOpenMeeting?: (meetingId: string) => Promise<{ success: boolean }>
+  notesWindowOpenSavedMeeting?: (meetingId: string) => Promise<{ success: boolean; code?: string }>
+  resumeMeeting?: (meetingId: string, request?: { audio?: { inputDeviceId: string | null; outputDeviceId: string | null }; doNotPersist?: boolean }) => Promise<{ success: boolean; error?: string; code?: string }>
   onLauncherOpenMeeting?: (callback: (meetingId: string) => void) => () => void
   /** Earlier versions of a meeting's notes, oldest first. */
   getMeetingNotesVersions?: (meetingId: string) => Promise<Array<{ id: number; label: string; createdAt: number; templateType: string | null; detailedSummary: any }>>
@@ -1115,7 +1128,7 @@ export interface ElectronAPI {
   getMeetingNotesRating?: (input: { meetingId: string; versionId?: number | null }) => Promise<{ rating: 'up' | 'down'; comment: string | null } | null>
   /** Compare two versions of the notes blind: A and B in a random order, named only after the pick. */
   compareMeetingNotesStart?: (input: { meetingId: string; versions: [number | 'current', number | 'current'] }) => Promise<{ id: string; a: any; b: any } | null>
-  compareMeetingNotesPick?: (input: { id: string; choice: 'A' | 'B' | 'same'; reason?: string }) => Promise<{ choice: 'A' | 'B' | 'same'; saved: boolean; a: { version: 'current' | number; label: string; provider: string | null; model: string | null }; b: { version: 'current' | number; label: string; provider: string | null; model: string | null } } | null>
+  compareMeetingNotesPick?: (input: { id: string; choice: 'A' | 'B' | 'same'; reason?: string }) => Promise<{ choice: 'A' | 'B' | 'same'; saved: boolean; a: { version: 'current' | number; label: string; provider: string | null; model: string | null }; b: { version: 'current' | number; label: string; provider: string | null; model: string | null }; removed?: 'current' | number | null; promoted?: number | null } | null>
   onMeetingAutoStopNotice?: (callback: (data: { stopsAt: number | null }) => void) => () => void
   /** A notification's Start (a detected call, the calendar reminder), relayed by main to the launcher. */
   onMeetingStartRequest?: (callback: (req: { title?: string; calendarEventId?: string; via?: 'detected' | 'reminder' }) => void) => () => void
@@ -1249,6 +1262,9 @@ export interface ElectronAPI {
   /** Async startup check — calls Dodo validate endpoint to detect server-side revocations. */
   licenseCheckPremiumAsync: () => Promise<boolean>
   onLicenseStatusChanged: (callback: (data: { isPremium: boolean, plan?: string }) => void) => () => void
+  /** A Pro pack ran out during a meeting (main: PackMeetingClock). */
+  onPackEnded?: (cb: (data: { reason: string | null }) => void) => () => void
+  onPackRenewed?: (cb: () => void) => () => void
   licenseDeactivate: () => Promise<void>
   licenseGetHardwareId: () => Promise<string>
 
@@ -1290,6 +1306,13 @@ export interface ElectronAPI {
   getProviderDataScopes: () => Promise<{ transcript?: boolean; screenshots?: boolean; reference_files?: boolean; profile_history?: boolean; embeddings?: boolean; post_call_summary?: boolean }>;
   setProviderDataScopes: (scopes: { transcript?: boolean; screenshots?: boolean; reference_files?: boolean; profile_history?: boolean; embeddings?: boolean; post_call_summary?: boolean }) => Promise<{ success: boolean; error?: string }>;
   onProviderDataScopesChanged: (callback: (scopes: { transcript?: boolean; screenshots?: boolean; reference_files?: boolean; profile_history?: boolean; embeddings?: boolean; post_call_summary?: boolean }) => void) => () => void;
+  getScreenshotDisplay: () => Promise<{
+    preference: string;
+    displays: Array<{ id: number; number: number; name: string; width: number; height: number; primary: boolean }>;
+  }>;
+  setScreenshotDisplay: (preference: string) => Promise<{ success: boolean; error?: string }>;
+  cropperPickDisplay: () => void;
+  cropperDrag: (active: boolean) => void;
   getScreenUnderstandingMode: () => Promise<'vision_first' | 'vision_only' | 'private_vision'>;
   setScreenUnderstandingMode: (mode: 'vision_first' | 'vision_only' | 'private_vision') => Promise<{ success: boolean; error?: string }>;
   onScreenUnderstandingModeChanged: (callback: (mode: 'vision_first' | 'vision_only' | 'private_vision') => void) => () => void;
@@ -1316,6 +1339,9 @@ export interface ElectronAPI {
     key: 'seenStartup' | 'seenProfileOnboarding' | 'seenModesOnboarding' | 'permsShown',
     value: boolean,
   ) => Promise<{ success: boolean; error?: string }>;
+  /** The permissions card's closes while a permission is missing (src/lib/permissionsCardPolicy.mjs). */
+  permissionsCardGet: () => Promise<{ dismissals: number; lastDismissedAt: number | null }>;
+  permissionsCardRecord: (event: 'dismissed' | 'granted') => Promise<{ success: boolean; error?: string; record?: { dismissals: number; lastDismissedAt: number | null } }>;
   /** First-launch shortcut tour: taught shortcuts become practice presses. */
   onboardingSetShortcutTour: (active: boolean) => Promise<{ success: boolean }>;
   onOnboardingTourShortcut: (callback: (actionId: string) => void) => () => void;
@@ -1344,6 +1370,8 @@ export interface ElectronAPI {
   // manager. Enable/disable is intentionally NOT exposed on the renderer —
   // users who don't want a skill delete it instead.
   skillsDelete: (id: string) => Promise<{ success: boolean; error?: string }>;
+  /** "Use in every answer": the skill rides every live and typed answer without its /name. */
+  skillsSetAlwaysOn?: (id: string, alwaysOn: boolean) => Promise<{ success: boolean; error?: string }>;
   // Skill upload — step-3 wiring. `skillsUpload(payload, { autoInstall: true })`
   // is a one-shot validate+install; `skillsPreview(payload)` always sets
   // `autoInstall: false` so the renderer can show a confirm card first.
@@ -1371,7 +1399,7 @@ export interface ElectronAPI {
   // question is sent, the screenshots it was sent with. Overlay window only.
   phoneMirrorSetAttachments?: (items: Array<{ path: string; preview: string }>) => void;
   phoneMirrorImagesSent?: (id: string, paths: string[]) => void;
-  // Phone Mirror's Answer chip reads Stop while the overlay's Answer button records.
+  // Phone Mirror's Speak chip reads Stop while the overlay's Speak button records.
   phoneMirrorSetRecording?: (active: boolean) => void;
   onPhoneMirrorDetach?: (callback: (data: { path: string }) => void) => () => void;
   // Smart Browser Context v2 — auto-capture settings.
@@ -1554,6 +1582,7 @@ export interface SkillSummary {
   description: string;
   source: 'builtin' | 'userData';
   enabled: boolean;
+  alwaysOn?: boolean; // "Use in every answer" (Settings › Skills)
 }
 
 // ---------------------------------------------------------------------------

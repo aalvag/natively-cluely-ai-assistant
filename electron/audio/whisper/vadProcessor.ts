@@ -1,8 +1,8 @@
 /**
  * Energy-based Voice Activity Detection (VAD) at 16 kHz.
  *
- * Uses 30ms windows (480 samples), RMS threshold 0.008,
- * 700ms hangover (~23 frames), 250ms min speech duration (~8 frames),
+ * Uses 30ms windows (480 samples), RMS threshold 0.0015,
+ * 300ms hangover (10 frames), 120ms min speech duration (4 frames),
  * and 15000ms max segment duration (force-flush).
  */
 

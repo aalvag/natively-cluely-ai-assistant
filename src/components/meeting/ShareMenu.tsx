@@ -57,9 +57,24 @@ export const ShareMenu: React.FC<{
     meetingId: string;
     disabled?: boolean;
     hasTranscript: boolean;
-    /** Copies the tab the user is on; resolves true once it is on the clipboard. */
-    onCopy: () => Promise<boolean>;
-}> = ({ meetingId, disabled, hasTranscript, onCopy }) => {
+    /**
+     * Copies the tab the user is on; resolves true once it is on the clipboard.
+     * Left out where a Copy button already sits beside Share (the notepad's
+     * notes, 2026-11-01: "remove the copy from the dropdown, since its
+     * repetition"), and then the menu has no Copy row.
+     */
+    onCopy?: () => Promise<boolean>;
+    /** The menu opened (the notepad counts it for its telemetry, 2026-11-01). */
+    onOpen?: () => void;
+    /**
+     * The notepad's toolbar (2026-11-01): the share icon alone, in the caller's pill
+     * (triggerClassName/triggerStyle), its menu hanging from the button's left edge like
+     * the Notes menu beside it. "Saved" / "Copied" still show as the check and are read out.
+     */
+    iconOnly?: boolean;
+    triggerClassName?: string;
+    triggerStyle?: React.CSSProperties;
+}> = ({ meetingId, disabled, hasTranscript, onCopy, onOpen, iconOnly, triggerClassName, triggerStyle }) => {
     const t = useT();
     const isLight = useResolvedTheme() === 'light';
     const [open, setOpen] = useState(false);
@@ -86,6 +101,7 @@ export const ShareMenu: React.FC<{
         clearTimeout(closeTimer.current);
         setClosing(false);
         setOpen(true);
+        onOpen?.();
         void api()?.getConnections().then((c) => c && setConn(c)).catch(() => {});
     };
     const close = (refocus: boolean) => {
@@ -137,7 +153,7 @@ export const ShareMenu: React.FC<{
     };
 
     const copy = async () => {
-        if (await onCopy().catch(() => false)) flashSaved(t('Copied'));
+        if (onCopy && await onCopy().catch(() => false)) flashSaved(t('Copied'));
     };
 
     // Link (owner, 2026-10-18: no card, "it says copied"): makes the link, or hands
@@ -159,26 +175,32 @@ export const ShareMenu: React.FC<{
     const crm = (['hubspot', 'attio', 'affinity', 'salesforce', 'pipedrive'] as CrmService[]).find((sv) => conn?.[sv]?.connected);
     type Item = { key: string; label: string; icon: React.ReactNode; run: () => void; brand?: boolean };
     const keep: Item[] = [
-        { key: 'copy', label: t('Copy'), icon: <Copy size={14} />, run: () => void copy() },
+        ...(onCopy ? [{ key: 'copy', label: t('Copy'), icon: <Copy size={14} />, run: () => void copy() }] : []),
         { key: 'pdf', label: t('File'), icon: <FileDown size={14} />, run: () => void exportPdf() },
         { key: 'link', label: t('Link'), icon: <Link2 size={14} />, run: () => void shareLink() },
     ];
+    // Connectors are Pro or trial (main enforces it: connectorAccess.ts). Without
+    // it the destinations stay listed and say so, instead of opening a dialog
+    // whose send would be refused. Absent `pro` (an older main) reads as allowed.
+    const proOnly = (run: () => void) => (conn?.pro === false
+        ? () => showMessage(t('Sending notes to Slack, Notion and your CRM is part of Natively Pro. Upgrade in Settings, Plans & Billing.'))
+        : run);
     const send: Item[] = [
-        { key: 'slack', label: 'Slack', icon: <ConnectorMark id="slack" size={14} />, brand: true, run: () => setDialog('slack') },
-        { key: 'notion', label: 'Notion', icon: <ConnectorMark id="notion" size={14} />, brand: true, run: () => setDialog('notion') },
+        { key: 'slack', label: 'Slack', icon: <ConnectorMark id="slack" size={14} />, brand: true, run: proOnly(() => setDialog('slack')) },
+        { key: 'notion', label: 'Notion', icon: <ConnectorMark id="notion" size={14} />, brand: true, run: proOnly(() => setDialog('notion')) },
         crm
-            ? { key: 'crm', label: CRM_NAMES[crm], icon: <ConnectorMark id={crm} size={14} />, brand: true, run: () => setDialog('crm') }
-            : { key: 'crm', label: 'CRM', icon: <Contact size={14} />, run: () => setDialog('crm') },
+            ? { key: 'crm', label: CRM_NAMES[crm], icon: <ConnectorMark id={crm} size={14} />, brand: true, run: proOnly(() => setDialog('crm')) }
+            : { key: 'crm', label: 'CRM', icon: <Contact size={14} />, run: proOnly(() => setDialog('crm')) },
         // Only once a directory key is saved: looks the attendees up and files
         // title / company suggestions. Nothing is applied here.
         ...(conn?.clearbit?.connected ? [{
             key: 'enrich',
             label: t('Look up attendees'),
             icon: <Contact size={14} />,
-            run: () => {
+            run: proOnly(() => {
                 const failed = t('The lookup did not finish. Try again.');
                 void api()?.enrichAttendees(meetingId).then((r) => showMessage(r?.message || failed)).catch(() => showMessage(failed));
-            },
+            }),
         }] : []),
     ];
     // Styled from its neighbours (owner, 2026-10-17: "visually disconnected"). It
@@ -224,7 +246,12 @@ export const ShareMenu: React.FC<{
                 aria-haspopup="menu"
                 aria-expanded={open}
                 aria-controls={menuId}
-                className="flex items-center gap-2 text-xs font-medium text-text-secondary hover:text-text-primary transition-[color,opacity] disabled:opacity-40 disabled:cursor-default disabled:hover:text-text-secondary"
+                aria-label={iconOnly ? t('Share') : undefined}
+                title={iconOnly ? t('Share') : undefined}
+                style={iconOnly ? triggerStyle : undefined}
+                className={iconOnly
+                    ? `${triggerClassName ?? ''} disabled:opacity-40 disabled:cursor-default`
+                    : 'flex items-center gap-2 text-xs font-medium text-text-secondary hover:text-text-primary transition-[color,opacity] disabled:opacity-40 disabled:cursor-default disabled:hover:text-text-secondary'}
             >
                 {busy ? (
                     <Loader2 className="w-3.5 h-3.5 animate-spin" size={14} aria-hidden="true" />
@@ -234,19 +261,23 @@ export const ShareMenu: React.FC<{
                         <Check className="t-icon w-3.5 h-3.5 text-emerald-500" data-icon="b" size={14} />
                     </span>
                 )}
+                {iconOnly ? (
+                    <span className="sr-only" role="status">{saved}</span>
+                ) : (
                 <span className="grid">
                     <span aria-hidden="true" className="invisible col-start-1 row-start-1">{t('Share')}</span>
                     <span aria-hidden="true" className="invisible col-start-1 row-start-1">{t('Saved')}</span>
                     <span aria-hidden="true" className="invisible col-start-1 row-start-1">{t('Copied')}</span>
                     <span className="col-start-1 row-start-1">{saved || t('Share')}</span>
                 </span>
+                )}
             </button>
             <div
                 ref={menuRef}
                 id={menuId}
                 role="menu"
                 tabIndex={-1}
-                data-origin="top-right"
+                data-origin={iconOnly ? 'top-left' : 'top-right'}
                 inert={!open}
                 onKeyDown={onMenuKeyDown}
                 // Leaving the menu with the pointer unlights the row it was on.
@@ -254,7 +285,7 @@ export const ShareMenu: React.FC<{
                 // Hangs mt-2 under the trigger like the Calendar chip's menu beside it.
                 // 110px wide (owner); the longest label, a connected "Salesforce", still fits.
                 // Dark keeps the app's popover surface: --bg-elevated there is the page itself.
-                className={`t-dropdown${open ? ' is-open' : closing ? ' is-closing' : ''} absolute right-[-4px] top-full mt-2 z-50 w-[110px] p-1 rounded-[11px] border outline-none ${isLight
+                className={`t-dropdown${open ? ' is-open' : closing ? ' is-closing' : ''} absolute ${iconOnly ? 'left-0 mt-1.5' : 'right-[-4px] mt-2'} top-full z-50 w-[110px] p-1 rounded-[11px] border outline-none ${isLight
                     ? 'bg-bg-elevated border-border-subtle shadow-[0_10px_32px_-6px_rgba(28,28,40,0.12),0_1px_2px_rgba(28,28,40,0.04)]'
                     : 'bg-[#1C1C1F] border-white/[0.08] shadow-[0_10px_32px_-6px_rgba(0,0,0,0.55),0_1px_2px_rgba(0,0,0,0.3)]'}`}
             >

@@ -17,6 +17,7 @@ import { useTrialExpiry }       from "./components/trial/useTrialExpiry"
 import { TrialMeterToaster }    from "./components/trial/TrialMeterToaster"
 import type { TrialUsage, TrialLimits } from './types/nativelyUsage';
 import { FreeTrialModal }       from "./components/trial/FreeTrialModal"
+import { usageForEndedCard }    from "./lib/trial/endedTrialUsage.mjs"
 import { OrchestratorProvider, OrchestratedToasterHost, setUserState as setOrchestratorUserState, emitOrchestratorEvent } from "./components/onboarding/OrchestratedToasterHost"
 // NOTE: explicit `.ts` extension is load-bearing. Vite's default resolver
 // tries `.mjs` before `.ts` (see DEFAULT_EXTENSIONS in vite/dist/node/constants.js),
@@ -31,11 +32,11 @@ import { OrchestratorProvider, OrchestratedToasterHost, setUserState as setOrche
 // unmounting the whole tree — the black-screen root cause. Do not remove
 // the extension.
 import { getOrchestrator } from "./lib/onboarding/orchestrator.ts"
-import { isInternalCaptureDevice } from "../electron/audio/audioDeviceSelection.mjs"
+import { savedMeetingAudio } from "./lib/startMeetingRequest"
 import { ProviderChangeNotice, type EmbeddingDegradedNotice } from "./components/ProviderChangeNotice"
 import { clampOverlayOpacity, OVERLAY_OPACITY_DEFAULT, getDefaultOverlayOpacity } from "./lib/overlayAppearance"
-import { getMeetingInterfaceTheme, type MeetingInterfaceTheme } from './lib/meetingInterfaceTheme'
-import { permissionsNeedAttention } from './lib/permissionAttentionPolicy.mjs'
+import { getMeetingInterfaceTheme, resolveMeetingInterfaceTheme, type MeetingInterfaceTheme } from './lib/meetingInterfaceTheme'
+import { requiredPermissionsGranted, startupPermissionsAttention } from './lib/permissionsCardPolicy.mjs'
 import { collectRendererLegacy } from './lib/cards/rendererLegacy.mjs'
 import { resetRendererTrialClaim } from './lib/trialCampaign.mjs'
 import { cardInputsFromSources } from './lib/cards/cardInputs.mjs'
@@ -300,6 +301,11 @@ const App: React.FC = () => {
   // motion, the launcher keeps its plain fade-up instead.
   const cameFromWelcome = useRef(false);
   if (showWelcome) cameFromWelcome.current = true;
+  // The first-run Welcome happened this launch: the permissions card may be
+  // followed by one more card (src/lib/onboarding/launchSession.mjs).
+  useEffect(() => {
+    if (showWelcome && (isLauncherWindow || isDefault)) setOrchestratorUserState({ welcomeThisLaunch: true });
+  }, [showWelcome, isLauncherWindow, isDefault]);
   const launcherLands = !cameFromWelcome.current && !reduceManagerMotion;
   const launcherLanded = useRef(false);
   const landLauncher = useCallback((el: HTMLDivElement | null) => {
@@ -469,6 +475,11 @@ const App: React.FC = () => {
   const [showTrialExpiredModal, setShowTrialExpiredModal] = useState(() =>
     import.meta.env.DEV && new URLSearchParams(window.location.search).has('forceTrialEnded')
   );
+  // The last live trial the launcher saw, kept past its end for the ended
+  // card's usage sentence, and what ended it.
+  const lastSeenTrialRef = useRef<typeof activeTrial>(null);
+  useEffect(() => { if (activeTrial) lastSeenTrialRef.current = activeTrial; }, [activeTrial]);
+  const [trialEndedReason, setTrialEndedReason] = useState<'clock' | 'allowance'>('clock');
   // The card is due (expired at launch) but still inside its 10 s delay: it
   // already owns the card slot, so no other card can open under it.
   const [trialEndedDue, setTrialEndedDue] = useState(false);
@@ -513,6 +524,13 @@ const App: React.FC = () => {
     [orch],
   );
   const orchState = useSyncExternalStore(orchSubscribe, orchSnapshot);
+  // The update card is a full-window card too (2026-11-09): it opens only when
+  // nothing else holds the screen, and while open it holds the card
+  // scheduler's one slot, so no onboarding card opens over it.
+  const updateCardMayOpen = !showStartup && showWelcome === false && !isSettingsOpen && !isManagerOpen
+    && !showTrialExpiredModal && !trialEndedDue && !orchState?.activeToasterId;
+  const claimUpdateSlot = useCallback((force?: boolean) => (orch ? orch.claimExternalCard('update', { force }) : true), [orch]);
+  const releaseUpdateSlot = useCallback(() => { orch?.releaseExternalCard('update'); }, [orch]);
   // ── Card scheduler inputs (toaster policy) ──────────────────────────────
   // What decides which card is relevant (keys, plan, profile, JD, trial,
   // extension, quota) is read live and re-read whenever it can have changed;
@@ -848,6 +866,16 @@ const App: React.FC = () => {
     // Listen for trial-ended event (emitted by trial:end-byok IPC)
     const removeTrialListener = window.electronAPI?.onTrialEnded?.((data) => {
       setActiveTrial(null);
+      // The trial's AI allowance ran out before its clock (main:
+      // endTrialForUsedAllowance): the same end as at 30 minutes, card included,
+      // now rather than at the next poll.
+      if (data?.choice === 'allowance') {
+        setTrialEndedReason('allowance');
+        if (data.showEndedCard && ownsTrialClock) setShowTrialExpiredModal(true);
+        if (trialEndedTimer) { clearTimeout(trialEndedTimer); trialEndedTimer = null; }
+        if (trialPollId) { clearInterval(trialPollId); trialPollId = null; }
+        return;
+      }
       // The BYOK exit is announced while its card is still Cleaning up; that
       // card closes itself once the user leaves "All set". Every other ending
       // (a licence or key superseded the trial) takes the card away.
@@ -900,10 +928,20 @@ const App: React.FC = () => {
 
       const maybeCheck = window.electronAPI?.checkPermissions;
       if (maybeCheck) {
+        // How often the card was closed while a permission was still missing
+        // (permissionsCardPolicy.mjs): it waits 7 days after a close and stops
+        // coming back at launch after the third. Read alongside the check; an
+        // unreadable record counts as never closed.
+        const cardRecord = Promise.resolve(window.electronAPI?.permissionsCardGet?.()).catch(() => null);
         maybeCheck()
-          .then((p) => {
+          .then(async (p) => {
+            const record = await cardRecord;
+            // Everything granted: a permission that breaks later starts afresh.
+            if (requiredPermissionsGranted(p) && record && record.dismissals > 0) {
+              window.electronAPI?.permissionsCardRecord?.('granted')?.catch?.(() => {});
+            }
             setOrchestratorUserState({
-              permissionsNeedAttention: permissionsNeedAttention(p),
+              permissionsNeedAttention: startupPermissionsAttention(p, record, Date.now()),
               extensionSupported: true, // updated by phoneMirrorGetInfo below
             });
           })
@@ -1121,38 +1159,10 @@ const App: React.FC = () => {
   const handleStartMeeting = async (calendar?: { title: string; calendarEventId: string }) => {
     const linked = calendar && typeof calendar === 'object' && typeof calendar.calendarEventId === 'string' ? calendar : undefined;
     try {
-      // Self-heal a poisoned preference. Until the picker started filtering
-      // them, Natively's own system-audio tap aggregate could be enumerated as
-      // an input device (private CoreAudio aggregates are hidden from other
-      // processes, not from ours) and saved here. It is not a microphone and
-      // never exists at mic-start time, so every meeting failed with
-      // "Input device 'NativelySystemAudioTap' not found". Main falls back to
-      // the default either way; dropping the key stops the stale value from
-      // being shown as the user's choice in Settings forever.
-      let inputDeviceId = localStorage.getItem('preferredInputDeviceId');
-      if (isInternalCaptureDevice(inputDeviceId)) {
-        console.warn(`[App] Discarding saved input device "${inputDeviceId}" — it is one of Natively's own capture devices, not a microphone.`);
-        localStorage.removeItem('preferredInputDeviceId');
-        inputDeviceId = null;
-      }
-      let outputDeviceId = localStorage.getItem('preferredOutputDeviceId');
-      // SCK is a macOS-only backend (ScreenCaptureKit + CoreAudio Process Tap
-      // live in the Rust speaker module under #[cfg(target_os = "macos")]).
-      // F-003 hid the toggle UI on Windows, but the localStorage key can be
-      // present on a Windows machine via cross-OS sync or restored backup —
-      // routing "sck" as an outputDeviceId then hands the Windows speaker
-      // module an unknown WASAPI device id and silently breaks system audio.
-      // Defense-in-depth: also require isMac at the consumer.
-      const useExperimentalSck = isMac && localStorage.getItem('useExperimentalSckBackend') === 'true';
-
-      // Override output device ID to force SCK if experimental mode is enabled
-      // Default to CoreAudio unless experimental is enabled
-      if (useExperimentalSck) {
-        console.log("[App] Using ScreenCaptureKit backend (Experimental).");
-        outputDeviceId = "sck";
-      } else if (isMac) {
-        console.log("[App] Using CoreAudio backend (Default).");
-      }
+      // The saved microphone and speaker, as Resume asks for them too
+      // (lib/startMeetingRequest.ts: drops Natively's own tap aggregate saved
+      // as a microphone, and 'sck' only on macOS with the experimental switch).
+      const { inputDeviceId, outputDeviceId } = savedMeetingAudio();
 
       const meetingRetention = await window.electronAPI.getMeetingRetention?.().catch(() => 'forever');
       const result = await window.electronAPI.startMeeting({
@@ -1175,8 +1185,10 @@ const App: React.FC = () => {
         // the "I press Start Natively and nothing happens" report.
         if (result.code === 'mic-permission-denied') {
           // Route through the orchestrator: mark permissions as needing
-          // attention so the permissions stage becomes re-eligible.
-          setOrchestratorUserState({ permissionsNeedAttention: true });
+          // attention so the permissions stage becomes re-eligible. The user
+          // asked for a meeting, so neither a put-off card nor this launch's
+          // one-card limit holds it back.
+          setOrchestratorUserState({ permissionsNeedAttention: true, permissionsRecoveryRequested: true });
         }
       }
     } catch (err) {
@@ -1187,7 +1199,7 @@ const App: React.FC = () => {
       // serialized error .code across ipcRenderer.invoke — keep the recovery
       // working so the denial never regresses to a silent failure.
       if ((err as { code?: string })?.code === 'mic-permission-denied') {
-        setOrchestratorUserState({ permissionsNeedAttention: true });
+        setOrchestratorUserState({ permissionsNeedAttention: true, permissionsRecoveryRequested: true });
       }
     }
   };
@@ -1234,7 +1246,9 @@ const App: React.FC = () => {
     setIsProcessingMeeting(true);
   };
 
-  const interfaceThemeAttribute = meetingInterfaceTheme === 'default' ? undefined : meetingInterfaceTheme;
+  // What the overlay paints for the pick: Default is Lavender.
+  const paintedInterfaceTheme = resolveMeetingInterfaceTheme(meetingInterfaceTheme, isLight ? 'light' : 'dark');
+  const interfaceThemeAttribute = paintedInterfaceTheme === 'default' ? undefined : paintedInterfaceTheme;
 
   // Render Logic
   if (isCropperWindow) {
@@ -1317,7 +1331,7 @@ const App: React.FC = () => {
                   <NativelyInterface
                     onMeetingEnded={handleMeetingEnded}
                     overlayOpacity={overlayOpacity}
-                    interfaceTheme={meetingInterfaceTheme}
+                    interfaceTheme={paintedInterfaceTheme}
                   />
                 </React.Suspense>
               </div>
@@ -1539,7 +1553,7 @@ const App: React.FC = () => {
       />
 
       <div data-opacity-preview-surface="">
-        {!isolateGlobalSurfaces && <UpdateBanner />}
+        {!isolateGlobalSurfaces && <UpdateBanner canOpen={updateCardMayOpen} claimSlot={claimUpdateSlot} releaseSlot={releaseUpdateSlot} />}
         {!isolateGlobalSurfaces && <NativelyQuotaBanner />}
         {/* A call was detected: Start / Not now, and the countdown when Start automatically is on. */}
         {!isolateGlobalSurfaces && (isLauncherWindow || isDefault) && <MeetingOfferToast />}
@@ -1558,7 +1572,9 @@ const App: React.FC = () => {
         {/* Post-trial upgrade modal — shown when trial expires */}
         {!isolateModals && (isLauncherWindow || isDefault) && showTrialExpiredModal && (
           <FreeTrialModal
-            usage={activeTrial?.usage ?? { ai: 0, ai_tokens: 0, stt_seconds: 0, search: 0 }}
+            // activeTrial is already cleared when the card opens: the last
+            // figures seen, never zeros (src/lib/trial/endedTrialUsage.mjs).
+            usage={activeTrial?.usage ?? usageForEndedCard(lastSeenTrialRef.current, trialEndedReason)}
             onByok={async (opts) => {
               // A wipe that did not finish must not read as "All set": the card
               // shows the error with Try again (toaster policy §5 row 5). After

@@ -21,12 +21,18 @@ import path from "path"
 import fs from "fs"
 import os from "os"
 import { windowsMicBlocker, windowsMicPage } from '../src/lib/micPermissionPolicy.mjs'
-import { SystemAudioHealthClassifier } from "./audio/systemAudioHealthClassifier.mjs"
+import { SystemAudioHealthClassifier, peakToPeakInt16LE } from "./audio/systemAudioHealthClassifier.mjs"
+import { classifySttError } from "./audio/sttErrorClassifier.mjs"
+import { SttReconnectNotice } from "./audio/sttReconnectNotice.mjs"
+import { CaptureRecoveryLatch } from "./audio/captureRecoveryLatch.mjs"
 import { OutputRouteMismatchDetector } from "./audio/outputRouteMismatch.mjs"
 import { FatalMainProcessCoordinator } from "./utils/fatalMainProcess"
 import { installResilientDnsLookup } from "./utils/resilientDnsLookup"
+import { trustSystemCertificates } from "./utils/systemCertificates"
 import { resolveDebugLogPath } from "./utils/debugLogPath.mjs"
+import { startupLogAction, startupLogMarker, type StartupLogLock } from "./utils/startupLogPolicy"
 import { MeetingLifecycleQueue, type MeetingLifecycleState } from "./audio/meetingLifecycleQueue"
+import { describeMicRate } from "./audio/micRateDiagnostics"
 import { systemAudioGrant, systemAudioRecordingBlocked, zeroFillMeansScreenRecordingLost, zeroFillMeansSystemAudioRecordingDenied } from "./audio/systemAudioPermission"
 import { defaultInputDecision } from "./audio/defaultInputFollow"
 import { autoUpdater } from "electron-updater"
@@ -48,6 +54,12 @@ import {
 // bounded FALLBACK behind a cached system lookup. See
 // electron/utils/resilientDnsLookup.ts for the contract and its tests.
 installResilientDnsLookup();
+
+// Antivirus HTTPS scanning and corporate TLS inspection re-sign connections
+// with a root that lives only in the OS store, which Node never read: every
+// transcription socket and LLM call failed until the user turned their
+// antivirus off. See electron/utils/systemCertificates.ts.
+trustSystemCertificates();
 
 if (!app.isPackaged) {
   require('dotenv').config();
@@ -695,15 +707,22 @@ function shouldTruncatePriorLog(): boolean {
 }
 
 let _didStartupLogReset = false;
+// Set right after requestSingleInstanceLock(), before the lock is logged: a
+// second launch must not wipe the running app's log (startupLogPolicy.ts).
+let _startupLogLock: StartupLogLock = 'unknown';
 function resetStartupLog(): void {
   if (_didStartupLogReset) return;
+  // Not known yet whether this process is the app or a second launch about to
+  // exit: append, and decide on the first write after the lock is asked for.
+  if (_startupLogLock === 'unknown') return;
   _didStartupLogReset = true;
   const logFile = getLogFile();
   if (!logFile) return;
   try { fs.mkdirSync(path.dirname(logFile), { recursive: true }); } catch { /* best-effort */ }
-  const truncate = shouldTruncatePriorLog();
+  const action = startupLogAction(_startupLogLock, shouldTruncatePriorLog);
+  const truncate = action === 'truncate';
   try {
-    if (fs.existsSync(logFile)) {
+    if (action !== 'append' && fs.existsSync(logFile)) {
       if (truncate) {
         // Clean prior session: blow away the previous log so the user only
         // sees current-session breadcrumbs. Old contents are GONE.
@@ -737,10 +756,13 @@ function resetStartupLog(): void {
   // Always write a marker line so the user (and we) can confirm what
   // happened to the prior log.
   try {
-    fs.appendFileSync(
-      logFile,
-      `${new Date().toISOString()} [STARTUP] log opened (prior=${truncate ? 'truncated' : 'rotated-to-prev'}) pid=${process.pid} version=${app.getVersion?.() ?? 'unknown'} platform=${process.platform} arch=${process.arch}\n`,
-    );
+    fs.appendFileSync(logFile, startupLogMarker(action, {
+      isoTime: new Date().toISOString(),
+      pid: process.pid,
+      version: app.getVersion?.() ?? 'unknown',
+      platform: process.platform,
+      arch: process.arch,
+    }));
   } catch { /* best-effort */ }
 }
 
@@ -1157,6 +1179,13 @@ function formatPermissionMessage(reason: PermissionReason, extra?: { device?: st
  * `formatPermissionMessage`'s switch. Keep the two in lockstep: no title may
  * be a restatement of the first sentence of its body.
  */
+// Banner text for a capture that gave up (2026-11-09). It used to end in
+// "Last error: <raw exception>", English engine text in a live-call banner; the
+// raw error is logged where it happens instead. Worded like the wake-restart
+// messages, which already say what to do.
+const SYSTEM_AUDIO_GAVE_UP_MESSAGE = 'System audio capture stopped and could not restart. End and restart the meeting to recover.';
+const MIC_GAVE_UP_MESSAGE = 'Microphone capture stopped and could not restart. Close other apps using the mic, then restart the meeting.';
+
 function permissionTitleKey(reason: PermissionReason): string {
   const isMac = process.platform === 'darwin';
   switch (reason) {
@@ -1273,7 +1302,7 @@ console.error = (...args: any[]) => {
   } catch { }
 };
 
-import { initializeIpcHandlers } from "./ipcHandlers"
+import { initializeIpcHandlers, triggerLicenceRecheck } from "./ipcHandlers"
 import { WindowHelper } from "./WindowHelper"
 import { SettingsWindowHelper } from "./SettingsWindowHelper"
 import { ModelSelectorWindowHelper } from "./ModelSelectorWindowHelper"
@@ -1301,7 +1330,7 @@ import { AutoAnswerUsageTelemetry } from "./intelligence/autoAnswer/AutoAnswerUs
 import { currentWhisperGlossaryPrompt, nameTerms, setSttContextTerms, setSttDictionaryTerms } from "./audio/sttContextTerms"
 import { getUserDictionary } from "./audio/userDictionary"
 import { LOCAL_STT_PROVIDERS, SttGapRecoveryCoordinator, type RecoveredSegment, type SttSource } from "./audio/sttGapRecovery"
-import { SttFailover, failoverNotice, type FailoverStatus } from "./audio/sttFailover"
+import { SttFailover, failoverNotice, type FailoverCause, type FailoverStatus } from "./audio/sttFailover"
 import { resolveAutoAnswerThresholds } from "./context-intelligence/policies/mode-policy-registry"
 import type { SpeechEdge } from "./audio/speechEdge"
 import { SonioxStreamingSTT } from "./audio/SonioxStreamingSTT"
@@ -1345,6 +1374,12 @@ interface SttStatusPayload {
   reconnectAttempts?: number;
   /** A stand-in carries the channel while `provider` is down (audio/sttFailover.ts). */
   fallback?: { provider: string; notice: string };
+  /**
+   * A local model is slower than speech (LocalWhisperSTT 'local_stt_behind'):
+   * text still comes, later and later. Not a state change; the overlay shows
+   * its own "choose a lighter model" notice once per meeting.
+   */
+  behind?: true;
 }
 
 export interface LocalWhisperRecoveryNotice {
@@ -1410,6 +1445,7 @@ if (!KnowledgeOrchestratorClass) {
 
 import { CredentialsManager } from "./services/CredentialsManager"
 import { SettingsManager } from "./services/SettingsManager"
+import { parseScreenshotDisplayPreference, resolveScreenshotDisplay } from "./screenshotDisplay"
 import { buildTelemetrySinks } from "./services/telemetry/telemetrySinks"
 import { PhoneMirrorService, shouldStartPhoneMirrorOnBoot } from "./services/PhoneMirrorService"
 import { PHONE_IMAGE_PREFIX } from "./utils/phoneImage"
@@ -1421,8 +1457,9 @@ import {
   OVERLAY_PASTE_IMAGE_PREFIX,
 } from "./utils/overlayImageAttach"
 import { renderPhoneAnswer } from "./services/phoneMirrorMarkdown"
+import { wireLiveAnswersToPhone } from "./services/phoneMirrorLiveAnswers"
 import { describeFormulaImage, describePageCaptureFallback, describeDoubleCaptureFailure, describeUnreadableFormulas, PAGE_CAPTURE_FALLBACK_CHANNEL, PAGE_CAPTURE_STARTED_CHANNEL } from "./services/pageCaptureFallback"
-import { FormulaScreenshotHandoff, markMissingFormulas, type FormulaShot } from "./services/formulaScreenshotHandoff"
+import { AUTO_FORMULA_IMAGE_MAX_AGE_MS, FormulaScreenshotHandoff, markMissingFormulas, type FormulaShot } from "./services/formulaScreenshotHandoff"
 import { setVerboseLoggingFlag } from "./verboseLog"
 import { ReleaseNotesManager } from "./update/ReleaseNotesManager"
 import { OllamaManager } from './services/OllamaManager'
@@ -1450,9 +1487,11 @@ import { nativePromptsBlocked } from './services/stealthPromptGate'
 import { createForeignWindowCaptureGuard, wrapAsyncDialogs, type ForeignWindowCaptureGuard } from './services/foreignWindowCaptureGuard'
 import { acceptsLocalSpeechEndHint } from './intelligence/autoAnswer/SimpleAutoAnswer'
 import { NativeOomTrace } from './utils/NativeOomTrace'
-import { setStealthHookAvailabilityProvider } from './utils/windowsFocusPolicy'
+import { setStealthHookAvailabilityProvider, setNoActivateClickDelivery } from './utils/windowsFocusPolicy'
 import { hasLiveRenderer } from './utils/rendererLiveness'
-import { DEFAULT_MEETING_SURFACE, planMeetingStart } from './utils/meetingSurface'
+import { DEFAULT_MEETING_SURFACE, planMeetingStart, planMeetingResume, planNotesClosed, type MeetingSurface } from './utils/meetingSurface'
+import { resumeMetadata, resumedChatFrom, type ResumeBase } from './services/meeting/meetingResume'
+import { isDefaultMeetingTitle } from './MeetingPersistence'
 import {
   shouldPromoteToRegularAtStartup,
   planDisguiseTitleWrites,
@@ -1465,9 +1504,11 @@ import { disguiseIconRelativePath, shouldSetMacDockIcon } from './utils/disguise
 import { createPageTitleGuard } from './utils/windowTitleGuard'
 import { createStealthProtectionLoop } from './utils/stealthProtection'
 import { resolveTrayIcon } from './utils/trayIcon'
-import { appUserModelIdForDisguise } from './utils/windowsTaskbarPolicy'
+import { appUserModelIdForDisguise, setOpenAtLogin } from './utils/windowsTaskbarPolicy'
+import { decideOpenAtLoginDefault } from './utils/openAtLoginDefault'
 import { shouldOpenExternally } from './utils/windowOpenPolicy'
 import { ensureNativeModuleAbi } from './utils/nativeModuleGuard'
+import { getPackMeetingClock } from './services/packs/packClockWiring'
 
 // Opt-in only: this trace writes allowlisted process metadata and IPC byte estimates
 // for a copied-profile native OOM investigation. It is inert unless explicitly enabled.
@@ -1813,6 +1854,16 @@ export class AppState {
         return false;
       }
     });
+    setNoActivateClickDelivery((win) => {
+      if (process.platform !== 'win32') return;
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { loadNativeModule } = require('./audio/nativeModuleLoader');
+      const native = loadNativeModule();
+      if (typeof native?.deliverClicksWithoutActivation !== 'function') return;
+      if (!native.deliverClicksWithoutActivation((win as BrowserWindow).getNativeWindowHandle())) {
+        console.warn('[AppState] could not subclass a no-activate window; its clicks may be eaten when no Natively window is active');
+      }
+    });
 
     // 2. Initialize Helpers with loaded state
     this.windowHelper = new WindowHelper(this)
@@ -1837,6 +1888,19 @@ export class AppState {
     // The overlay's Notes button shows whether the window is open.
     this.notesWindowHelper.onVisibilityChange((visible) => {
       this.sendToWindow(this.windowHelper.getOverlayWindow(), 'notes-window-visibility', visible);
+      // The notepad's demand (FunnelTelemetry.notepadUsed): it came up.
+      if (visible) { try { require('./services/FunnelTelemetry').funnelTelemetry.notepadUsed('opened'); } catch { /* analytics only */ } }
+    });
+    // Closing the notepad never leaves the screen empty (utils/meetingSurface.ts):
+    // after a Stop it brings up the launcher Stop held back (endMeeting); during
+    // a notepad meeting it goes home, as the overlay's logo does, and the
+    // launcher's "Meeting ongoing" brings the notepad back (resumeMeetingSurface).
+    this.notesWindowHelper.onClosedByUser(() => {
+      try { require('./services/FunnelTelemetry').funnelTelemetry.notepadUsed('closed'); } catch { /* analytics only */ }
+      const inactive = this.isUndetectable ? true : undefined;
+      const action = planNotesClosed(this.isMeetingActive, this.windowHelper.isOverlayHeldHidden());
+      if (action === 'owed-launcher') this.windowHelper.showOwedLauncher(inactive);
+      else if (action === 'launcher') this.windowHelper.setWindowMode('launcher', inactive);
     });
 
     if (process.platform === 'win32' || process.platform === 'darwin') {
@@ -2374,8 +2438,6 @@ export class AppState {
       setLive: (text) => this.intelligenceManager.setLiveUserNotes(text),
       saveEnded: (meetingId, text) => { DatabaseManager.getInstance().setMeetingUserNotes(meetingId, text); },
       broadcast: (state) => this.sendToWindow(this.notesWindowHelper.getWindow(), 'live-notes-state', state),
-      // The notepad's folder button (services/organise), as "Move to folder" on the meeting page.
-      fileInFolder: (meetingId, folderId, inFolder) => this.fileMeetingInFolder(meetingId, folderId, inFolder),
     })
 
     // Initialize ThemeManager
@@ -2567,17 +2629,6 @@ export class AppState {
     this.nativeOomTraceTimer = null;
   }
 
-  // The notepad's folder button (LiveNotesSession.fileInFolder). Every list of
-  // meetings refreshes, as "Move to folder" on the meeting page does.
-  private fileMeetingInFolder(meetingId: string, folderId: string, inFolder: boolean): boolean {
-    const { organiseStore } = require('./services/organise/organiseService');
-    const store = organiseStore();
-    if (!store) return false;
-    const ok = inFolder ? store.addMeetingToFolder(meetingId, folderId, 'user') : store.removeMeetingFromFolder(meetingId, folderId);
-    if (ok) for (const w of BrowserWindow.getAllWindows()) if (!w.isDestroyed()) w.webContents.send('meetings-updated');
-    return ok;
-  }
-
   private sendToWindow(win: BrowserWindow | null | undefined, channel: string, ...args: any[]): boolean {
     if (!win || win.isDestroyed()) return false;
     try {
@@ -2691,7 +2742,24 @@ export class AppState {
   // banner symmetrically with sendSystemAudioPermissionDenied. Other in-class
   // call sites are unaffected.
   public sendAudioCaptureFailed(payload: any): void {
+    // A warning that says the channel is not heard is cleared again once it
+    // carries real audio (noteCaptureAudio, audio/captureRecoveryLatch.mjs).
+    this._captureRecovery.noteWarning(payload);
     this.sendToMeetingSurfaces('audio-capture-failed', payload);
+  }
+
+  // Recovery for the overlay's audio banner (2026-11-09). A "stuck" or
+  // "terminal" capture warning used to stay up until its ✕, also after the
+  // channel came back by itself (a re-plugged mic, a grant given mid-meeting,
+  // a capture rebuilt by a route change). The data paths report each chunk of
+  // an armed channel here; once it has carried real signal for a few seconds
+  // the surfaces are told, on the same channel, with `recovered: true`.
+  private readonly _captureRecovery = new CaptureRecoveryLatch();
+  private noteCaptureAudio(channel: 'mic' | 'system', nowMs: number, hasSignal: boolean): void {
+    if (!this.isMeetingActive) return;
+    if (!this._captureRecovery.noteAudio(channel, nowMs, hasSignal)) return;
+    console.log(`[Main] ${channel} capture is carrying audio again — clearing its warning.`);
+    this.sendToMeetingSurfaces('audio-capture-failed', { channel, recovered: true, message: '', attempt: 0, maxAttempts: 0 });
   }
 
   // `titleKey` is the i18n key for the banner heading (see permissionTitleKey).
@@ -2740,6 +2808,11 @@ export class AppState {
 
   public getIsMeetingActive(): boolean {
     return this.isMeetingActive;
+  }
+
+  /** A meeting start is queued or under way (MeetingLifecycleQueue.hasPendingStart). */
+  public hasPendingMeetingStart(): boolean {
+    return this._meetingLifecycle.hasPendingStart();
   }
 
   /** The microphone the last meeting asked for (dictation opens the same one), or undefined for the default. */
@@ -2810,6 +2883,32 @@ export class AppState {
       }
     }, 90_000);
     (timer as any).unref?.();
+  }
+
+  /**
+   * The Pro pack meeting clock. When a pack ends and the server confirms Pro
+   * went with it, the same premium-only context a deactivated licence loses is
+   * cleared here (the license-status-changed broadcast is the wiring's).
+   */
+  private packMeetingClock() {
+    return getPackMeetingClock(() => {
+      try { this.getKnowledgeOrchestrator()?.setKnowledgeMode(false); } catch { /* not running */ }
+      try {
+        const { ModesManager } = require('./services/ModesManager');
+        ModesManager.getInstance().setActiveMode(null);
+        this.broadcast('modes-active-cleared');
+      } catch { /* no modes */ }
+    });
+  }
+
+  /** powerMonitor 'suspend' (macOS and Windows): sleep is not meeting time. */
+  public packClockSuspend(): void {
+    try { this.packMeetingClock().suspend(); } catch { /* billing only */ }
+  }
+
+  /** powerMonitor 'resume' (macOS and Windows). */
+  public packClockResume(): void {
+    try { this.packMeetingClock().resume(); } catch { /* billing only */ }
   }
 
   private broadcastMeetingState(): void {
@@ -2941,6 +3040,12 @@ export class AppState {
         const { ModesManager } = require('./services/ModesManager');
         const modeEmbeddingPipeline = this.ragManager.getEmbeddingPipeline();
         ModesManager.getInstance().setSharedEmbeddingPipeline(modeEmbeddingPipeline);
+        // Background re-indexing tells the Modes Manager badges, as uploads do.
+        ModesManager.getInstance().setReferenceIndexStatusListener((event: { modeId: string; fileId: string; phase: 'indexing' | 'done' }) => {
+          BrowserWindow.getAllWindows().forEach((win) => {
+            if (!win.isDestroyed()) win.webContents.send('mode-file-index-status', event);
+          });
+        });
         this.scheduleModeReferenceIndexRetry();
 
         // Context Intelligence V3: hand the engine LAZY access to the meeting
@@ -3195,7 +3300,21 @@ export class AppState {
         // NOTE: groqFastTextMode is now restored unconditionally in the AppState constructor
         // so it is not repeated here.
         const sm = SettingsManager.getInstance();
-        if (sm.get('knowledgeMode')) {
+        // Profile Intelligence is Pro or trial (services/proAccess.ts). A licence
+        // or trial that ended while the app was closed leaves knowledgeMode true
+        // on disk; restoring it would keep the résumé and JD in answers. The
+        // setting is kept, so a renewed licence turns it back on next launch.
+        let profileAllowed = false;
+        try {
+          const { isProOrTrialActive } = require('./services/proAccess') as typeof import('./services/proAccess');
+          profileAllowed = isProOrTrialActive();
+        } catch {
+          profileAllowed = false;
+        }
+        if (sm.get('knowledgeMode') && !profileAllowed) {
+          console.log('[AppState] Knowledge mode not restored: no Pro licence or active trial');
+        }
+        if (sm.get('knowledgeMode') && profileAllowed) {
           this.knowledgeOrchestrator.setKnowledgeMode(true);
           console.log('[AppState] Knowledge mode restored from settings');
           // Pre-warm the provider prompt cache off the hot path so the first
@@ -3885,7 +4004,26 @@ export class AppState {
     return this.currentUserName();
   }
 
+  /** The surface the running meeting started on (startMeeting). */
+  private meetingSurface: MeetingSurface = DEFAULT_MEETING_SURFACE;
+
+  /**
+   * The launcher's "Meeting ongoing" (set-window-mode 'overlay' mid-meeting):
+   * back to the meeting's own surface, the notepad for a notepad meeting
+   * (utils/meetingSurface.planMeetingResume), the overlay otherwise.
+   */
+  public resumeMeetingSurface(inactive?: boolean): void {
+    const plan = planMeetingResume(this.meetingSurface);
+    this.windowHelper.setWindowMode('overlay', inactive, { hidden: plan.overlayHidden });
+    if (plan.openNotes) this.notesWindowHelper.open({ activate: false });
+  }
+
   /** The user's name: the active résumé's, else the connected Calendar account's. */
+  /** The user's name for recipes that sign as them (notepad recipes, 2026-10-31). */
+  public getUserName(): string | null {
+    return this.currentUserName();
+  }
+
   private currentUserName(): string | null {
     try {
       const orchestrator = this.knowledgeOrchestrator ?? this.processingHelper?.getLLMHelper?.()?.getKnowledgeOrchestrator?.();
@@ -4322,6 +4460,9 @@ export class AppState {
     // carries the live stream, until this one is back.
     this._sttFailover[gapSource]?.stop();
     const rawStop = stt.stop.bind(stt);
+    // Why the primary last handed over, for the notice: set just before
+    // engage(), which reports the stand-in synchronously.
+    let failoverCause: FailoverCause = 'other';
     const failover = new SttFailover({
       source: gapSource,
       primary: effectiveSttId,
@@ -4335,6 +4476,9 @@ export class AppState {
       // A provider that reports no confidence counts as sure, as the providers' own do.
       onTranscript: (seg, id) => onSegment({ ...seg, confidence: typeof seg.confidence === 'number' ? seg.confidence : 1 }, id),
       onStatus: (st: FailoverStatus) => {
+        // A stand-in, a recovery or the end of the line: whichever, a
+        // "reconnecting" still waiting to be shown is out of date.
+        reconnectNotice.settle();
         if (st.phase === 'fallback' && st.fallback) {
           _lastState = 'connected';
           _consecutiveErrors = 0;
@@ -4342,7 +4486,7 @@ export class AppState {
             state: 'connected',
             provider: sttProvider,
             channel: speaker,
-            fallback: { provider: st.fallback, notice: failoverNotice(effectiveSttId, st.fallback) },
+            fallback: { provider: st.fallback, notice: failoverNotice(effectiveSttId, st.fallback, failoverCause) },
           });
         } else if (st.reason === 'exhausted') {
           _lastState = 'failed';
@@ -4368,6 +4512,10 @@ export class AppState {
     // ends its stand-in too.
     (stt as any).stop = () => {
       failover.stop();
+      // The provider object outlives the meeting (the next one reuses it): a
+      // "reconnecting" shown or waiting, and the once-only "behind", end here.
+      reconnectNotice.settle();
+      _behindReported = false;
       return rawStop();
     };
     stt.on('transcript', (segment: { text: string, isFinal: boolean, confidence: number, speakerId?: string, voiceEpoch?: number }) => {
@@ -4387,57 +4535,62 @@ export class AppState {
     // implied a recovery state from the get-go.
     let _lastState: 'connected' | 'reconnecting' | 'failed' | 'awaiting-audio' | 'preparing' = 'awaiting-audio';
 
-    stt.on('error', (err: Error) => {
-      // Google streamingRecognize's 10s silence timeout closes the stream
-      // with gRPC code 11 ("Audio Timeout Error"). GoogleSTT already
-      // swallows this case before it reaches us, but other providers may
-      // surface a similar idle-timeout that the lazy-reconnect path
-      // recovers from cleanly. Downgrade to a one-liner here as well so
-      // a stray bubble-up doesn't cascade into stack-trace noise.
-      const grpcCode = (err as any)?.code;
-      if (grpcCode === 11 || /Audio Timeout Error/i.test(err.message || '')) {
+    // "Transcription Reconnecting" only for an outage that lasts
+    // (audio/sttReconnectNotice.mjs, 2026-11-09): sent on the first retryable
+    // error, it flashed over a live call for every socket that dropped and was
+    // back a second later. It now waits 5 s, or for the provider to say the
+    // outage is sustained; a reconnect, a final, a stand-in, a failure or a
+    // teardown cancels the wait. `_lastState` turns 'reconnecting' only when
+    // the notice is actually sent.
+    const reconnectNotice = new SttReconnectNotice({
+      // A wait that started in one meeting never shows in the next.
+      epoch: () => this._meetingGeneration,
+      show: (payload: SttStatusPayload) => {
+        // Not for a channel a stand-in carries, nor for a provider that was
+        // torn down or replaced while the notice waited (meeting end,
+        // reconfigure): its outage is over with it.
+        const current: unknown = speaker === 'interviewer' ? this.googleSTT : this.googleSTT_User;
+        if (failover.active || !this.isMeetingActive || current !== stt) return false;
+        _lastState = 'reconnecting';
+        this.sendSttStatus(payload);
+      },
+    });
+    // A local model slower than speech is said once per meeting: stop() (every
+    // meeting end) resets it.
+    let _behindReported = false;
+
+    stt.on('error', (raw: unknown) => {
+      // Every check below reads err.message; a provider that emits a bare
+      // string or object (ElevenLabs did, for quota/auth) made this handler
+      // throw before any status reached the overlay.
+      const err: Error = raw instanceof Error
+        ? raw
+        : Object.assign(new Error(typeof raw === 'string' ? raw : ((raw as any)?.message || (raw as any)?.error || JSON.stringify(raw) || 'Unknown STT error')), { code: (raw as any)?.code });
+      // Read by sttErrorClassifier.mjs (pure, tested): auth/account verdicts
+      // and providers that have stopped (`terminal`) end as "failed" at once;
+      // quota may hand over to a stand-in; the rest reconnect.
+      const verdict = classifySttError(err);
+      if (verdict.kind === 'idle') {
+        // A provider's no-audio limit (Google's gRPC 11 silence timeout): the
+        // lazy-reconnect path recovers on the next chunk. One line, no trace.
         console.warn(`[Main] STT (${speaker}) idle-timed-out (provider's no-audio limit), reconnecting on next chunk.`);
         return;
       }
 
       console.error(`[Main] STT (${speaker}) Error:`, err);
 
-      // Extract richer error info from Axios errors (RestSTT)
-      let errorMessage = err.message;
-      const axiosErr = err as any;
-      const httpStatus = axiosErr?.response?.status || 0;
-      if (axiosErr?.response?.data?.error) {
-        const respErr = axiosErr.response.data.error;
-        const respMsg = typeof respErr === 'string' ? respErr : (respErr.message || respErr.code || JSON.stringify(respErr));
-        errorMessage = httpStatus ? `${httpStatus} ${respMsg}` : respMsg;
-      } else if (httpStatus) {
-        errorMessage = `${httpStatus} ${axiosErr.response.statusText}`;
-      }
-
-      // Immediately fatal: auth/account problems — no amount of retrying helps
-      const isAuthError = httpStatus === 401
-        || err.message.toLowerCase().includes('auth_timeout')
-        || err.message.toLowerCase().includes('invalid_key')
-        || err.message.toLowerCase().includes('invalid api')
-        || err.message.toLowerCase().includes('authentication')
-        // Google STT with no usable Service Account JSON. GoogleSTT has already
-        // disabled the channel and opens no stream until a new key is set
-        // (GoogleSTT.CREDENTIALS_UNAVAILABLE_CODE), so it is terminal by code,
-        // not by whatever words the message happens to contain.
-        || (err as any)?.code === 'google_stt_credentials_unavailable';
-
-      const isQuotaError = err.message.toLowerCase().includes('transcription_quota_exceeded')
-        || err.message.toLowerCase().includes('quota');
-
+      const errorMessage = verdict.errorMessage;
+      const isQuotaError = verdict.kind === 'quota';
+      const isAuthError = verdict.kind === 'auth';
       // A local STT worker that could not start (no ONNX slot within 20s, or
       // the model never reported ready) is terminal for this meeting: nothing
       // restarts a LocalWhisperSTT instance, so "reconnecting" would be a lie
-      // the user stares at until they end the call. Surface the actionable
-      // message as a failure instead (LocalWhisperSTT.LOCAL_STT_UNAVAILABLE_CODE).
-      const isLocalSttUnavailable = (err as any)?.code === 'local_stt_unavailable';
+      // the user stares at until they end the call (LOCAL_STT_UNAVAILABLE_CODE).
+      const isLocalSttUnavailable = verdict.kind === 'local_unavailable';
 
       if (isAuthError || isLocalSttUnavailable) {
         _consecutiveErrors = 0;
+        reconnectNotice.settle();
         _lastState = 'failed';
         this.sendSttStatus( {
           state: 'failed',
@@ -4448,22 +4601,38 @@ export class AppState {
         return;
       }
 
+      // A local model that is merely behind (LocalWhisperSTT
+      // LOCAL_STT_BEHIND_CODE, at most every 30 s) is not an outage: its text
+      // still comes, only late. Counted as one, it raised "Transcription
+      // Reconnecting" every 30 s, the next final cleared it, and five of them
+      // ended in "Transcription Stopped" over a transcript that was still
+      // arriving. Its own notice instead, once: choose a lighter model. No
+      // gap recovery either: that would run a second local model over the same
+      // audio on an already overloaded CPU.
+      if ((err as any)?.code === 'local_stt_behind') {
+        if (!_behindReported) {
+          _behindReported = true;
+          this.sendSttStatus({ state: _lastState, provider: sttProvider, channel: speaker, behind: true } as SttStatusPayload);
+        }
+        return;
+      }
+
       // A stand-in carries this channel (sttFailover.ts): the provider keeps
-      // retrying quietly, and there is no outage to recover.
+      // retrying quietly, and there is no outage to recover. (A pending
+      // "reconnecting" is declined by its show(), and engaging settled it.)
       if (failover.active) return;
 
       // Retryable: network drop, timeout, 5xx, 400, 429, WS drop. The audio
       // from here until text comes back is kept for recovery (sttGapRecovery.ts).
-      // Not for a local model that is merely behind (LocalWhisperSTT
-      // LOCAL_STT_BEHIND_CODE): its text still comes, and recovery would run a
-      // second local model over the same audio on an already overloaded CPU.
-      if ((err as any)?.code !== 'local_stt_behind') this.sttGap.onProviderError(gapSource);
+      this.sttGap.onProviderError(gapSource);
       _consecutiveErrors++;
       const maxErrors = 5;
 
       if (_consecutiveErrors >= maxErrors || isQuotaError) {
         // Past the reconnect policy: another transcriber takes the live stream
         // when the user has one set up (it reports its own status).
+        reconnectNotice.settle();
+        failoverCause = isQuotaError ? 'quota' : 'other';
         if (failover.engage()) return;
         _lastState = 'failed';
         this.sendSttStatus( {
@@ -4476,8 +4645,7 @@ export class AppState {
           reconnectAttempts: _consecutiveErrors,
         } as SttStatusPayload);
       } else {
-        _lastState = 'reconnecting';
-        this.sendSttStatus( {
+        reconnectNotice.retrying( {
           state: 'reconnecting',
           provider: sttProvider,
           error: errorMessage,
@@ -4492,6 +4660,7 @@ export class AppState {
     stt.on('transcript', (segment: { text: string, isFinal: boolean, confidence: number }) => {
       if (segment.isFinal) {
         _consecutiveErrors = 0; // Success — reset counter
+        reconnectNotice.settle();
         if (_lastState !== 'connected') {
           _lastState = 'connected';
           this.sendSttStatus( {
@@ -4538,12 +4707,40 @@ export class AppState {
       });
     }
 
+    // A streaming provider's session is (re)open (2026-11-09): Deepgram,
+    // Soniox, OpenAI, ElevenLabs, Qwen and NVIDIA NIM emit 'connected' when it
+    // is ready for audio. Only a final transcript used to clear
+    // "Transcription Reconnecting", so after a reconnect it stayed up through
+    // any silence that followed. Back to the neutral awaiting-audio state, as
+    // NativelyPro's handshake does below. Only from 'reconnecting': a 'failed'
+    // channel waits for real text, or a provider that opens and then fails
+    // again would flap between "stopped" and nothing. The error count is NOT
+    // reset here (NativelyPro's server handshake is a stronger signal than a
+    // socket opening), so an open-then-fail loop still ends in 'failed'.
+    // Google STT (gRPC, reconnects lazily on the next chunk) and the REST and
+    // local providers have no session to open; they clear on the next final.
+    if (!(stt instanceof NativelyProSTT)) {
+      stt.on('connected', () => {
+        reconnectNotice.settle();
+        if (failover.active || _lastState !== 'reconnecting') return;
+        _lastState = 'awaiting-audio';
+        this.sendSttStatus({
+          state: 'awaiting-audio',
+          provider: sttProvider,
+          channel: speaker,
+        } as SttStatusPayload);
+      });
+    }
+
     // Auto language detection: NativelyProSTT emits 'languageDetected' when the
     // backend resolves the language from the first audio batch. Notify the renderer
     // so the settings UI can show what was detected.
     if (stt instanceof NativelyProSTT) {
       stt.on('connected', () => {
         _consecutiveErrors = 0;
+        reconnectNotice.settle();
+        // A stand-in leads: its own status (and backup notice) stays.
+        if (failover.active) return;
         if (_lastState !== 'connected') {
           _lastState = 'awaiting-audio';
           this.sendSttStatus({
@@ -4568,7 +4765,8 @@ export class AppState {
       // attempts count so the renderer's existing banner picks it up.
       stt.on('persistent-reconnect', (info: { attempts: number }) => {
         console.warn(`[Main] STT persistent reconnect (${speaker}): ${info.attempts} consecutive attempts.`);
-        this.sendSttStatus( {
+        // Sustained: shown now, without the 5 s wait (sttReconnectNotice.mjs).
+        reconnectNotice.persistent( {
           state: 'reconnecting',
           provider: sttProvider,
           error: `Reconnecting to transcription service — ${info.attempts} consecutive attempts. Check your network connection.`,
@@ -4665,6 +4863,8 @@ export class AppState {
                 maxAttempts: 3,
                 terminal: false,
                 stuck: true,
+                // A blocked permission: the overlay shows it even when hidden (quietly).
+                permission: true,
               });
             })
             .catch(() => { /* probe failed — keep log-only behavior */ });
@@ -4684,6 +4884,8 @@ export class AppState {
               maxAttempts: 3,
               terminal: false,
               stuck: true,
+              // A blocked permission: the overlay shows it even when hidden (quietly).
+              permission: true,
             });
           }
         }
@@ -4777,6 +4979,10 @@ export class AppState {
     capture.on('data', (chunk: Buffer) => {
       const now = Date.now();
       handleSystemAudioHealthDecision(systemAudioHealth.handle({ kind: 'chunk', nowMs: now, chunk }));
+      // The classifier just stamped this chunk if it carried real signal.
+      if (this.systemAudioCapture === capture && this._captureRecovery.isArmed('system')) {
+        this.noteCaptureAudio('system', now, systemAudioHealth.lastMeaningfulSignalAtMs === now);
+      }
       chunkCount++;
       if (chunkCount === 1 && stuckTimer) {
         clearTimeout(stuckTimer);
@@ -4968,6 +5174,12 @@ export class AppState {
         clearTimeout(stuckTimer);
         stuckTimer = null;
       }
+      // The raw chunk (before the meeting-mute and pause gates), measured only
+      // while a mic warning is up: the same peak-to-peak floor as the zero-fill
+      // detector below.
+      if (this.microphoneCapture === capture && this._captureRecovery.isArmed('mic')) {
+        this.noteCaptureAudio('mic', now, peakToPeakInt16LE(chunk) > 100);
+      }
       if (!this._micSttRateApplied && this.googleSTT_User && this.microphoneCapture === capture) {
         const rate = capture.getSampleRate();
         this.googleSTT_User.setSampleRate(rate);
@@ -4976,6 +5188,14 @@ export class AppState {
         this._sttFailover.mic?.setAudioChannelCount(1);
         this._micSttRateApplied = true;
         console.log(`${prefix}User STT rate locked from first mic chunk: ${rate}Hz`);
+        // The native module prints its device format to stdout only; this puts
+        // it in natively_debug.log (see micRateDiagnostics.ts for why).
+        const micFormat = describeMicRate({
+          emittedRate: rate,
+          nativeRate: capture.getNativeSampleRate(),
+          channels: capture.getChannelCount(),
+        });
+        (micFormat.unusual ? console.warn : console.log)(`${prefix}${micFormat.line}`);
       }
 
       // HFP-degradation backstop. The proactive reconfigureAudio check handles
@@ -5025,6 +5245,10 @@ export class AppState {
                 maxAttempts: 0,
                 terminal: false,
                 stuck: false,
+                // Advice the overlay shows once per meeting, lowest priority.
+                // Without the flag it was dropped with the transient recovery
+                // reports and never reached the user.
+                advisory: true,
               });
             }
           }
@@ -5061,6 +5285,8 @@ export class AppState {
             maxAttempts: 3,
             terminal: false,
             stuck: true,
+            // Most often a blocked mic permission: shown even on a hidden overlay.
+            permission: true,
           });
         }
       }
@@ -5234,6 +5460,8 @@ export class AppState {
             maxAttempts: 0,
             terminal: true,
             stuck: false,
+            // A provider fault: the channel carrying audio says nothing about it.
+            clearsOnRecovery: false,
           });
         }
       }
@@ -5254,6 +5482,8 @@ export class AppState {
             maxAttempts: 0,
             terminal: true,
             stuck: false,
+            // A provider fault: the channel carrying audio says nothing about it.
+            clearsOnRecovery: false,
           });
         }
       }
@@ -6318,9 +6548,12 @@ export class AppState {
           setTimeout(() => {
             if (!isRecoveryCurrentMeeting()) return;
             if (this.systemAudioCapture !== failedCapture || this._systemAudioRecoveryAttempts !== 4) return;
+            // The banner says what happened and what to do; the raw error is
+            // for the log (support reads it there), not for a live call.
+            console.error(`[AudioRecovery] System audio capture gave up after 3 attempts. Last error: ${err.message}`);
             this.sendAudioCaptureFailed({
               channel: 'system',
-              message: `System audio capture gave up after 3 attempts. Last error: ${err.message}`,
+              message: SYSTEM_AUDIO_GAVE_UP_MESSAGE,
               attempt: 3,
               maxAttempts: 3,
               terminal: true,
@@ -6419,9 +6652,10 @@ export class AppState {
         // for this meeting so it can stop showing "reconnecting" and surface a
         // mic-only banner instead.
         if (this._systemAudioRecoveryAttempts >= 3 && isRecoveryCurrentMeeting()) {
+          console.error(`[AudioRecovery] System audio capture gave up after 3 attempts. Last error: ${recoveryErr?.message || err.message}`);
           this.sendAudioCaptureFailed( {
             channel: 'system',
-            message: `System audio capture gave up after 3 attempts. Last error: ${recoveryErr?.message || err.message}`,
+            message: SYSTEM_AUDIO_GAVE_UP_MESSAGE,
             attempt: this._systemAudioRecoveryAttempts,
             maxAttempts: 3,
             terminal: true,
@@ -6620,6 +6854,8 @@ export class AppState {
       maxAttempts: 3,
       terminal: false,
       stuck: true,
+      // Other sound on the captured device is not the meeting coming back.
+      clearsOnRecovery: false,
     });
   }
 
@@ -7089,9 +7325,10 @@ export class AppState {
             // was being transcribed but no banner ever showed. Meeting-generation
             // check mirrors isRecoveryCurrentMeeting() in the system-side handler.
             if (this._micRecoveryAttempts >= 3 && isMicRecoveryCurrentMeeting()) {
+              console.error(`[MicRecovery] Microphone capture gave up after 3 attempts. Last error: ${recoveryErr?.message || err.message}`);
               this.sendAudioCaptureFailed({
                 channel: 'mic',
-                message: `Microphone capture gave up after 3 attempts. Last error: ${recoveryErr?.message || err.message}`,
+                message: MIC_GAVE_UP_MESSAGE,
                 attempt: this._micRecoveryAttempts,
                 maxAttempts: 3,
                 terminal: true,
@@ -7124,12 +7361,16 @@ export class AppState {
             systemCapturePausedByMicRecovery.start();
           } catch (restartErr) {
             console.error('[MicRecovery] Failed to restart system audio after mic recovery pause:', restartErr);
+            // Nothing retries it: the overlay hides non-terminal, non-stuck
+            // reports, so this one never reached the user while the
+            // interviewer went untranscribed. Terminal; the raw error is logged above.
             this.sendAudioCaptureFailed({
               channel: 'system',
-              message: `System audio failed to restart after microphone recovery: ${(restartErr as Error)?.message || 'unknown error'}`,
+              message: SYSTEM_AUDIO_GAVE_UP_MESSAGE,
               attempt: 0,
               maxAttempts: 0,
-              terminal: false,
+              terminal: true,
+              stuck: false,
             });
           }
         }
@@ -7442,7 +7683,8 @@ export class AppState {
       console.error(`[Main] ${context}: mic channel failed to start:`, err);
       this.sendAudioCaptureFailed({
         channel: 'mic',
-        message: `Microphone failed to start (${(err as Error)?.message || 'unknown error'}). The meeting continues with system audio only.`,
+        // The cause is in the log line above.
+        message: 'Microphone failed to start. The meeting continues with system audio only.',
         attempt: 0,
         maxAttempts: 0,
         terminal: true,
@@ -7457,7 +7699,8 @@ export class AppState {
       console.error(`[Main] ${context}: system channel failed to start:`, err);
       this.sendAudioCaptureFailed({
         channel: 'system',
-        message: `System audio failed to start (${(err as Error)?.message || 'unknown error'}). The meeting continues with microphone only.`,
+        // The cause is in the log line above.
+        message: 'System audio failed to start. The meeting continues with microphone only.',
         attempt: 0,
         maxAttempts: 0,
         terminal: true,
@@ -7525,6 +7768,20 @@ export class AppState {
         // teardown already logs; safe to swallow here
       }
       this._pendingTeardown = null;
+    }
+
+    // Resume (2026-11-02, services/meeting/meetingResume.ts): this meeting
+    // continues a saved one under its id. Read after the teardown above, so a
+    // meeting stopped a moment ago is already saved.
+    const resumeId = typeof metadata?.resumeMeetingId === 'string' && metadata.resumeMeetingId ? metadata.resumeMeetingId as string : null;
+    let resumeBase: ResumeBase | null = null;
+    if (resumeId) {
+      resumeBase = this.intelligenceManager.loadResumeBase(resumeId);
+      if (!resumeBase) {
+        const err = new Error('That meeting could not be found.') as Error & { code?: string };
+        err.code = 'resume-not-found';
+        throw err;
+      }
     }
 
     // PR #173: Reset audio recovery state for fresh session
@@ -7607,7 +7864,11 @@ export class AppState {
     // utils/meetingSurface.ts). A notepad meeting is in overlay mode with the
     // overlay hidden, and the notepad opens below once the page is this meeting's.
     let startPlan = planMeetingStart(DEFAULT_MEETING_SURFACE, false);
-    try { startPlan = planMeetingStart(SettingsManager.getInstance().get('meetingSurface'), this.notesWindowHelper.wasLeftOpen()); } catch { /* the overlay, as always */ }
+    // A resumed meeting opens what it was taken on, whatever the switcher says now.
+    try { startPlan = planMeetingStart(resumeBase ? resumeBase.surface : SettingsManager.getInstance().get('meetingSurface'), this.notesWindowHelper.wasLeftOpen()); } catch { /* the overlay, as always */ }
+    // Kept for the launcher's "Meeting ongoing" (resumeMeetingSurface): a
+    // switch in Settings mid-meeting does not move this meeting.
+    this.meetingSurface = startPlan.overlayHidden ? 'notepad' : 'overlay';
 
     // ─── WINDOW SWAP BEFORE STATE BROADCAST ───────────────────────────────
     // Switch to the overlay BEFORE flipping `isMeetingActive` to true. If we
@@ -7621,17 +7882,22 @@ export class AppState {
     const meetingGeneration = ++this._meetingGeneration;
     this.isMeetingActive = true;
     this.autoAnswerUsage.meetingStarted();
+    // A Pro pack is sold as meeting hours: report this meeting's time, whatever
+    // transcribes it (services/packs/PackMeetingClock.ts). No-op without a
+    // Natively API key, and one request per meeting for a key that is not a pack.
+    try { this.packMeetingClock().meetingStarted(); } catch (e) { console.warn('[Main] pack clock not started:', (e as Error)?.message); }
     // The user's name as a transcription hint, before any STT connects (sttContextTerms.ts).
     try { setSttContextTerms(nameTerms(this.currentUserName())); } catch { /* a hint, never a blocker */ }
     // The user's dictionary (Settings > Audio) beside it, for every provider with a vocabulary input.
     try { setSttDictionaryTerms(getUserDictionary()); } catch { /* a hint, never a blocker */ }
     // The transcript goes to disk as it grows, so a quit or crash mid-meeting
     // is recovered at the next launch (services/meeting/LiveMeetingJournal.ts).
-    try { this.intelligenceManager.beginLiveMeeting(); } catch (e) { console.warn('[Main] live meeting journal unavailable:', (e as Error)?.message); }
+    try { this.intelligenceManager.beginLiveMeeting(undefined, { surface: this.meetingSurface, resume: resumeBase }); } catch (e) { console.warn('[Main] live meeting journal unavailable:', (e as Error)?.message); }
     // The notes window's page belongs to this meeting now; someone who keeps
-    // the window open gets it back, without it taking focus.
+    // the window open gets it back, without it taking focus. A resume keeps
+    // the meeting's notes on the page.
     try {
-      this.liveNotes.meetingStarted();
+      this.liveNotes.meetingStarted(resumeBase ? { meetingId: resumeBase.meetingId, text: resumeBase.userNotes ?? '' } : undefined);
       this.notesWindowHelper.reopenForMeeting(startPlan.openNotes);
     } catch (e) { console.warn('[Main] notes window not reopened:', (e as Error)?.message); }
     this.transcriptionPause.setPaused(false);
@@ -7648,13 +7914,24 @@ export class AppState {
       if (provider !== 'none' && !LOCAL_STT_PROVIDERS.has(provider)) this.sttGap.startMeeting();
       else this.sttGap.endMeeting();
     } catch { /* recovery is extra; the meeting runs without it */ }
-    try { require('./services/FunnelTelemetry').funnelTelemetry.meetingStarted(this.intelligenceManager.getAnswerCount()); } catch { /* analytics never blocks a meeting */ }
+    // What it opened on, and whether the notepad is up from the start (a notepad
+    // meeting, or the user left it open), for the notepad's demand (2026-11-01).
+    try { require('./services/FunnelTelemetry').funnelTelemetry.meetingStarted(this.intelligenceManager.getAnswerCount(), this.meetingSurface, startPlan.openNotes || this.notesWindowHelper.isVisible(), !!resumeBase); } catch { /* analytics never blocks a meeting */ }
     // No AI set up: the free trial starts by itself. Below the funnel line on
     // purpose, so `meeting_started.ai` still says what the meeting began with.
     // Fire and forget: the overlay is told when it starts or cannot.
     try { this.autoStartTrialForMeeting?.(); } catch { /* a trial never blocks a meeting */ }
     this.broadcastMeetingState()
-    if (metadata) {
+    if (resumeBase) {
+      // The saved meeting's title and calendar link: already linked, so no
+      // new link and no "last time" lookup (it would find this very meeting).
+      this.intelligenceManager.setMeetingMetadata({
+        ...resumeMetadata(resumeBase, isDefaultMeetingTitle),
+        resumedFrom: resumeBase.meetingId,
+        // Retention "never" still holds for the new part (MeetingPersistence.mustNotPersist).
+        ...(metadata?.doNotPersist === true ? { doNotPersist: true } : {}),
+      });
+    } else if (metadata) {
       this.intelligenceManager.setMeetingMetadata(metadata);
       // Which calendar event this is (title, attendees, 1:1 speaker names,
       // follow-up recipients). Decides at once from the cached list; never
@@ -7665,7 +7942,8 @@ export class AppState {
       try { getAssistService()?.noteMeetingStarted(metadata, () => this.isMeetingActive && this._meetingGeneration === meetingGeneration); } catch { /* a recap never blocks a start */ }
     }
     // Zoom / Teams read-only signals: who speaks, the meeting ID, mute, a shared screen.
-    this.startDesktopCallSpeakers(metadata ?? null, meetingGeneration);
+    // A resume's metadata is the session's own (set above), not the start request.
+    this.startDesktopCallSpeakers(resumeBase ? null : (metadata ?? null), meetingGeneration);
     // Every meeting gets its own conversation history, whether or not a mode
     // is active (the dynamic-action session id below exists only WITH a mode,
     // and without one every meeting shared one history — 2026-09-24).
@@ -7711,8 +7989,10 @@ export class AppState {
       });
     } catch { /* non-fatal */ }
 
-    // Emit session reset to clear UI state immediately
-    this.sendToWindow(this.getWindowHelper().getOverlayWindow(), 'session-reset');
+    // Emit session reset to clear UI state immediately. A resume hands the
+    // overlay the saved meeting's answers, so its chat carries on where it
+    // stopped (meetingResume.resumedChatFrom; renderer src/lib/resumedChat.mjs).
+    this.sendToWindow(this.getWindowHelper().getOverlayWindow(), 'session-reset', resumeBase ? { resumedChat: resumedChatFrom(resumeBase.usage) } : undefined);
     this.sendToWindow(this.getWindowHelper().getLauncherWindow(), 'session-reset');
 
     // LOCAL-MODEL WARMUP: if the active model is a local Ollama model, warm + pin
@@ -8117,7 +8397,10 @@ export class AppState {
     // centerAndShowWindow pattern) — the user often stops transcription while
     // the proctored test continues, and an activating show would blur the
     // test page. Normal mode is unchanged (active show + focus).
-    this.windowHelper.setWindowMode('launcher', this.isUndetectable ? true : undefined);
+    //
+    // The notepad open at Stop (2026-10-31): its notes are written now, so it
+    // stays in front and the launcher waits until it is closed (onClosedByUser).
+    this.windowHelper.setWindowMode('launcher', this.isUndetectable ? true : undefined, { hidden: this.notesWindowHelper.isVisible() });
 
     // ─── CLEAR THE OVERLAY TREE WHILE IT IS HIDDEN ─────────────────────────
     // The overlay BrowserWindow is PERSISTENT — created once with show:false
@@ -8145,6 +8428,9 @@ export class AppState {
     // for the cold-start / crash-recovery path where endMeeting never ran; on
     // the normal Stop→Start path it is now a no-op (state already clean).
     this.sendToWindow(this.getWindowHelper().getOverlayWindow(), 'session-reset');
+    // The overlay drops this meeting's audio warnings as it ends; nothing armed
+    // for them may clear a warning in the next one.
+    this._captureRecovery.reset();
 
     // ─── UX STATE FLIP — SYNCHRONOUS ───────────────────────────────────────
     // Now flip the UX-facing meeting flag and broadcast. The launcher's
@@ -8154,6 +8440,7 @@ export class AppState {
     this._meetingGeneration++;
     this._isDraining = true;
     this.sttGap.endMeeting();
+    try { void this.packMeetingClock().meetingEnded(); } catch (e) { console.warn('[Main] pack clock not stopped:', (e as Error)?.message); }
     this.broadcastMeetingState();
 
     // ─── ABORT + AWAIT IN-FLIGHT AUDIO INIT (before any capture teardown) ───
@@ -8230,6 +8517,9 @@ export class AppState {
     // over the next ~150ms while we're already returning to the renderer.
     this.googleSTT?.finalize?.();
     this.googleSTT_User?.finalize?.();
+    // Natively Pro: the server asks its provider for the last finals now
+    // (a sentence spoken just before Stop was otherwise lost whole).
+    for (const s of [this.googleSTT, this.googleSTT_User]) if (s instanceof NativelyProSTT) s.finish();
     // A failover stand-in carrying a channel (audio/sttFailover.ts) gets the
     // same: told the audio is over, and waited for (bounded, per provider)
     // before the providers stop and the transcript is saved. Resolves at once
@@ -8283,7 +8573,9 @@ export class AppState {
         await new Promise(resolve => setTimeout(resolve, 250));
         // 1a. A REST provider (Groq: ~10 s chunks, issue #698) answers only
         //     after its upload: wait for one in flight or queued, up to 5 s.
-        const restStts = [this.googleSTT, this.googleSTT_User].filter((s): s is RestSTT => s instanceof RestSTT);
+        //     Natively Pro waits for the server's `finished` (finish() above;
+        //     it gives up by itself after NATIVELY_FINISH_WAIT_MS).
+        const restStts = [this.googleSTT, this.googleSTT_User].filter((s): s is RestSTT | NativelyProSTT => s instanceof RestSTT || s instanceof NativelyProSTT);
         for (const deadline = Date.now() + 5_000; Date.now() < deadline && restStts.some((s) => s.hasPendingWork());) {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
@@ -8390,7 +8682,18 @@ export class AppState {
   }
 
   private setupIntelligenceEvents(): void {
-    const mainWindow = this.getMainWindow.bind(this)
+    // Where answers go: the OVERLAY, in every window mode (2026-11-06). Only the
+    // overlay's interface (NativelyInterface) listens on any channel below.
+    // They followed getMainWindow(), which is the launcher whenever the window
+    // mode is 'launcher' — so a What to answer pressed then (from the phone,
+    // or the overlay's own key handler) showed "Thinking" in the overlay and
+    // the answer went to the launcher, which drops it: the card never filled.
+    // A meeting's start resets the overlay (session-reset), so an answer left
+    // in it while it was hidden never carries into the next meeting.
+    const answerWindow = (): BrowserWindow | null => {
+      const overlay = this.windowHelper.getOverlayWindow();
+      return overlay && !overlay.isDestroyed() ? overlay : this.getMainWindow();
+    }
 
     // Sprint 9: time-batched IPC token sends.
     //
@@ -8431,7 +8734,7 @@ export class AppState {
       // done the work the queued one was going to do, so the next queueBatch
       // must be able to arm a fresh immediate rather than be dropped.
       batchFlushScheduled = false;
-      const win = mainWindow();
+      const win = answerWindow();
       if (!win) { tokenBatches.clear(); return; }
       for (const [kind, items] of tokenBatches.entries()) {
         if (items.length > 0) {
@@ -8460,6 +8763,11 @@ export class AppState {
     // answer, trailing tokens) — the latter would clobber the just-finalized
     // row with appended text from a pending setImmediate batch.
     const flushBatchesBeforeFinal = flushBatchesNow;
+
+    // The paired phone gets every answer the overlay gets, streamed as it is
+    // written: Auto Answer, the buttons, coaching cards, corrected code.
+    // Before, only the button IPC handlers published, once finished.
+    wireLiveAnswersToPhone(this.intelligenceManager, () => PhoneMirrorService.getInstance())
 
     // Forward intelligence events to renderer
     this.intelligenceManager.on('assist_update', (insight: string) => {
@@ -8506,7 +8814,7 @@ export class AppState {
       // (fallback paths, code-hint, brainstorm) that don't compute it.
       flushBatchesBeforeFinal();
       this.autoAnswerUsage.answerShown();
-      const win = mainWindow()
+      const win = answerWindow()
       // emittedAt (2026-07-31): WTA supersession is generation-relative only —
       // a slow generation stays "current" through any number of manual turns
       // and mode switches, so a minutes-old answer appeared with no marker of
@@ -8532,7 +8840,7 @@ export class AppState {
     this.intelligenceManager.on('suggested_answer_discard', (reason: string) => {
       this.autoAnswerUsage.stopAwaitingAnswer();
       flushBatchesBeforeFinal();
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-suggested-answer-discard', { reason })
     })
 
@@ -8540,12 +8848,12 @@ export class AppState {
     // its executed test cases, and a NEW corrected message when it failed and a
     // re-verified fix was produced. Both arrive AFTER the answer was shown.
     this.intelligenceManager.on('code_verified', (info: { question: string; passed: number; total: number; language: string }) => {
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-code-verified', info)
     })
     this.intelligenceManager.on('code_correction', (info: { question: string; answer: string; note: string; reVerified: boolean }) => {
       flushBatchesBeforeFinal();
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-code-correction', info)
     })
 
@@ -8557,7 +8865,7 @@ export class AppState {
       // Sprint 9: flush any pending batched tokens first so the renderer
       // sees them before the coaching card swap.
       flushBatchesBeforeFinal();
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-negotiation-coaching', { payload })
     })
 
@@ -8568,14 +8876,14 @@ export class AppState {
 
     this.intelligenceManager.on('refined_answer', (answer: string, intent: string) => {
       flushBatchesBeforeFinal();
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-refined-answer', { answer, intent })
 
     })
 
     this.intelligenceManager.on('recap', (summary: string) => {
       flushBatchesBeforeFinal();
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-recap', { summary })
     })
 
@@ -8586,7 +8894,7 @@ export class AppState {
 
     this.intelligenceManager.on('clarify', (clarification: string) => {
       flushBatchesBeforeFinal();
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-clarify', { clarification })
     })
 
@@ -8597,7 +8905,7 @@ export class AppState {
 
     this.intelligenceManager.on('follow_up_questions_update', (questions: string) => {
       flushBatchesBeforeFinal();
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-follow-up-questions-update', { questions })
     })
 
@@ -8615,27 +8923,38 @@ export class AppState {
 
     this.intelligenceManager.on('live_helper', (text: string, action: LiveHelperAction) => {
       flushBatchesBeforeFinal();
-      const win = mainWindow()
+      const win = answerWindow()
       if (liveHelperDisplayKind(action) === 'clarify') this.sendToWindow(win, 'intelligence-clarify', { clarification: text })
       else this.sendToWindow(win, 'intelligence-recap', { summary: text })
+    })
+
+    // The user's own buttons (llm/customButtons.ts) are shown in Recap's card,
+    // like Define and What did I miss?.
+    this.intelligenceManager.on('custom_button_token', (token: string) => {
+      queueBatch('recap', { token });
+    })
+
+    this.intelligenceManager.on('custom_button', (text: string) => {
+      flushBatchesBeforeFinal();
+      this.sendToWindow(answerWindow(), 'intelligence-recap', { summary: text })
     })
 
     this.intelligenceManager.on('manual_answer_started', () => {
       // The hotkey/click commits whatever Auto Answer was offering — and,
       // inside the feedback window, says the automatic answer missed.
       this.simpleAutoAnswer.onManualAnswerStarted();
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-manual-started')
     })
 
     this.intelligenceManager.on('manual_answer_result', (answer: string, question: string) => {
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-manual-result', { answer, question })
 
     })
 
     this.intelligenceManager.on('mode_changed', (mode: string) => {
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-mode-changed', { mode })
       // A candidate parked because the engine was busy may now dispatch.
       if (mode === 'idle') this.simpleAutoAnswer.onEngineIdle()
@@ -8647,7 +8966,7 @@ export class AppState {
       // Sent after it, they opened a new row under the failure line that
       // nothing ever closed.
       flushBatchesBeforeFinal()
-      const win = mainWindow()
+      const win = answerWindow()
       this.sendToWindow(win, 'intelligence-error', { error: error.message, mode })
     })
   }
@@ -9012,16 +9331,18 @@ export class AppState {
   }
 
   private getTargetDisplayForFullScreenshot(session: ScreenshotCaptureSession): Electron.Display {
+    const cursorDisplay = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    let overlayDisplay: Electron.Display = cursorDisplay;
     if (session.windowMode === 'overlay' && session.overlayBounds) {
-      return screen.getDisplayMatching(session.overlayBounds);
+      overlayDisplay = screen.getDisplayMatching(session.overlayBounds);
+    } else {
+      overlayDisplay = this.getDisplayById(session.overlayDisplayId) ?? cursorDisplay;
     }
 
-    const lastOverlayDisplay = this.getDisplayById(session.overlayDisplayId);
-    if (lastOverlayDisplay) {
-      return lastOverlayDisplay;
-    }
-
-    return screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    // Settings › Overlay › Screenshot screen. With three monitors the overlay's
+    // screen is often not the one the question is on (customer, 2026-10-29).
+    const preference = parseScreenshotDisplayPreference(SettingsManager.getInstance().get('screenshotDisplay'));
+    return resolveScreenshotDisplay(preference, screen.getAllDisplays(), overlayDisplay, cursorDisplay);
   }
 
   private hideWindowsForScreenshot(session: ScreenshotCaptureSession): void {
@@ -9226,6 +9547,29 @@ export class AppState {
       shot?.settle(null);
       this.sendToWindow(overlay(), PAGE_CAPTURE_FALLBACK_CHANNEL, describeUnreadableFormulas(Math.max(1, unreadable), 'not-taken'));
       console.warn('[Main] Saving the formula image failed:', err?.message || err);
+    }
+  }
+
+  /**
+   * The automatic capture's image of the formulas with no text (#645), saved
+   * and handed to the answer that pulled the capture. Never attached in the
+   * overlay: that answer has already copied its attachments, and in the tray
+   * the images would ride the next question. Opened before the first await,
+   * so the answer request, sent right after, finds it while the files are
+   * written. No screenshot when there is no image: the page is not on screen.
+   */
+  public async handFormulaImagesToAnswer(
+    images: Array<{ data: Buffer; ext: 'jpg' | 'png' | 'webp'; formulas?: [number, number] }>,
+    unreadable: number,
+  ): Promise<void> {
+    const shot = this.formulaScreenshots.open({ maxAgeMs: AUTO_FORMULA_IMAGE_MAX_AGE_MS });
+    try {
+      const paths = await this.screenshotHelper.addFormulaImages(images);
+      shot.settle(paths);
+      console.log(`[Main] Formula image(s) from the automatic capture: ${paths.length} for this answer${unreadable ? `, ${unreadable} formula(s) in none` : ''}`);
+    } catch (err: any) {
+      shot.settle(null);
+      console.warn('[Main] Saving the automatic capture\'s formula image failed:', err?.message || err);
     }
   }
 
@@ -10434,6 +10778,7 @@ if (agentUserData) {
 
 // Skipping the lock is what lets an agent instance run beside the developer's.
 const gotSingleInstanceLock = agentUserData ? true : app.requestSingleInstanceLock();
+_startupLogLock = gotSingleInstanceLock ? 'held' : 'lost';
 logStartupPhase('single-instance-lock', {
   gotLock: gotSingleInstanceLock,
   agentMode: Boolean(agentUserData),
@@ -10544,7 +10889,8 @@ async function initializeApp() {
       console.warn(
         `[Lifecycle] previous session ended unexpectedly: ` +
         `pid=${prev.pid} lastEvent=${prev.lastEvent} reason=${prev.quitReason ?? 'unknown'} ` +
-        `startedAt=${prev.startedAt} lastEventAt=${prev.lastEventAt}`
+        `startedAt=${prev.startedAt} lastEventAt=${prev.lastEventAt}` +
+        (prev.lastIncident ? ` lastIncident=${prev.lastIncident.event}@${prev.lastIncident.at}` : '')
       );
     }
   } catch (err) {
@@ -10617,6 +10963,29 @@ async function initializeApp() {
       process.title = disguiseAppName(normalizeDisguiseMode(SettingsManager.getInstance().get('disguiseMode')), process.platform);
       if (app.dock) app.dock.hide();  // app.dock is macOS-only (undefined elsewhere); darwin gated at 7445
     }
+  }
+
+  // 2b. "Open Natively when you log in" is on by default for fresh installs,
+  // written to the OS once; after that the Settings toggle owns it. The marker
+  // is persisted BEFORE the login item is written, so a store that refuses
+  // writes can't re-enable it on every launch. See utils/openAtLoginDefault.ts.
+  try {
+    const settings = SettingsManager.getInstance();
+    const decision = decideOpenAtLoginDefault({
+      platform: process.platform,
+      state: settings.get('openAtLoginDefault'),
+      freshInstall: settings.isFreshInstall(),
+      isPackaged: app.isPackaged,
+      inApplicationsFolder: process.platform === 'darwin' ? app.isInApplicationsFolder() : false,
+      isPortable: process.platform === 'win32' && !!process.env.PORTABLE_EXECUTABLE_FILE,
+    });
+    const persisted = decision.nextState === null || settings.set('openAtLoginDefault', decision.nextState);
+    if (decision.enable && persisted) {
+      setOpenAtLogin(app, process.platform, true, app.getPath('exe'));
+      console.log('[Startup] Open at login turned on (fresh-install default)');
+    }
+  } catch (err) {
+    console.warn('[Startup] Open-at-login default skipped:', err);
   }
 
   // 3. Initialize Managers
@@ -11127,6 +11496,16 @@ if (process.env.THINKING_MATRIX === '1') {
     }
   }
 
+  // Main's own calendar refresh (CalendarManager.refreshInBackground): the
+  // reminders no longer depend on the Launcher's renderer asking for the list.
+  const refreshCalendarInBackground = (reason: 'resume' | 'unlock') => {
+    try {
+      void require('./services/CalendarManager').CalendarManager.getInstance().refreshInBackground(reason);
+    } catch (err) {
+      console.warn(`[Main] calendar refresh on ${reason} failed (non-fatal):`, err);
+    }
+  };
+
   // System sleep/wake handling. macOS invalidates CoreAudio AggregateDevice
   // handles on sleep — without this the Process Tap silently stops delivering
   // buffers on resume and the user sits in front of a frozen transcript with
@@ -11137,6 +11516,15 @@ if (process.env.THINKING_MATRIX === '1') {
     const { powerMonitor } = require('electron') as typeof import('electron');
     powerMonitor.on('resume', () => {
       console.log('[Main] powerMonitor: system resumed from sleep.');
+      // The Pro pack meeting clock accrues again from now; the sleep is not billed.
+      appState.packClockResume();
+      // A laptop closed for days may come back with a licence that lapsed,
+      // was refunded or was cancelled meanwhile: ask the server.
+      try {
+        triggerLicenceRecheck('resume');
+      } catch (err) {
+        console.warn('[Main] licence re-check on resume failed (non-fatal):', err);
+      }
       // Tell the Provider Performance Profile that the next few turns are not
       // representative: a machine coming back from sleep re-associates Wi-Fi,
       // re-opens TLS sessions and re-warms DNS, and a first-token measurement
@@ -11168,9 +11556,13 @@ if (process.env.THINKING_MATRIX === '1') {
       } catch (err) {
         console.error('[Main] revalidateShortcuts on resume threw:', err);
       }
+      // Calendar reminders: their timers stood still in sleep. Re-planned at
+      // once, then the list refreshed (not while Undetectable is on).
+      refreshCalendarInBackground('resume');
     });
     powerMonitor.on('suspend', () => {
       console.log('[Main] powerMonitor: system suspending. Captures will be recreated on resume if a meeting is active.');
+      appState.packClockSuspend();
     });
     // Unlocking the session is another moment the OS may have dropped global
     // shortcut registrations (a lock can outlast a short sleep that never fired
@@ -11184,6 +11576,7 @@ if (process.env.THINKING_MATRIX === '1') {
       } catch (err) {
         console.error('[Main] revalidateShortcuts on unlock-screen threw:', err);
       }
+      refreshCalendarInBackground('unlock');
     });
   } catch (err) {
     console.warn('[Main] powerMonitor unavailable — sleep/wake recovery disabled:', err);
@@ -11568,10 +11961,18 @@ if (process.env.THINKING_MATRIX === '1') {
     const { CalendarManager } = require('./services/CalendarManager');
     const calMgr = CalendarManager.getInstance();
     // Reminders are system notifications (with a chime): their own OS window,
-    // outside content protection. Checked when each one fires, not when it is
-    // scheduled, since the mode can change during the wait.
-    calMgr.setNotificationSuppressor(() => nativePromptsBlocked(() => appState.getUndetectable()));
+    // outside content protection, saying "Natively". Not while Undetectable or
+    // a disguise is on (as meeting detection and dictation), and no Start while
+    // a Natively meeting runs. Checked when each one fires, not when it is
+    // scheduled, since either can change during the wait.
+    calMgr.setNotificationSuppressor(
+      () => nativePromptsBlocked(() => appState.getUndetectable()) || appState.getDisguise() !== 'none',
+      () => appState.getIsMeetingActive(),
+    );
     calMgr.init();
+    // Re-fetched every few minutes by main itself (none while Undetectable:
+    // no calendar traffic then, like the Launcher's poll).
+    calMgr.startBackgroundRefresh(() => nativePromptsBlocked(() => appState.getUndetectable()));
 
     // The Launcher card and Settings › Calendar follow the connection wherever it changes.
     require('./services/calendar/calendarConnectionBroadcast').broadcastCalendarConnection(calMgr, () => BrowserWindow.getAllWindows());

@@ -14,7 +14,7 @@ import { assemblePromptV2 } from "../intelligence/PromptAssemblerV2";
 import { beginTrace, commitTrace } from "../intelligence/IntelligenceTrace";
 import { DOM_CONTEXT_MAX_CHARS } from "../config/constants";
 import { checkAnswerForCodeBugs } from "./CodeSanityCheck";
-import { providerRejectionUserMessage } from "./providerErrorClassifier";
+import { accountOrSetupUserMessage, providerRejectionUserMessage } from "./providerErrorClassifier";
 import { formatAnswerPlanForPrompt, isCodingAnswerType } from "./AnswerPlanner";
 import { resolveCodingPromptSignals, isDeicticAsk, isPromotedScreenCodingTurn, screenPromotedCodingSignals } from "./codingPromptSignals";
 import type { AnswerPlan, AnswerType } from "./AnswerPlanner";
@@ -1151,7 +1151,22 @@ The user triggered this action with a coding problem on screen and NO new questi
             // own section; the v2 envelope and the legacy packet get it appended
             // (never twice — see withDiagramTurnBlock).
             const _wtaUserBase = _v3p?.user ?? _v2TurnUser ?? packet.userMessage;
-            const _wtaUserMessage = _v3p ? _wtaUserBase : withDiagramTurnBlock(_wtaUserBase, diagramTurn);
+            // What the user told the app about themselves (2026-11-09): the V3
+            // composer carries About you, the mode's Real-time prompt facts and
+            // "Use in every answer" skills; the v2 envelope and the legacy packet
+            // carried none, so with V3 off or failed a live answer invented the
+            // user's background. Appended last, where the composer puts them.
+            const _personalBlock = _v3p ? '' : (() => {
+                try {
+                    return (require('../services/answerPersonalContext') as typeof import('../services/answerPersonalContext')).personalContextBlockForAnswers({
+                        answerType: answerPlan?.answerType,
+                        modeId: requestSnapshot?.modeUniqueId ?? null,
+                        explicitSkillId: activeSkill?.id ?? null,
+                    });
+                } catch { return ''; }
+            })();
+            const _wtaLegacyUser = _personalBlock ? `${_wtaUserBase}\n\n${_personalBlock}` : _wtaUserBase;
+            const _wtaUserMessage = _v3p ? _wtaUserBase : withDiagramTurnBlock(_wtaLegacyUser, diagramTurn);
             // PR #429 Bug 003: `_v3p?.system ?? finalPromptOverride` discarded the
             // ACTIVE SKILL block on every V3 turn — finalPromptOverride is its only
             // carrier and V3 is default ON, so `??` never fell through.
@@ -1321,13 +1336,20 @@ The user triggered this action with a coding problem on screen and NO new questi
             // app simply didn't hear the question — undiagnosable for users and
             // support. Surface an actionable message for provider failures.
             const msg = String(error?.message ?? error ?? '').toLowerCase();
+            // The trial ended, the plan's limit was reached, or nothing is set
+            // up (2026-11-03): no provider failed, so "check your API keys"
+            // below would name the wrong cause. Checked first: "quota" and
+            // "API key" in these would otherwise match the provider test.
+            const ownLine = accountOrSetupUserMessage(error);
             const isProviderFailure = /\b(401|403|429)\b|api key|unauthor|forbidden|quota|rate.?limit|billing|exhausted|permission/.test(msg);
             // A permanent rejection ("The '<model>' model is not supported when
             // using Codex with a ChatGPT account", issue #543) is not retryable:
             // the engine's regeneration would replay the same refused call and
             // then say "press again". The provider's explanation is the answer.
             const rejection = isProviderFailure ? null : providerRejectionUserMessage(error);
-            if (rejection) {
+            if (ownLine) {
+                yield ownLine;
+            } else if (rejection) {
                 yield rejection;
             } else if (isProviderFailure) {
                 yield "I couldn't reach the AI provider — this looks like an API key or rate-limit issue. Check your API keys / plan in Settings and try again.";

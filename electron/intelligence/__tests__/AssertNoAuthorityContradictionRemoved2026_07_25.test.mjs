@@ -18,6 +18,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -35,7 +36,7 @@ test('no source file repo-wide imports/calls assertNoAuthorityContradiction', ()
   try {
     output = execFileSync(
       'grep',
-      ['-rlE', usagePattern, 'electron', 'src', 'premium/electron'],
+      ['-rlE', usagePattern, ...['electron', 'src', 'premium/electron'].filter(dir => fs.existsSync(path.join(repoRoot, dir)))],
       { cwd: repoRoot, encoding: 'utf8' },
     );
   } catch (err) {

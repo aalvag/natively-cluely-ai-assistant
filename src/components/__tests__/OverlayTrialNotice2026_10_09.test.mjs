@@ -61,7 +61,8 @@ test('the overlay mounts the trial state once and folds its notice like every ot
   const at = overlay.indexOf('testId="fold-trial-notice"');
   assert.ok(at > 0);
   const tag = overlay.slice(overlay.lastIndexOf('<ChromeFold', at), at);
-  assert.match(tag, /show=\{!!trial\.banner\} overlayVisible=\{isExpanded\} requestHeightMotion=\{requestChromeHeightMotion\}/);
+  // Gated by the two-banner cap too (overlayBannerSlots.mjs, 2026-11-09).
+  assert.match(tag, /show=\{!!trial\.banner && bannerSlots\.has\('trial'\)\} overlayVisible=\{isExpanded\} requestHeightMotion=\{requestChromeHeightMotion\}/);
   assert.ok(overlay.includes('{trial.banner && <TrialNoticeBanner trial={trial} />}'));
   // The countdown lives in the status row, which must open for it alone.
   assert.ok(overlay.includes('<ChromeFold show={hasStatusPill || !!trial.chip} '));
@@ -70,7 +71,7 @@ test('the overlay mounts the trial state once and folds its notice like every ot
 
 test('"Transcription Not Configured" stands down while the trial explains it', () => {
   assert.ok(overlay.includes("const trialExplainsNoStt = trial.pending || trial.banner === 'ended' || trial.banner === 'failed';"));
-  assert.ok(overlay.includes('<ChromeFold show={sttNotConfigured && !trialExplainsNoStt} '));
+  assert.ok(overlay.includes("<ChromeFold show={sttNotConfigured && !trialExplainsNoStt && bannerSlots.has('stt-not-configured')} "));
   assert.ok(overlay.includes('{sttNotConfigured && !trialExplainsNoStt && ('));
 });
 
@@ -234,7 +235,8 @@ test('review fixes: the overlay hook knows whether a meeting is on, and rests wh
   assert.ok(hook.includes('if (f.meetingActive && f.expiresAt !== null && f.expiresAt > now) f.liveThisMeeting = true;'), 'a trial is "live in this meeting" only in a meeting');
   // Reported only while a meeting is on, and again when one begins under a banner already computed.
   assert.match(hook, /if \(!view\.active \|\| !view\.banner \|\| reported\.current\.has\(view\.banner\)\) return;/);
-  assert.match(hook, /\}, \[view\.banner, view\.active\]\);/);
+  // (2026-11-03) The reason rides along with the report; still once per banner.
+  assert.match(hook, /\}, \[view\.banner, view\.active, view\.reason\]\);/);
   // The clock runs only while a trial is counting down or a start is in flight.
   assert.ok(hook.includes('const counting = f.pendingSince !== null || (f.expiresAt !== null && f.expiresAt > Date.now());'));
   assert.ok(!/const id = setInterval\(refresh, 1000\);/.test(hook), 'no unconditional interval');
@@ -269,6 +271,20 @@ test('review fix: the old words of a crossed-over line are taken out again', () 
   assert.ok(!/return \(\) => clearTimeout\(done\);/.test(swap), 'not cancelled by the re-run it causes');
   assert.match(swap, /leaveTimer\.current = setTimeout\(\(\) => \{\s*leaveTimer\.current = null;\s*setLeaving\(null\);/);
   assert.match(swap, /useEffect\(\(\) => \(\) => \{ if \(leaveTimer\.current\) clearTimeout\(leaveTimer\.current\); \}, \[\]\);/, 'cleared when the line itself goes');
+});
+
+test('review fix: a line that changes twice in one update still comes into view', () => {
+  // Seen live (2026-11-03, macOS): "Transcription Stopped" in the overlay with
+  // no words, its swap span stuck at is-enter-start (opacity 0). A banner title
+  // that changes twice in one update asks the crossed-over swap to enter while
+  // it is already entering: the phase does not change, the layout effect that
+  // brings the words in does not run again, and they stay invisible until the
+  // next change. Reproduced in Electron with React 19; the sequential swap
+  // recovers by itself and is unaffected.
+  const swap = read('src/components/ui/SwapText.tsx');
+  assert.ok(swap.includes('const [enterSeq, setEnterSeq] = useState(0);'));
+  assert.equal((swap.match(/setPhase\('enter'\);\s*setEnterSeq\(\(n\) => n \+ 1\);/g) || []).length, 2, 'every enter starts a new one, both swaps');
+  assert.match(swap, /void ref\.current\?\.offsetHeight;[^]*?setPhase\('idle'\);\s*\}, \[phase, enterSeq\]\);/, 'the enter runs again for each one');
 });
 
 test('Settings words every refusal and remembers none of them against the device', () => {

@@ -604,7 +604,7 @@ export const AIP_CSS = `
 }
 /* Repointed to --toggle-on (not --aip-accent) so only the switch changes —
    --aip-accent still drives buttons, links, and chips elsewhere in this panel. */
-.aip-switch[aria-checked='true'] { background: var(--toggle-on); }
+.aip-switch[aria-checked='true'] { background: var(--toggle-on-track); }
 .aip-switch[aria-disabled='true'] { cursor:not-allowed; }
 .aip-switch:disabled { cursor:not-allowed; opacity:0.5; }
 /* Thumb dimensions, position, and bounce are owned by .t-toggle-thumb in
@@ -1338,10 +1338,23 @@ select.aip-input { cursor:pointer; }
    .aip-subtitle is already 12px = General's "text-xs", and --aip-secondary
    already resolves to the same colour as --text-secondary in both themes
    (#6B7280 light; rgba(255,255,255,0.56) over the dark canvas ≈ #A0A0A0), so
-   the description role needs no change. */
-.aip-title     { font-size:15px; font-weight:600; letter-spacing:-0.012em; color: var(--aip-hero); }
+   the description role needs no change.
+   2026-11-01: .aip-title now really is 18px/700 (it had drifted to 15px/600,
+   so AI Providers, Retrieval, Embeddings and Reranker read smaller than
+   General and Audio). */
+.aip-title     { font-family: var(--font-title); font-size:18px; line-height:28px; font-weight:600;
+                 letter-spacing:-0.015em; color: var(--aip-hero); }  /* = .settings-heading */
 .aip-subtitle  { font-size:12px; font-weight:400; color: var(--aip-secondary); }
-.aip-card-title{ font-size:13px; font-weight:600; letter-spacing:-0.008em; color: var(--aip-hero); }
+/* 2026-11-09: card titles set in Inter (the variable file bundled in
+   src/font/Inter-4.1/web, optical size left on auto) at 600 instead of SF Pro /
+   Segoe UI bold: the same family feel as the system-font body text, tighter
+   and more modern. Picked by the owner from a 5-font × 3-weight comparison.
+   .aip-row-title is a setting card's name (Active Model, Background Model,
+   Active Embedding Model…); .aip-card-title is a provider card's name. */
+.aip-row-title { font-family: var(--font-title); font-size:15px; line-height:1.3;
+                 font-weight:600; letter-spacing:-0.012em; color: var(--aip-hero); }
+.aip-card-title{ font-family: var(--font-title); font-size:14px; line-height:1.3;
+                 font-weight:600; letter-spacing:-0.01em; color: var(--aip-hero); }
 .aip-meta      { font-size:11px; font-weight:400; line-height:1.45; color: var(--aip-secondary); }
 .aip-label     { font-size:10px; font-weight:600; text-transform:uppercase;
                  letter-spacing:0.05em; color: var(--aip-secondary); }
@@ -5352,8 +5365,8 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
 
             <div className="aip-card p-5 flex items-center justify-between gap-4">
                     <div className="min-w-0">
-                        <label className="block text-xs font-medium uppercase tracking-wide mb-0 aip-hero">{t('Active Model')}</label>
-                        <p className="text-[10px] aip-muted mt-0.5">{t('Applies to new chats instantly.')}</p>
+                        <label className="block mb-0 aip-row-title">{t('Active Model')}</label>
+                        <p className="text-xs aip-muted mt-0.5">{t('Applies to new chats instantly.')}</p>
                     </div>
                     <ModelSelect
                         containerClassName={AIP_ACTIVE_SELECT_CONTAINER}
@@ -5370,14 +5383,14 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
 
             <div className="aip-card p-5 flex items-center justify-between gap-4">
                     <div className="min-w-0">
-                        <label className="block text-xs font-medium uppercase tracking-wide mb-0 aip-hero">{t('Background Model')}</label>
-                        <p className="text-[10px] aip-muted mt-0.5">{t('Runs Auto Answer, quick decisions and Fast Response Mode.')}</p>
+                        <label className="block mb-0 aip-row-title">{t('Background Model')}</label>
+                        <p className="text-xs aip-muted mt-0.5">{t('Runs Auto Answer, quick decisions and Fast Response Mode.')}</p>
                         {/* Advisory only: a big pick silently re-creates the latency
                             problem the measured judge ladder exists to avoid, but a
                             hard filter would need a hand-maintained list that goes
                             stale on every model retirement. */}
                         {!isKnownFastModel(fastModel) && (
-                            <p className="text-[10px] aip-warn-fg mt-0.5 font-medium">{t('Large models make Auto Answer slower. Pick a small tier for the best results.')}</p>
+                            <p className="text-xs aip-warn-fg mt-0.5 font-medium">{t('Large models make Auto Answer slower. Pick a small tier for the best results.')}</p>
                         )}
                     </div>
                     <ModelSelect
@@ -5408,8 +5421,8 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
 
             <div className="aip-card p-5 flex items-center justify-between gap-4">
                     <div className="min-w-0">
-                        <label className="block text-xs font-medium uppercase tracking-wide mb-0 aip-hero">{t('AI Response Language')}</label>
-                        <p className="text-[10px] aip-muted mt-0.5">
+                        <label className="block mb-0 aip-row-title">{t('AI Response Language')}</label>
+                        <p className="text-xs aip-muted mt-0.5">
                             {aiResponseLanguage === 'auto'
                                 ? t('Mirrors user\'s language automatically')
                                 : t('Language for AI suggestions and notes')
@@ -5458,7 +5471,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
             <div className="aip-card p-5 flex items-center justify-between gap-4">
                     <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
-                            <label className="block text-xs font-medium uppercase tracking-wide mb-0 aip-hero">{t('Direct Assist')}</label>
+                            <label className="block mb-0 aip-row-title">{t('Direct Assist')}</label>
                             {/* The Liquid Glass material rather than .aip-badge:
                                 a tag qualifies the title beside it, and this one
                                 carries no status, so it also drops the status dot
@@ -5475,10 +5488,10 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                 5.31:1 if that ever needs to change. */}
                             <LiquidGlassBadge variant="sky">{t('Beta')}</LiquidGlassBadge>
                         </div>
-                        <p className="text-[10px] aip-muted mt-0.5">
+                        <p className="text-xs aip-muted mt-0.5">
                             {t('Sends your typed, spoken, screenshot, and page input straight to the model, unprocessed.')}
                         </p>
-                        <AipRevealNote text={directAssistError} className="text-[10px] aip-danger-fg mt-1" role="alert" />
+                        <AipRevealNote text={directAssistError} className="text-xs aip-danger-fg mt-1" role="alert" />
                     </div>
                     <AipSwitch
                         checked={directAssistEnabled}
@@ -5521,10 +5534,10 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                             states the real requirement in full, as does the
                             card's title. A badge carries only what no other
                             control already says. */}
-                        <label className="block text-xs font-medium uppercase tracking-wide mb-0 aip-hero">{t('Fast Response Mode')}</label>
+                        <label className="block mb-0 aip-row-title">{t('Fast Response Mode')}</label>
                         {/* Says which model will answer: the Background Model when one
                             is picked, otherwise Auto's fastest connected model. */}
-                        <p className="text-[10px] aip-muted mt-0.5">{hasFastModelPick
+                        <p className="text-xs aip-muted mt-0.5">{hasFastModelPick
                             ? t('Answers with the Background Model, not the Active Model.')
                             : t('Uses the fastest available provider instead of your selected model.')}</p>
                         <AipRevealNote
@@ -5661,7 +5674,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
             {/* Cloud Providers */}
             <div className="space-y-5">
                 <div>
-                    <h3 className="text-sm font-bold aip-hero mb-1">{t('Cloud Providers')}</h3>
+                    <h3 className="settings-heading aip-hero mb-1">{t('Cloud Providers')}</h3>
                     <p className="text-xs aip-muted mb-2">{t('Add API keys to unlock cloud AI models.')}</p>
                 </div>
 
@@ -5726,7 +5739,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                     <div className="flex gap-3">
                         <AipProviderMark provider="antigravity" name="Google Antigravity" className="mt-0.5" />
                         <div>
-                            <h3 className="text-sm font-bold aip-hero mb-1">Google Antigravity</h3>
+                            <h3 className="aip-row-title mb-1">Google Antigravity</h3>
                             <p className="text-xs aip-muted">{t('Sign in with Google to use your Antigravity models.')}</p>
                         </div>
                     </div>
@@ -5872,7 +5885,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                     <div className="flex gap-3 min-w-0">
                         <AipProviderMark provider="codex" name="OpenAI Codex" className="mt-0.5" />
                         <div className="min-w-0">
-                            <h3 className="text-sm font-bold aip-hero mb-1">OpenAI Codex</h3>
+                            <h3 className="aip-row-title mb-1">OpenAI Codex</h3>
                             <p className="text-xs aip-muted">{t('Use your ChatGPT Plus/Pro subscription as an AI provider.')}</p>
                         </div>
                     </div>
@@ -6457,7 +6470,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                     <div className="flex items-start gap-2.5 min-w-0">
                         <AipProviderMark provider="ollama" name="Ollama" className="mt-0.5" />
                         <div className="min-w-0">
-                            <h3 className="text-sm font-bold aip-hero mb-1">{t('Local Models (Ollama)')}</h3>
+                            <h3 className="settings-heading aip-hero mb-1">{t('Local Models (Ollama)')}</h3>
                             <p className="text-xs aip-muted">{t('Run open-source models locally.')}</p>
                         </div>
                     </div>
@@ -6596,7 +6609,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                 <div className="flex items-center justify-between mb-2">
                     <div>
                         <div className="flex items-center gap-2 mb-1">
-                            <h3 className="text-sm font-bold aip-hero">{t('Custom Providers')}</h3>
+                            <h3 className="settings-heading aip-hero">{t('Custom Providers')}</h3>
                             <AipBadge tone="warn" label={t('Experimental')} />
                         </div>
                         <p className="text-xs aip-muted">{t('Add your own AI endpoints via cURL.')}</p>
@@ -6623,7 +6636,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
 
                 {isEditingCustom ? (
                     <div className="aip-card p-5 aip-panel-fade">
-                        <h4 className="text-sm font-bold aip-hero mb-4">{editingProvider ? t('Edit Provider') : t('New Provider')}</h4>
+                        <h4 className="aip-row-title mb-4">{editingProvider ? t('Edit Provider') : t('New Provider')}</h4>
 
                         <div className="space-y-4">
                             <div>
@@ -6851,7 +6864,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                 Now two switches over the same enum; see applyVisionMode(). */}
             <div className="space-y-5">
                 <div>
-                    <h3 className="text-sm font-bold aip-hero mb-1">{t('Screenshots')}</h3>
+                    <h3 className="aip-row-title mb-1">{t('Screenshots')}</h3>
                     <p className="text-xs aip-muted mb-2">{t('Controls where screenshots of your screen are processed.')}</p>
                 </div>
                 <div className="aip-card p-5 flex flex-col gap-3">
@@ -6960,7 +6973,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
             <div className="space-y-5">
                 <div className="flex items-end justify-between gap-3">
                     <div className="min-w-0">
-                        <h3 className="text-sm font-bold aip-hero mb-1">{t('Cloud provider data scopes')}</h3>
+                        <h3 className="aip-row-title mb-1">{t('Cloud provider data scopes')}</h3>
                         <p className="text-xs aip-muted">{t('What cloud AI providers are allowed to receive.')}</p>
                     </div>
                     <span className="aip-meta tabular-nums shrink-0 pb-0.5">

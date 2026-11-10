@@ -49,7 +49,7 @@ import { clearLoadSentinel, modelPreloader, writeLoadSentinel } from './whisper/
 import { buildWorkerInitMessage } from './whisper/inferenceConfig';
 import { resolveWhisperWorkerPath } from './whisper/workerPathResolver';
 import type { WhisperModelId, WorkerOutMessage } from './whisper/types';
-import { acquireOnnxSlotWithin, hasEnoughMemoryForModelSize, getMinFreeGBForModelSize } from '../utils/onnxThreadConfig';
+import { acquireOnnxSlotWithin, checkMemoryForModelSize, describeModelMemoryShortfall, type ModelMemoryCheck } from '../utils/onnxThreadConfig';
 import { retireOnnxWorker, trackOnnxWorker } from '../utils/onnxWorkerShutdown';
 import { classifyLocalModelLoadFailure, describeLocalModelLoadFailure } from './whisper/loadFailure';
 import { listMissingVcRuntimeDlls, resolveOnnxBindingDir } from './whisper/windowsVcRuntime';
@@ -101,11 +101,20 @@ export const LOCAL_STT_BEHIND_CODE = 'local_stt_behind';
  * the phrase "insufficient available memory" (pinned by
  * LocalWhisperSpawnFailTeardown2026_07_10) and must NOT contain "unavailable",
  * which sttErrorMapper titles "Service Unavailable ... Trying to reconnect".
+ *
+ * It reports the measured figure the gate refused on, not only the floor:
+ * "under 2GB free" alone could not tell a machine 50 MB short from one with
+ * nothing left (issue #707, a 16 GB Windows PC). It formats the check it is
+ * handed, never a fresh measurement, so the figure is the one that refused.
+ *
+ * The probe and the main-process heap go to the log only: they help triage
+ * but mean nothing to the user, who quoted "app heap 0.0GB" back as a clue.
  */
-function localSttMemoryRefusal(modelSizeMb: number | undefined): Error {
+function localSttMemoryRefusal(check: ModelMemoryCheck): Error {
     const heapGB = (process.memoryUsage().heapUsed / 1024 ** 3).toFixed(1);
+    console.warn(`[LocalWhisperSTT] Memory refusal: ${describeModelMemoryShortfall(check)} (measured by ${check.source ?? 'nothing'}; main heap ${heapGB}GB)`);
     return markLocalSttUnavailable(new Error(
-        `Local STT could not start: insufficient available memory (under ${getMinFreeGBForModelSize(modelSizeMb)}GB free, app heap ${heapGB}GB). ` +
+        `Local STT could not start: insufficient available memory (${describeModelMemoryShortfall(check)}). ` +
         `Close other apps to free memory, choose a smaller local model, or use a cloud STT provider.`,
     ));
 }
@@ -1248,7 +1257,8 @@ export class LocalWhisperSTT extends EventEmitter {
             // warm-worker path is also skipped entirely for Nemotron (see
             // modelPreloader.preload's own Nemotron guard) so there is never
             // a warm worker to take here in the first place.
-            if (!hasEnoughMemoryForModelSize(modelSizeMb)) throw localSttMemoryRefusal(modelSizeMb);
+            const memory = checkMemoryForModelSize(modelSizeMb);
+            if (!memory.ok) throw localSttMemoryRefusal(memory);
             const channelId = this.channelLabel || `nemotron-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
             this.nemotronChannelId = channelId;
             const initMsg = buildWorkerInitMessage(this.modelId);
@@ -1374,7 +1384,8 @@ export class LocalWhisperSTT extends EventEmitter {
         // Cold path. Acquire the shared ONNX slot at HIGH priority — Whisper
         // is latency-critical (~750ms real-time streaming) and would deadlock
         // behind a queued embedding batch.
-        if (!hasEnoughMemoryForModelSize(modelSizeMb)) throw localSttMemoryRefusal(modelSizeMb);
+        const memory = checkMemoryForModelSize(modelSizeMb);
+        if (!memory.ok) throw localSttMemoryRefusal(memory);
 
         // Bounded: an unbounded wait here was a silent dead channel — the local
         // embedding + reranker workers hold the whole default gate (cap 2) for
@@ -1537,8 +1548,8 @@ export class LocalWhisperSTT extends EventEmitter {
             if (msg.type === 'behind') {
                 // The worker's oldest final waited longer than 30s: this model
                 // runs slower than people talk on this computer, and text
-                // comes later and later (whisperTaskQueue.ts). Counted like any
-                // provider error, so a stand-in takes over when one is set up.
+                // comes later and later (whisperTaskQueue.ts). Main shows it
+                // once as "choose a lighter model", not as a reconnect.
                 console.warn(`[LocalWhisperSTT/${this.channelLabel}] transcription is ${Math.round(msg.waitedMs / 1000)}s behind the audio (${this.modelId})`);
                 this.emit('error', Object.assign(new Error(
                     `Transcription is ${Math.round(msg.waitedMs / 1000)} seconds behind: this model is too slow for this computer. ` +

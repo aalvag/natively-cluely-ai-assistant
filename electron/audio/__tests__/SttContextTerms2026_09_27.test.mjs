@@ -55,6 +55,6 @@ test('Natively: context_terms in the legacy frame only; the relay frame is the r
 
 test('main sets the terms at meeting start from the same name the judge uses', () => {
   const main = read('electron/main.ts');
-  assert.match(main, /this\.autoAnswerUsage\.meetingStarted\(\);[\s\S]{0,200}setSttContextTerms\(nameTerms\(this\.currentUserName\(\)\)\)/);
+  assert.match(main, /this\.autoAnswerUsage\.meetingStarted\(\);[\s\S]{0,800}setSttContextTerms\(nameTerms\(this\.currentUserName\(\)\)\)/);
   assert.match(main, /userName: \(\) => this\.currentUserName\(\)/);
 });

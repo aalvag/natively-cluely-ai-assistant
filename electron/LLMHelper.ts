@@ -7,7 +7,6 @@ import fs from "fs"
 import os from "os"
 import path from "path"
 import { createHash, randomUUID } from "crypto"
-import sharp from "sharp"
 import { ModelVersionManager, ModelFamily, TextModelFamily } from './services/ModelVersionManager'
 import {
   HARD_SYSTEM_PROMPT, GROQ_SYSTEM_PROMPT, OPENAI_SYSTEM_PROMPT, CLAUDE_SYSTEM_PROMPT,
@@ -72,9 +71,12 @@ import type { TranscriptTurn } from "./llm/transcriptCleaner"
 import { applyCurlVariables, getByPath, injectImageIntoMessages, flattenStructuredJsonAnswer, blockedInfrastructureHost } from './utils/curlUtils';
 import { getImageOptimizer } from './services/screen/ImageOptimizer';
 import { isPhoneImagePath, visionImageEdge } from './utils/phoneImage';
+import { NATIVELY_API_JPEG, preparedJpeg } from './services/screen/preparedJpeg';
 import curl2Json from "@bany/curl-to-json";
 import { CustomProvider, CurlProvider } from './services/CredentialsManager';
 import { TRIAL_SENTINEL_KEY } from './config/constants';
+import { emitNativelyPlanLimit, nativelyLimitErrorMessage } from './llm/nativelyPlanLimitEvents';
+import { interactiveSeedFor } from './llm/interactiveSeed';
 import axios from 'axios';
 import { createProviderRateLimiters, RateLimiter } from './services/RateLimiter';
 import { chatGptCompatibleModel, CodexCliConfig, CodexCliService, codexSignedOutMessage, DEFAULT_CODEX_CLI_CONFIG, getCodexAuthStatus } from './services/CodexCliService';
@@ -482,7 +484,11 @@ const MIN_USEFUL_RUNG_MS = 3_000;
 // run-to-run variance and keeps the race winner's STYLE consistent with the
 // primary. Vision/multimodal temps are left untouched.
 const INTERACTIVE_TEMPERATURE = 0.2; // "very low" per report; avoids degenerate-0 loops some models show
-const INTERACTIVE_SEED = 7;          // fixed seed where the SDK supports it (Groq/DeepSeek; Gemini via config). NOT sent to OpenAI: reasoning models (gpt-5/o-series) reject non-default seed/temperature with a 400.
+// Fixed seed where the SDK supports it (Groq/DeepSeek; Gemini via config), as
+// interactiveSeedFor's BASE: an identical prompt sent again within minutes (a
+// retry after a hang or an empty answer) gets the next seed, so one prompt
+// that makes a model hang cannot hang on every retry. NOT sent to OpenAI:
+// reasoning models (gpt-5/o-series) reject non-default seed/temperature with a 400.
 
 // Canned-fallback phrases that mean the model gave up entirely, not phrases
 // that might legitimately appear inside a real answer. Matched only when the
@@ -2269,6 +2275,11 @@ export class LLMHelper {
   }
 
   public setNativelyKey(key: string | null): void {
+    // A new key is a new allowance: a plan bought after the trial ran out must
+    // answer at once, not after the trial's refusal stops being remembered.
+    // Clearing the key (a trial that ended) keeps it, so later answers still
+    // say why there is nothing to answer them.
+    if (key && key !== this.nativelyKey) { this.nativelyQuotaBlockedUntil = 0; this.nativelyLimit = null; }
     this.nativelyKey = key || null;
     this.visionHealth.delete('natively'); // fresh key → its selection leads again at once
     console.log(`[LLMHelper] Natively key ${key ? 'set' : 'cleared'}`);
@@ -3927,12 +3938,17 @@ export class LLMHelper {
   // 4,137 refused requests in 33 h from one key. Remember the server's Retry-After
   // and fail fast, locally, until then — bounded so a plan upgrade is noticed.
   private nativelyQuotaBlockedUntil = 0;
+  // What the last plan-limit refusal was, while it holds (2026-11-03): an
+  // answer nothing else could give fails with it, instead of falling through
+  // to "No AI provider configured… add at least one API key", which the
+  // overlay and the funnel read as a rejected key.
+  private nativelyLimit: { code: string; onTrial: boolean } | null = null;
   private static readonly NATIVELY_QUOTA_BLOCK_MIN_MS = 60_000;
   private static readonly NATIVELY_QUOTA_BLOCK_MAX_MS = 6 * 60 * 60_000;
   private static readonly PLAN_LIMIT_RE = /\b(?:[a-z]+_)?(?:quota_exceeded|plan_limit|limit_exceeded|lifetime_exceeded)\b/;
 
   /** Records a plan-limit 429 from the Natively API. Returns true when it was one. */
-  private noteNativelyPlanLimit(status: number, headers: { get(name: string): string | null } | null | undefined, errData: any): boolean {
+  private noteNativelyPlanLimit(status: number, headers: { get(name: string): string | null } | null | undefined, errData: any, onTrial = false): boolean {
     if (status !== 429) return false;
     const code = String(errData?.error ?? errData?.code ?? '');
     if (!LLMHelper.PLAN_LIMIT_RE.test(code)) return false;
@@ -3941,16 +3957,35 @@ export class LLMHelper {
     const sec = Number.isFinite(bodySec) && bodySec > 0 ? bodySec : (Number.isFinite(headerSec) && headerSec > 0 ? headerSec : 0);
     const ms = Math.min(LLMHelper.NATIVELY_QUOTA_BLOCK_MAX_MS, Math.max(LLMHelper.NATIVELY_QUOTA_BLOCK_MIN_MS, sec * 1000));
     this.nativelyQuotaBlockedUntil = Date.now() + ms;
+    this.nativelyLimit = { code: (/^[a-z_]{1,64}$/.test(code) ? code : 'ai_quota_exceeded'), onTrial };
+    // A free trial's AI allowance ends the trial (ipcHandlers.ts listens).
+    emitNativelyPlanLimit(this.nativelyLimit);
     console.warn(`[NativelyAPI] plan allowance exhausted (${code}) — not calling the Natively API again for ${Math.round(ms / 60000)} min${errData?.resets_at ? ` (resets ${errData.resets_at})` : ''}`);
     return true;
+  }
+
+  /** The error for an answer nothing could give: the Natively limit while it
+   *  holds, else "no provider". */
+  private exhaustedChainError(): Error {
+    if (this.nativelyLimit && this.nativelyQuotaBlockedUntil > Date.now()) {
+      return new Error(nativelyLimitErrorMessage(this.nativelyLimit));
+    }
+    return new Error(this.noProviderAvailableMessage());
   }
 
   /** Throws the same quota error the server would, without a network round trip. */
   private assertNativelyNotBlocked(requestId: string): void {
     const until = this.nativelyQuotaBlockedUntil;
     if (until > Date.now()) {
-      throw new Error(`Natively API HTTP 429 requestId=${requestId}: ai_quota_exceeded (plan allowance exhausted; next check ${new Date(until).toISOString()})`);
+      throw this.withNativelyLimit(new Error(`Natively API HTTP 429 requestId=${requestId}: ai_quota_exceeded (plan allowance exhausted; next check ${new Date(until).toISOString()})`));
     }
+  }
+
+  /** Marks a refusal as Natively's own trial or plan limit, so Direct Assist
+   *  (direct-assist/errors.ts) says that instead of "rate limited". */
+  private withNativelyLimit<E extends Error>(error: E): E & { nativelyLimit?: { code: string; onTrial: boolean } } {
+    const limit = this.nativelyLimit ?? { code: 'ai_quota_exceeded', onTrial: false };
+    return Object.assign(error, { nativelyLimit: { ...limit } });
   }
   private static readonly CIRCUIT_429_THRESHOLD = 2;      // open after N consecutive 429s
   private static readonly CIRCUIT_COOLDOWN_MS = 60_000;   // skip the saturated model for 60s
@@ -4218,8 +4253,6 @@ ${IMAGE_TRUST_TRAILER}`;
    */
   private async processImage(path: string): Promise<{ mimeType: string, data: string }> {
     try {
-      const imageBuffer = await fs.promises.readFile(path);
-
       // Resize and compress. 1536px @ q80 unless "Shrink screenshots when the
       // provider is slow" is on AND the measured provider would blow this turn's
       // budget AND this is not a coding session — then ImageOptimizer's `fast`
@@ -4230,15 +4263,9 @@ ${IMAGE_TRUST_TRAILER}`;
       // phone photo needs it (see visionImageEdge).
       const shrink = this.imageProfileFor('balanced', 0) === 'fast';
       const edge = visionImageEdge({ shrink, phoneImage: isPhoneImagePath(path) });
-      const processedBuffer = await sharp(imageBuffer)
-        .resize({
-          width: edge,
-          height: edge,
-          fit: 'inside', // Maintain aspect ratio
-          withoutEnlargement: true
-        })
-        .jpeg({ quality: shrink ? 78 : 80 }) // JPEG is much smaller than PNG
-        .toBuffer();
+      // JPEG is much smaller than PNG. A screenshot's JPEG is usually made
+      // already, right after ⌘/Ctrl+H (services/screen/preparedJpeg).
+      const processedBuffer = await preparedJpeg(path, { edge, quality: shrink ? 78 : 80 });
 
       return {
         mimeType: "image/jpeg",
@@ -4549,6 +4576,7 @@ ANSWER DIRECTLY:`;
 Detect the language of the user's most recent message and ALWAYS respond in that exact same language.
 If the user writes in Hindi, respond in Hindi. If in Spanish, respond in Spanish. If in English, respond in English.
 If the language is ambiguous, default to English.
+If an ACTIVE SKILL the user switched on asks for a specific response language, answer in that language instead.
 You may mix scripts naturally (e.g. code stays in English even when the explanation is in another language).
 [END LANGUAGE INSTRUCTION]`;
     }
@@ -6888,10 +6916,8 @@ let isMultimodal = !!(imagePaths?.length);
       for (const p of imagePaths) {
         if (fs.existsSync(p)) {
           try {
-            const compressed = await sharp(p)
-              .resize(1920, 1920, { fit: 'inside', withoutEnlargement: true })
-              .jpeg({ quality: 85 })
-              .toBuffer();
+            // Usually made already, right after ⌘/Ctrl+H (services/screen/preparedJpeg).
+            const compressed = await preparedJpeg(p, NATIVELY_API_JPEG);
             images.push({ mime_type: 'image/jpeg', data: compressed.toString('base64') });
           } catch (compressErr: any) {
             // Fallback: send raw if sharp fails (e.g. unsupported format)
@@ -6980,7 +7006,7 @@ let isMultimodal = !!(imagePaths?.length);
         const errText = await response.text().catch(() => '');
         let errData: any = {};
         try { errData = errText ? JSON.parse(errText) : {}; } catch { errData = {}; }
-        this.noteNativelyPlanLimit(response.status, response.headers, errData);
+        this.noteNativelyPlanLimit(response.status, response.headers, errData, nativelyKey === TRIAL_SENTINEL_KEY);
         console.error('[NativelyAPI] JSON HTTP failure', {
           requestId,
           serverRequestId,
@@ -7573,11 +7599,11 @@ let isMultimodal = !!(imagePaths?.length);
    * DeepSeek ran at 0.2 / seed 7 / 8192 — same prompt, different generation.
    * `opts` is the fast-model seam's override (a small cap, temperature 0).
    */
-  private agentRouterOpenAIParams(model: string, opts?: AgentRouterCallOptions): Record<string, unknown> {
+  private agentRouterOpenAIParams(model: string, opts?: AgentRouterCallOptions, promptParts: Array<string | undefined> = []): Record<string, unknown> {
     if (isDeepseekModelId(model)) {
       return {
         temperature: opts?.temperature ?? INTERACTIVE_TEMPERATURE,
-        seed: INTERACTIVE_SEED,
+        seed: interactiveSeedFor('agentrouter', [model, ...promptParts]),
         max_tokens: opts?.maxTokens ?? this.getDeepseekMaxOutput(model),
         ...DEEPSEEK_NO_THINKING,
       };
@@ -7730,7 +7756,7 @@ let isMultimodal = !!(imagePaths?.length);
     let stream: any;
     try {
       stream = await client.chat.completions.create(
-        { model, messages, stream: true, ...this.agentRouterOpenAIParams(model, opts) } as any,
+        { model, messages, stream: true, ...this.agentRouterOpenAIParams(model, opts, [systemPrompt, userMessage, (imagePaths ?? []).join('|')]) } as any,
         { signal: abortSignal },
       );
     } catch (e: any) {
@@ -10706,7 +10732,7 @@ let isMultimodal = !!(imagePaths?.length);
       // to "Answer in 100 words".
       try {
         const alreadyCarried = /<user_instructions\b|<custom_instructions>/.test(`${systemPromptOverride || ''}\n${message || ''}`);
-        const answerTurn = Boolean(routeOptions?.answerType) && routeOptions?.answerType !== 'ethical_usage_answer';
+        const answerTurn = Boolean(routeOptions?.answerType);
         if (!alreadyCarried && answerTurn) {
           const modesMgr = modesMgrForInjection || require('./services/ModesManager').ModesManager.getInstance();
           const pinnedInstructions: string = modesMgr.getActiveModePinnedInstructions?.(modeAnswerType(routeOptions), routeOptions?.pinnedModeId ?? undefined) || '';
@@ -12117,7 +12143,7 @@ let isMultimodal = !!(imagePaths?.length);
       }
     }
 
-    throw new Error(this.noProviderAvailableMessage());
+    throw this.exhaustedChainError();
   }
 
   /**
@@ -12180,10 +12206,8 @@ let isMultimodal = !!(imagePaths?.length);
       for (const p of imagePaths) {
         if (fs.existsSync(p)) {
           try {
-            const compressed = await sharp(p)
-              .resize(1920, 1920, { fit: 'inside', withoutEnlargement: true })
-              .jpeg({ quality: 85 })
-              .toBuffer();
+            // Usually made already, right after ⌘/Ctrl+H (services/screen/preparedJpeg).
+            const compressed = await preparedJpeg(p, NATIVELY_API_JPEG);
             images.push({ mime_type: 'image/jpeg', data: compressed.toString('base64') });
           } catch (compressErr: any) {
             // Fallback: send raw if sharp fails (e.g. unsupported format)
@@ -12415,7 +12439,7 @@ let isMultimodal = !!(imagePaths?.length);
       const errText = await response.text().catch(() => '');
       let errData: any = {};
       try { errData = errText ? JSON.parse(errText) : {}; } catch { errData = {}; }
-      this.noteNativelyPlanLimit(response.status, response.headers, errData);
+      const planLimit = this.noteNativelyPlanLimit(response.status, response.headers, errData, nativelyKey === TRIAL_SENTINEL_KEY);
       console.error('[NativelyAPI] stream HTTP failure', {
         requestId,
         serverRequestId,
@@ -12433,7 +12457,7 @@ let isMultimodal = !!(imagePaths?.length);
       if (directMode) {
         const error = new Error(`Natively API stream HTTP ${response.status}`) as Error & { status?: number };
         error.status = response.status;
-        throw error;
+        throw planLimit ? this.withNativelyLimit(error) : error;
       }
       throw new Error(`Natively API stream HTTP ${response.status} requestId=${requestId} serverRequestId=${serverRequestId || 'n/a'} endpoint=${endpointUrl}: ${errData.error || errText.slice(0, 300) || 'unknown'}`);
     }
@@ -12614,7 +12638,7 @@ let isMultimodal = !!(imagePaths?.length);
       messages,
       stream: true as const,
       temperature: INTERACTIVE_TEMPERATURE,
-      seed: INTERACTIVE_SEED, // Groq honors seed for near-deterministic output
+      seed: interactiveSeedFor('groq', [modelId, systemPrompt, userMessage]), // Groq honors seed for near-deterministic output
       max_tokens: 8192,
     };
     require('./llm/providerPayloadCapture').captureProviderPayload({
@@ -12827,7 +12851,7 @@ let isMultimodal = !!(imagePaths?.length);
         messages,
         stream: true,
         temperature: INTERACTIVE_TEMPERATURE,
-        seed: INTERACTIVE_SEED, // DeepSeek is OpenAI-compatible and honors seed
+        seed: interactiveSeedFor('deepseek', [model, systemPrompt, userMessage, (imagePaths ?? []).join('|')]), // DeepSeek is OpenAI-compatible and honors seed
         max_tokens: this.getDeepseekMaxOutput(model),
         ...DEEPSEEK_NO_THINKING, // else the first token waits out the default reasoning
       }, { signal: abortSignal });
@@ -13189,10 +13213,13 @@ let isMultimodal = !!(imagePaths?.length);
       : null;
     if (_gmeasure) console.log(`[Gemini.stream] +${Date.now() - _gt0}ms  cache resolve done (cacheHit=${Boolean(cacheName)}, sysPrompt=${systemInstruction?.length ?? 0}c, model=${model})`);
 
+    // Once per request (buildConfig runs again on a cache miss retry, which must
+    // not count as a repeat of the prompt).
+    const requestSeed = interactiveSeedFor('gemini', [model, systemInstruction, fullMessage, (imagePaths ?? []).join('|')]);
     const buildConfig = (useCacheName: string | null) => ({
       maxOutputTokens: MAX_OUTPUT_TOKENS,
       temperature: INTERACTIVE_TEMPERATURE,
-      seed: INTERACTIVE_SEED, // Gemini v1alpha honors seed in generationConfig
+      seed: requestSeed, // Gemini v1alpha honors seed in generationConfig
       // Per-request thinking config (doc-correct 3.x thinkingLevel): 'minimal'
       // (off, fast) for budget≤0, 'low' for Pro (which can't disable), or an
       // explicit numeric budget when a caller passes a positive one. Threaded

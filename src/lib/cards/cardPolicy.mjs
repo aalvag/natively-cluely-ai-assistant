@@ -19,6 +19,8 @@ export const CARDS = Object.freeze({
   browser_extension: Object.freeze({ cls: 'onboarding', priority: null, followUpAfterActedMs: 7 * DAY_MS }),
   trial_promo: Object.freeze({ cls: 'onboarding', priority: null }),
   natively_api_new: Object.freeze({ cls: 'onboarding', priority: null }),
+  // The full setup & demo film (src/components/onboarding/DemoVideoToaster.tsx).
+  demo_video: Object.freeze({ cls: 'onboarding', priority: null }),
   max_ultra: Object.freeze({ cls: 'promo', priority: 1, actedRetiresUntilCycleEnd: true }),
   natively_api_existing: Object.freeze({ cls: 'promo', priority: 2 }),
   profile_ad: Object.freeze({ cls: 'promo', priority: 3 }),
@@ -42,6 +44,12 @@ export const PROMO_BUDGET_MS = 3 * DAY_MS;
 
 /** No promotional card in the first 24 hours after the first launch. */
 export const DAY_ONE_MS = DAY_MS;
+
+/**
+ * Onboarding cards come at least 24 hours apart, across launches (2026-11-09):
+ * a restart must not bring the next one straight after the last.
+ */
+export const ONBOARDING_GAP_MS = DAY_MS;
 
 const DEFAULT_ENTRY = Object.freeze({
   shows: 0,
@@ -167,6 +175,17 @@ export function promoBudgetOpen(ledger, now) {
   return now >= last + PROMO_BUDGET_MS;
 }
 
+/** When an onboarding-class card last showed (ms), or null when none has. */
+export function lastOnboardingShownAt(ledger) {
+  let last = null;
+  for (const [id, card] of Object.entries(CARDS)) {
+    if (card.cls !== 'onboarding') continue;
+    const t = ledger?.cards?.[id]?.lastShownAt;
+    if (isNum(t) && (last === null || t > last)) last = t;
+  }
+  return last;
+}
+
 /** True once 24 hours have passed since the first launch. */
 export function dayOneOver(ledger, now) {
   return now >= ledger.firstLaunchAt + DAY_ONE_MS;
@@ -175,8 +194,9 @@ export function dayOneOver(ledger, now) {
 /**
  * Milliseconds until the ledger allows this card (0 = now), or null when it
  * never will (retired, or not a card). Promotional cards also wait for day one
- * and the promo budget. The scheduler turns this into its next deadline and
- * adds the per-launch caps, which the ledger cannot know.
+ * and the promo budget; onboarding cards for 24 hours after the last onboarding
+ * card. The scheduler turns this into its next deadline and adds the
+ * per-launch cap, which the ledger cannot know.
  */
 export function msUntilCardAllowed(ledger, id, now) {
   if (!Object.prototype.hasOwnProperty.call(CARDS, id)) return null;
@@ -188,6 +208,9 @@ export function msUntilCardAllowed(ledger, id, now) {
   if (CARDS[id].cls === 'promo') {
     at = Math.max(at, ledger.firstLaunchAt + DAY_ONE_MS);
     if (isNum(ledger.lastPromoShownAt)) at = Math.max(at, ledger.lastPromoShownAt + PROMO_BUDGET_MS);
+  } else {
+    const lastOnboarding = lastOnboardingShownAt(ledger);
+    if (lastOnboarding !== null) at = Math.max(at, lastOnboarding + ONBOARDING_GAP_MS);
   }
   return at - now;
 }

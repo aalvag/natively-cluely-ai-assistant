@@ -7,6 +7,7 @@ import {
   Code,
   Copy,
   Check,
+  Clock,
   Crop,
   Globe,
   HelpCircle,
@@ -18,10 +19,10 @@ import {
   MessageSquare,
   Mic,
   MicOff,
-  NotebookPen,
   Pencil,
   Quote,
   RefreshCw,
+  Repeat2,
   SlidersHorizontal,
   X,
   Zap,
@@ -29,10 +30,11 @@ import {
 } from 'lucide-react';
 import {
   mergeRollingTranscriptFinal,
-  mergeRollingTranscriptPartial,
+  rollingTranscriptWithPartial,
 } from '../../electron/utils/rollingTranscriptState.ts';
-import { categorizeSttError } from '../lib/sttErrorMapper';
+import { categorizeSttError, sttConnectionCause, sttLocalModelCause } from '../lib/sttErrorMapper';
 import { splitGistLine, splitGistLineStreaming, collapseBlockGaps } from '../lib/displayMarkup';
+import { resumedChatMessages, resumedDirectHistory } from '../lib/resumedChat.mjs';
 
 import type { SkillSummary } from '../types/electron';
 import { copyText } from '../lib/copyText';
@@ -383,7 +385,7 @@ import {
   pinnedViewportBudget,
   type OverlayResizeDirection,
 } from '../lib/overlayCustomSize.mjs';
-import { resolveChatStreamToken, resolveChatStreamDone, resolveLiveAnswerBatch, resolveChatStreamSurfaceError } from '../lib/chatStreamGuard.mjs';
+import { resolveChatStreamToken, resolveChatStreamDone, resolveLiveAnswerBatch, resolveChatStreamSurfaceError, isStaleDesktopChatEvent } from '../lib/chatStreamGuard.mjs';
 import { buildDirectWhatToSayPayload } from '../lib/directAssistWhatToSayPayload.mjs';
 import { chatFailureFromError, isProviderFailureSentence } from '../lib/chatFailure.mjs';
 import {
@@ -400,6 +402,7 @@ import {
   type DirectAssistFallbackNotice,
 } from '../lib/directAssistFailure.mjs';
 import { addAttachment, revealsOverlay, withoutFormulaImages } from '../lib/attachmentTray.mjs';
+import { createPendingScreenshots } from '../lib/pendingScreenshots.mjs';
 import { imageFilesFromDrop, overlayPasteAction } from '../lib/overlayImageDrop.mjs';
 import { shouldSkipLiveRagForChatFollowUp } from '../lib/liveRagFollowUpGate.mjs';
 import {
@@ -429,10 +432,20 @@ import {
   REVEAL_WORD_CLASS,
 } from '../lib/textRevealAnimation.mjs';
 import SyntaxHighlighter from 'react-syntax-highlighter/dist/esm/prism-light';
-import { oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { oneLight as oneLightBase } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { vividDarkCodeTheme, VIVID_DARK_LINE_NUMBER_COLOR } from '../lib/codeTheme';
 
 registerPrismLanguages();
+
+// oneLight paints hsl(230,1%,98%) on the <pre> and <code>. customStyle only
+// clears the <pre>; the <code> kept its fill, and in the streaming view (one
+// inline highlighter per line) that showed as a white bar behind every line.
+// The code block's own card is the background, so the theme's must go.
+const oneLight = {
+  ...oneLightBase,
+  'code[class*="language-"]': { ...oneLightBase['code[class*="language-"]'], background: 'transparent' },
+  'pre[class*="language-"]': { ...oneLightBase['pre[class*="language-"]'], background: 'transparent' },
+};
 // import { ModelSelector } from './ui/ModelSelector'; // REMOVED
 import 'katex/dist/katex.min.css';
 import DOMPurify from 'dompurify';
@@ -468,8 +481,9 @@ import { useShortcuts } from '../hooks/useShortcuts';
 import ClickThroughToggle from './ui/ClickThroughToggle';
 import { analytics, detectProviderType, reportAnswerFailed } from '../lib/analytics/analytics.service';
 import { interfaceThemeSurface, isCssOwnedInterfaceTheme, type MeetingInterfaceTheme } from '../lib/meetingInterfaceTheme';
-import { overlayRowOf, useOverlayButtonOrder, type OverlayButtonId } from '../lib/overlayButtonOrder';
-import { OVERLAY_BUTTONS } from './overlay/overlayButtons';
+import { isBuiltinOverlayButtonId, overlayRowOf, useOverlayButtonOrder, type BuiltinOverlayButtonId, type OverlayButtonId } from '../lib/overlayButtonOrder';
+import { getOverlayCustomButton, overlayCustomReadMinutes, useOverlayCustomButtons, type OverlayCustomButtonId } from '../lib/overlayCustomButtons';
+import { OVERLAY_BUTTONS, overlayButtonFace } from './overlay/overlayButtons';
 import {
   getGlassOverlayAppearance,
   getOverlayAppearance,
@@ -477,7 +491,7 @@ import {
 } from '../lib/overlayAppearance';
 import { NegotiationCoachingCard } from '../premium';
 import type { DynamicActionPayload } from '../types/electron';
-import { getCodexCliModelDisplayName, gatewayModelLabel, litellmModelLabel } from '../utils/modelUtils';
+import { getCodexCliModelDisplayName, gatewayModelLabel, litellmModelLabel, modelChipName } from '../utils/modelUtils';
 import { getModifierSymbol, isMac, isWindows } from '../utils/platformUtils';
 import { acceleratorToKeys } from '../utils/keyboardUtils';
 import { DynamicActionBar } from './dynamic-actions/DynamicActionBar';
@@ -514,6 +528,21 @@ const REMARK_PLUGINS = [remarkGfm, remarkMath];
 const REHYPE_PLUGINS: any[] = [[rehypeKatex, { throwOnError: false, strict: false, errorColor: '#cc0000' }]];
 
 import { DOM_CONTEXT_MAX_CHARS } from '../constants/domCapture';
+import { isKeepOverlaySizeEnabled, subscribeKeepOverlaySize } from '../lib/overlaySizeSetting';
+import {
+  EMPTY_AUDIO_WARNINGS,
+  audioWarningSeverity,
+  clearAudioWarning,
+  clearedByRebuild,
+  clearedByRecovery,
+  dismissShownAudioWarning,
+  offerAudioWarning,
+  resetAudioWarnings,
+  shownAudioWarning,
+  type AudioWarningState,
+} from './overlay/audioWarningSlots.mjs';
+import { audioBannerId, pickOverlayBanners } from './overlay/overlayBannerSlots.mjs';
+import { forgetSettledSttOutages, sttReconnectingKey, sttStoppedKey } from './overlay/sttBannerKeys.mjs';
 
 // ── Streaming-height headroom buffer (native OS window resize during token
 // streaming) ─────────────────────────────────────────────────────────────
@@ -1490,9 +1519,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   overlayOpacity = OVERLAY_OPACITY_DEFAULT,
   interfaceTheme = 'default',
 }) => {
-  // Lavender paints a light panel under the dark app theme too, so every
-  // light/dark class choice below follows the panel, not the app.
-  const isLightTheme = interfaceTheme === 'lavender' || useResolvedTheme() === 'light';
+  // Every style but glass and modern follows the app's light or dark theme
+  // (Lavender too since 2026-10-31). The hook runs on every render: behind `||` it was skipped while the theme
+  // was Lavender, and flipping in or out of Lavender changed the hook order
+  // and crashed the overlay ("Should have a queue").
+  const resolvedTheme = useResolvedTheme();
+  const isLightTheme = resolvedTheme === 'light';
   const isGlassTheme = interfaceTheme === 'liquid-glass';
   const isModernTheme = interfaceTheme === 'modern';
   // Lavender draws its buttons with the website hero's own button
@@ -1554,10 +1586,31 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     progress?: number;
     message?: string;
   }>({ stage: 'idle' });
+  // A Pro pack ran out mid-meeting (main: PackMeetingClock → 'pack-ended').
+  // Its key is switched off, so Natively transcription and Pro stop together;
+  // without this the overlay only said "check your transcription provider and
+  // its key", which sends a pack holder to the wrong place. Cleared when a new
+  // meeting starts: the clock re-sends it on that meeting's first tick if the
+  // pack is still empty. 'hours_used' | 'window_closed' | 'ended'.
+  const [packEndedReason, setPackEndedReason] = useState<string | null>(null);
+  // A local model is slower than speech (main: `behind` on stt-status,
+  // 2026-11-09). Its text still comes, later and later, so it is advice with a
+  // close, said once per meeting; it used to count as a reconnect and flash
+  // "Transcription Reconnecting" every 30 s.
+  const [sttBehind, setSttBehind] = useState(false);
+  // The transcription banners closed in this meeting, by key (kind, plus what
+  // makes one a different banner: the pack's reason, the stand-in's notice).
+  // A banner with another key still shows; the next meeting starts clean.
+  const [sttBannerDismissed, setSttBannerDismissed] = useState<readonly string[]>([]);
+  // A closed stop or reconnect is keyed by its channels; once both channels are
+  // healthy again it is forgotten, so the next outage shows
+  // (overlay/sttBannerKeys.mjs).
+  useEffect(() => {
+    setSttBannerDismissed((prev) => forgetSettledSttOutages(prev, sttUserStatus, sttInterviewerStatus));
+  }, [sttUserStatus, sttInterviewerStatus]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   // The notes window (`?window=notes`) is open: the Notes button shows it.
-  const [isNotesOpen, setIsNotesOpen] = useState(false);
   const [conversationContext, setConversationContext] = useState<string>('');
   const [isManualRecording, setIsManualRecording] = useState(false);
   const isRecordingRef = useRef(false); // Ref to track recording state (avoids stale closure)
@@ -1835,6 +1888,15 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     return () => clearTimeout(timer);
   }, [captureFallback]);
 
+  // The same for "Answer was retried without the browser border" (2026-11-09):
+  // it explains one answer, and with no expiry it stayed up for the rest of the
+  // meeting and into the next one. Cleared on session reset too.
+  useEffect(() => {
+    if (!refusalRetryNotice) return;
+    const timer = setTimeout(() => setRefusalRetryNotice(null), 20_000);
+    return () => clearTimeout(timer);
+  }, [refusalRetryNotice]);
+
   // Auto-expire the captured page-context pill if it's never consumed. The DOM
   // itself is cleared on use (handleWhatToSay) or dismiss; this just stops the
   // pill from lingering indefinitely after a capture the user didn't end up using.
@@ -2075,6 +2137,9 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // Debounce partial STT ticks so answer/solution rows are not drowned in re-renders.
   const rollingPartialDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingRollingPartialRef = useRef<string | null>(null);
+  // The bar's committed finals; the live partial is drawn after them and never
+  // committed (see rollingTranscriptWithPartial).
+  const rollingCommittedRef = useRef('');
   const interviewerSpeakingRef = useRef(false);
   const pinAnswerPanelRef = useRef<() => void>(() => {});
   const [voiceInput, setVoiceInput] = useState(''); // Accumulated user voice input
@@ -2157,6 +2222,24 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   const handleManualSubmitRef = useRef<() => void>(() => {});
   /** Blocks concurrent typed submits (double-click / key repeat) before React state updates. */
   const manualSubmitInFlightRef = useRef(false);
+  // A question typed while the previous answer still streams (2026-11-06). The
+  // flag above used to stay set until that answer FINISHED, so Enter did
+  // nothing and the question sat in the box. It is now released once the
+  // question is sent; main stops the older stream. The older stream's last
+  // tokens, done and error are kept out of the new card: from a send until
+  // main's gemini-stream-started for it, every desktop chat event is an older
+  // stream's, and after it the floor is that stream's id minus one
+  // (isStaleDesktopChatEvent). The sequence number keeps a replaced send's own
+  // error path off the new card.
+  const awaitingChatStreamStartRef = useRef(false);
+  const replacedChatStreamFloorRef = useRef<number | null>(null);
+  const manualSubmitSeqRef = useRef(0);
+  // Refs only, so the stream listeners (mounted once) can call any render's copy.
+  const staleDesktopChatEvent = (streamId: unknown, source: unknown) => isStaleDesktopChatEvent(
+    { awaitingStart: awaitingChatStreamStartRef.current, floor: replacedChatStreamFloorRef.current },
+    typeof streamId === 'number' ? streamId : undefined,
+    typeof source === 'string' ? source : undefined,
+  );
   const lastManualSubmitRef = useRef<{ text: string; atMs: number } | null>(null);
   /** Blocks duplicate quick-action LLM calls (Clarify, Follow-up, Brainstorm, Answer). */
   const overlayActionInFlightRef = useRef(new Set<string>());
@@ -2261,10 +2344,9 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // handleWhatToSay() can access it even in React 18 concurrent mode (where
   // a plain setTimeout(0) may fire before setAttachedContext flushes).
   const pendingCaptureRef = useRef<{ path: string; preview: string } | null>(null);
-
-  // Session screenshot pool: keeps recent screenshots of the active problem/session
-  // so follow-up questions retain the full visual context of previous captures.
-  const sessionCapturesRef = useRef<Array<{ path: string; preview: string; timestamp: number }>>([]);
+  // ⌘/Ctrl+H captures still in flight. A send pressed in that ~0.5 s gap waits
+  // for them and takes them along (src/lib/pendingScreenshots.mjs).
+  const pendingShotsRef = useRef(createPendingScreenshots<{ path: string; preview: string }>());
 
   // Latent Context State (Screenshots attached but not sent)
   const [attachedContext, setAttachedContext] = useState<
@@ -2469,11 +2551,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     };
   }, []);
 
-  // Glass and modern keep a dark panel under the light app theme and lavender
-  // a light one under the dark theme; only default follows the app.
+  // Glass and modern keep a dark panel under the light app theme; default and
+  // lavender follow the app.
   const isLightSurface = interfaceThemeSurface(interfaceTheme, isLightTheme ? 'light' : 'dark') === 'light';
-  // Lavender keeps the website theme's dark code well on its light panel.
-  const useDarkCodeTheme = !isLightSurface || isLavenderTheme;
+  // Lavender's code sits in a well of its own glass (2026-10-30), light or
+  // dark with the app (2026-10-31), so it takes the matching code theme.
+  const useDarkCodeTheme = !isLightSurface;
   const codeTheme = useDarkCodeTheme ? vividDarkCodeTheme : oneLight;
   const codeLineNumberColor = useDarkCodeTheme ? VIVID_DARK_LINE_NUMBER_COLOR : 'rgba(24,24,24,0.4)';
   // Header only shows for the light theme and the modern/glass interface
@@ -2931,6 +3014,17 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // fresh auto-behaviour. NOT cleared on scroll (that would spring it back open
   // the moment the user nudges the wheel — the exact fight we're killing).
   const manualWidthOverrideRef = useRef<number | null>(null);
+  // Settings → Advanced → "Keep overlay size" (overlaySizeSetting.ts), on by
+  // default: the width a code answer opened, a width set with the resize button
+  // and a dragged height all stay for the next answers. Off: the overlay narrows
+  // when no code is in view and each new answer starts from the automatic size.
+  // A ref, read on the token path; a change applies from the next resize.
+  const holdOverlaySizeRef = useRef<boolean>(isKeepOverlaySizeEnabled());
+  useEffect(() => {
+    const follow = () => { holdOverlaySizeRef.current = isKeepOverlaySizeEnabled(); };
+    follow();
+    return subscribeKeepOverlaySize(follow);
+  }, []);
   // `isShellWide` drives the resize button's icon (Maximize2 ↔ Minimize2). It is
   // derived from the live shellWidth motion value crossing the midpoint, so it
   // self-reconciles for BOTH manual toggles and automatic code-expansion — the
@@ -3030,8 +3124,35 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // True when main gave up (no more recovery attempts). Decides the banner's
     // tone: a terminal fault is an error, a stuck-but-retrying one a warning.
     terminal?: boolean;
+    // Main is still retrying; neither this nor `terminal` is advice only.
+    stuck?: boolean;
+    // false: the channel carrying audio again does not clear it (main.ts).
+    clearsOnRecovery?: boolean;
+    // A blocked permission reported mid-meeting as stuck (main.ts sets it).
+    permission?: boolean;
   };
-  const [systemAudioWarning, setSystemAudioWarning] = useState<SystemAudioWarning | null>(null);
+  // Every warning is held until it no longer holds; the banner shows the most
+  // serious, and a milder one waits under it instead of being lost
+  // (overlay/audioWarningSlots.mjs, 2026-11-09). The single slot used to take
+  // whatever arrived last.
+  const [audioWarnings, setAudioWarnings] = useState<AudioWarningState<SystemAudioWarning>>(EMPTY_AUDIO_WARNINGS);
+  const systemAudioWarning = shownAudioWarning(audioWarnings);
+  const setSystemAudioWarning = useCallback((w: SystemAudioWarning) => {
+    setAudioWarnings((s) => offerAudioWarning(s, w));
+  }, []);
+  // A warning that stops the meeting being heard (a blocked permission, a
+  // capture that gave up) reopens a collapsed overlay, WITHOUT focus: set
+  // isStealthRef first, as onEnsureExpanded does, or the [isExpanded] effect
+  // calls show()+focus() and the overlay takes the keyboard from the call
+  // (WindowHelper). An overlay already open is left alone, so the next
+  // expansion the user makes is not made quiet. A warning that main is still
+  // retrying, or advice, only sets the banner: someone who hid the overlay
+  // mid-call is not interrupted for it.
+  const revealOverlayForWarning = useCallback(() => {
+    if (isExpandedRef.current) return;
+    isStealthRef.current = true;
+    setIsExpanded(true);
+  }, []);
   // UX2: in-flight guard for the "Repair Permissions" button so a double-click
   // can't fire two concurrent tccutil sequences (whose second-arriving response
   // would clobber the first's banner mid-render).
@@ -3054,7 +3175,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       // Screen Recording TCC pane). Set channel for consistency so the
       // button-resolution logic has a single source of truth.
       setSystemAudioWarning({ kind: 'screen-recording-permission', message, channel: 'system', titleKey });
-      setIsExpanded(true); // Force overlay open so user sees the warning
+      revealOverlayForWarning();
     });
     return () => unsub?.();
   }, []);
@@ -3070,6 +3191,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       // emits the right payload (channel:'mic', stuck:true, mic-zero-fill
       // message); we just need to display it.
       //
+      // The channel carries real audio again after a stuck or terminal
+      // report (main.ts noteCaptureAudio): its warning is no longer true.
+      if (payload.recovered) {
+        setAudioWarnings((s) => clearAudioWarning(s, payload.channel, clearedByRecovery));
+        return;
+      }
       // Only surface terminal failures or the stuck signal — transient
       // recovery attempts shouldn't spam the banner since recovery
       // typically succeeds within ~1.5s.
@@ -3080,9 +3207,36 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           channel: payload.channel,
           titleKey: payload.titleKey,
           terminal: !!payload.terminal,
+          stuck: !!payload.stuck,
+          clearsOnRecovery: payload.clearsOnRecovery,
+          permission: !!payload.permission,
         });
-        setIsExpanded(true);
+        // A capture that gave up, or a permission lost mid-meeting (sent as
+        // stuck: main keeps probing), reopens a hidden overlay, quietly.
+        if (payload.terminal || payload.permission) revealOverlayForWarning();
+      } else if (payload.advisory) {
+        // Advice that is still true but changes nothing on its own (a
+        // Bluetooth mic in call mode): once per meeting, lowest priority,
+        // never over a real fault (audioWarningSlots.mjs).
+        setSystemAudioWarning({
+          kind: 'audio-capture-failure',
+          message: payload.message,
+          channel: payload.channel,
+          titleKey: payload.titleKey,
+        });
       }
+    });
+    return () => unsub?.();
+  }, []);
+
+  // The overlay window outlives meetings, so a meeting's audio warnings end
+  // with it (2026-11-09): one left up said the next meeting's audio was
+  // broken before it had started. Not on the start-side session reset: main
+  // checks the permissions BEFORE it sends that, and the meeting's own
+  // "Screen Recording Blocked" would be wiped as it arrived.
+  useEffect(() => {
+    const unsub = window.electronAPI?.onMeetingStateChanged?.((data) => {
+      if (!data?.isActive) setAudioWarnings(resetAudioWarnings());
     });
     return () => unsub?.();
   }, []);
@@ -3096,9 +3250,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   useEffect(() => {
     const unsub = window.electronAPI?.onDeviceSelectionApplied?.((payload) => {
       if (payload.kind !== 'output' || payload.fellBack) return;
-      setSystemAudioWarning((w) => (
-        w?.kind === 'audio-capture-failure' && w.channel === 'system' && w.terminal ? null : w
-      ));
+      setAudioWarnings((s) => clearAudioWarning(s, 'system', clearedByRebuild));
     });
     return () => unsub?.();
   }, []);
@@ -4340,6 +4492,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // width). English with Inter and the default five fits the default.
   const overlayButtonOrder = useOverlayButtonOrder();
   const overlayRow = overlayRowOf(overlayButtonOrder);
+  const overlayCustomButtons = useOverlayCustomButtons();
   const quickRowRef = useRef<HTMLDivElement>(null);
   const rowMeasureRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -5155,7 +5308,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       stableVisibilityTimerRef.current = null;
       const target = pendingVisibilityRef.current;
       pendingVisibilityRef.current = null;
-      if (target !== null && target !== codeExpandedRef.current) {
+      if (target !== null && target !== codeExpandedRef.current && !(target === false && holdOverlaySizeRef.current)) {
         startTransition(target ? SHELL_WIDTH_EXPANDED : SHELL_WIDTH_COLLAPSED);
       }
     }, STABILITY_MS);
@@ -5458,15 +5611,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     return () => unsubscribe();
   }, []);
 
-  // The notes window opens and closes outside this window (its own X, a
-  // meeting starting); follow it so the Notes button reads right.
-  useEffect(() => {
-    let cancelled = false;
-    window.electronAPI?.notesWindowIsOpen?.().then((open) => { if (!cancelled) setIsNotesOpen(open === true); }).catch(() => {});
-    const off = window.electronAPI?.onNotesWindowVisibility?.((open) => setIsNotesOpen(open));
-    return () => { cancelled = true; off?.(); };
-  }, []);
-
   // Sync Window Visibility with Expanded State
   useEffect(() => {
     // First run is the mount-time isExpanded=true. main.startMeeting() has
@@ -5581,10 +5725,24 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     return () => unsubscribe();
   }, []);
 
+  useEffect(() => {
+    // Main sends this only with the server's reason ('hours_used' |
+    // 'window_closed'); a reasonless one is not a pack and is ignored.
+    const offEnded = window.electronAPI?.onPackEnded?.(({ reason }) => { if (reason) setPackEndedReason(reason); });
+    const offReset = window.electronAPI?.onSessionReset?.(() => setPackEndedReason(null));
+    // Hours added mid-meeting (a top-up adds them to the same key) bring Pro
+    // back; the notice goes with it rather than staying until the next meeting.
+    const offLicence = window.electronAPI?.onLicenseStatusChanged?.(({ isPremium }) => { if (isPremium) setPackEndedReason(null); });
+    // The clock saw the hours come back (also when a lifetime licence kept Pro
+    // on, so no licence change arrives).
+    const offRenewed = window.electronAPI?.onPackRenewed?.(() => setPackEndedReason(null));
+    return () => { offEnded?.(); offReset?.(); offLicence?.(); offRenewed?.(); };
+  }, []);
+
   // Session Reset Listener - Clears UI when a NEW meeting starts
   useEffect(() => {
     if (!window.electronAPI?.onSessionReset) return;
-    const unsubscribe = window.electronAPI.onSessionReset(() => {
+    const unsubscribe = window.electronAPI.onSessionReset((payload) => {
       console.log('[NativelyInterface] Resetting session state...');
       window.electronAPI?.cancelChatStream?.();
       chatStreamIdRef.current = null;
@@ -5667,6 +5825,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         rollingPartialDebounceRef.current = null;
       }
       pendingRollingPartialRef.current = null;
+      rollingCommittedRef.current = '';
       setRollingTranscript('');
       setIsInterviewerSpeaking(false);
       interviewerSpeakingRef.current = false;
@@ -5677,7 +5836,21 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       setSttInterviewerStatus('awaiting-audio');
       setSttUserError('');
       setSttInterviewerError('');
+      // Closed banners and once-per-meeting notices are per meeting (2026-11-09),
+      // and so is the "retried without the browser border" note: it described
+      // a screenshot of the meeting that just ended.
+      setSttBehind(false);
+      setSttBannerDismissed([]);
+      setRefusalRetryNotice(null);
       // Optionally reset connection status if needed, but connection persists
+
+      // A resumed meeting (2026-11-03): its earlier answers come back, so the
+      // chat carries on where it stopped; typed turns are Direct history too.
+      const earlier = resumedChatMessages(payload?.resumedChat);
+      if (earlier.length > 0) {
+        setMessages(earlier as Message[]);
+        directAssistHistoryRef.current = resumedDirectHistory(payload?.resumedChat);
+      }
 
       // Track new conversation/session if applicable?
       // Actually 'app_opened' is global, 'assistant_started' is overlay.
@@ -5693,12 +5866,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     const { quiet, ...item } = data;
     if (revealsOverlay({ quiet })) setIsExpanded(true);
 
-    const sessionItem = { path: data.path, preview: data.preview, timestamp: Date.now() };
-    sessionCapturesRef.current = [
-      ...sessionCapturesRef.current.filter((s) => s.path !== data.path),
-      sessionItem,
-    ].slice(-5);
-
     setAttachedContext((prev) => addAttachment(prev, item));
   };
 
@@ -5706,6 +5873,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // If registered inside the [isExpanded] effect, events are dropped during cleanup.
   useEffect(() => {
     return window.electronAPI.onSttStatusChanged((data) => {
+      // Not a state change (main sends the channel's state as it was): only
+      // the "falling behind" notice, so nothing else about the channel moves.
+      if (data.behind) {
+        setSttBehind(true);
+        return;
+      }
       if (data.channel === 'user') {
         setSttUserStatus(data.state);
         setSttUserProvider(data.provider);
@@ -6712,6 +6885,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // to the auto cap before the token lays out, so the growth is one motion.
     if (
       heightPinIsCeilingRef.current &&
+      !holdOverlaySizeRef.current &&
       streamingMsgIdRef.current !== heightPinStreamIdRef.current
     ) {
       heightPinIsCeilingRef.current = false;
@@ -6773,7 +6947,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // First token of a NEW stream (id not yet reserved) → relinquish any manual
     // width pin so this answer gets fresh auto-resize behaviour. Done before the
     // eager-expand check below so a new coding answer can still grow the shell.
-    if (streamingMsgIdRef.current === null && manualWidthOverrideRef.current !== null) {
+    if (streamingMsgIdRef.current === null && manualWidthOverrideRef.current !== null && !holdOverlaySizeRef.current) {
       manualWidthOverrideRef.current = null;
     }
 
@@ -7471,7 +7645,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     diagramRepairBlockedRef.current.clear();
     previousDiagramRef.current = null;
     setMessages([]);
-    sessionCapturesRef.current = [];
     setAttachedContext([]);
     answerPanelPinnedRef.current = false;
     setAnswerPanelPinned(false);
@@ -7678,7 +7851,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       const text = pendingRollingPartialRef.current;
       pendingRollingPartialRef.current = null;
       if (text == null) return;
-      setRollingTranscript((prev) => mergeRollingTranscriptPartial(prev, text));
+      setRollingTranscript(rollingTranscriptWithPartial(rollingCommittedRef.current, text));
     }, 80);
   }, []);
 
@@ -7690,7 +7863,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     const text = pendingRollingPartialRef.current;
     pendingRollingPartialRef.current = null;
     if (text != null) {
-      setRollingTranscript((prev) => mergeRollingTranscriptPartial(prev, text));
+      setRollingTranscript(rollingTranscriptWithPartial(rollingCommittedRef.current, text));
     }
   }, []);
 
@@ -7774,7 +7947,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         flushRollingPartialPreview();
         interviewerSpeakingRef.current = false;
         setIsInterviewerSpeaking(false);
-        setRollingTranscript((prev) => mergeRollingTranscriptFinal(prev, transcript.text));
+        rollingCommittedRef.current = mergeRollingTranscriptFinal(rollingCommittedRef.current, transcript.text);
+        setRollingTranscript(rollingCommittedRef.current);
 
         setTimeout(() => {
           setIsInterviewerSpeaking(false);
@@ -8210,8 +8384,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     );
   }, [attachedContext]);
 
-  // Phone Mirror's Answer chip toggles this recording, so the phone shows it
-  // too: Stop while recording, Answer again once it ends. Reported on every
+  // Phone Mirror's Speak chip toggles this recording, so the phone shows it
+  // too: Stop while recording, Speak again once it ends. Reported on every
   // change, including the false on mount, which clears one left by a reload.
   useEffect(() => {
     window.electronAPI?.phoneMirrorSetRecording?.(isManualRecording);
@@ -8301,6 +8475,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       typeof promptInstruction === 'string' ? promptInstruction : undefined;
     setIsExpanded(true);
     setIsProcessing(true);
+    // ⌘H then ⌘Enter in one motion: wait for a screenshot still capturing.
+    const lateShots = await pendingShotsRef.current.settle();
     // Capture and clear attached image context.
     // Also merge in any screenshot from the capture-and-process shortcut that
     // arrived via pendingCaptureRef before the React state flush (React 18 fix).
@@ -8312,14 +8488,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     if (pending && !currentAttachments.some((s) => s.path === pending.path)) {
       currentAttachments = addAttachment(currentAttachments, pending);
     }
-    // Retain multi-screenshot session context (last 15 mins) if no new image was explicitly attached
-    if (currentAttachments.length === 0 && sessionCapturesRef.current.length > 0) {
-      const now = Date.now();
-      const recentValid = sessionCapturesRef.current.filter((s) => now - s.timestamp < 15 * 60 * 1000);
-      if (recentValid.length > 0) {
-        currentAttachments = recentValid.map((s) => ({ path: s.path, preview: s.preview }));
-      }
-    }
+    for (const shot of lateShots) currentAttachments = addAttachment(currentAttachments, shot);
 
     if (currentAttachments.length > 0) {
       setAttachedContext([]);
@@ -8378,7 +8547,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         // segments so a question split by punctuation/finalization stays intact,
         // while older meeting discussion cannot become the primary request.
         const directTranscriptSnapshot = pendingRollingPartialRef.current
-          ? mergeRollingTranscriptPartial(rollingTranscript, pendingRollingPartialRef.current)
+          ? rollingTranscriptWithPartial(rollingCommittedRef.current, pendingRollingPartialRef.current)
           : rollingTranscript;
         const interviewerRequest = directTranscriptSnapshot
           .split('  ·  ')
@@ -8897,11 +9066,20 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // streamId guard (audit finding #3): drop tokens from a superseded chat stream so
     // a phone-mirror or stale desktop stream can't bleed into the active bubble. Tokens
     // without a streamId (back-compat) are always accepted.
+    // The id main gave the question just sent: older desktop streams are below it.
+    cleanups.push(
+      window.electronAPI.onGeminiStreamStarted((data) => {
+        if (typeof data?.streamId !== 'number') return;
+        replacedChatStreamFloorRef.current = data.streamId - 1;
+        awaitingChatStreamStartRef.current = false;
+      }),
+    );
     cleanups.push(
       window.electronAPI.onGeminiStreamToken((token, meta) => {
         // Direct Assist owns this overlay row while active. A legacy token that
         // was already queued before cancellation must never be adopted into it.
         if (activeDirectAssistRef.current) return;
+        if (staleDesktopChatEvent(meta?.streamId, (meta as any)?.source)) return;
         const decision = resolveChatStreamToken(
           chatStreamIdRef.current, meta?.streamId,
           chatStreamSourceRef.current, (meta as any)?.source,
@@ -8917,6 +9095,9 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     cleanups.push(
       window.electronAPI.onGeminiStreamDone((data) => {
         if (activeDirectAssistRef.current) return;
+        // Replaced by a newer typed question: the new question owns the card
+        // and the spinner, so nothing here is released either.
+        if (staleDesktopChatEvent(data?.streamId, (data as any)?.source)) return;
         // Ignore a done from a superseded stream (audit finding #3) so it can't
         // tear down a newer stream's row. A done without a streamId is honored
         // (back-compat). On an honored done we clear the adopted id.
@@ -9092,6 +9273,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           }
           return;
         }
+        if (staleDesktopChatEvent(meta?.streamId, meta?.source)) return;
         if (typeof meta?.streamId === 'number'
           && chatStreamIdRef.current !== null
           && meta.streamId !== chatStreamIdRef.current) return;
@@ -9583,6 +9765,9 @@ Provide only the answer, nothing else.`;
           // surface. The desktop done/error handlers both clear it again.
           chatStreamIdRef.current = null;
           chatStreamSourceRef.current = 'desktop';
+          // As for a typed question: older desktop streams' events are dropped
+          // until main names this one's (isStaleDesktopChatEvent).
+          awaitingChatStreamStartRef.current = true;
           requestStartTimeRef.current = Date.now();
           await window.electronAPI.streamGeminiChat(
             question,
@@ -9598,6 +9783,7 @@ Provide only the answer, nothing else.`;
           // gemini-stream-error follows and nothing else releases the claim we
           // took above. Left set, it would pin the guard to 'desktop' and block
           // every phone turn — the bug this fix removes, inverted.
+          awaitingChatStreamStartRef.current = false;
           chatStreamIdRef.current = null;
           chatStreamSourceRef.current = null;
           setIsProcessing(false);
@@ -9664,22 +9850,7 @@ Provide only the answer, nothing else.`;
     // Timing: the moment this request was accepted (content-free; see diagramTimings).
     diagramRequestAtRef.current = performance.now();
     warmDiagramRendererOnIdle();
-
-    const pending = pendingCaptureRef.current;
-    let currentAttachments = attachedContext;
-    if (pending && !currentAttachments.some((s) => s.path === pending.path)) {
-      currentAttachments = [...currentAttachments, pending].slice(-5);
-    }
-    // Retain multi-screenshot session context (last 15 mins) if no new image was explicitly attached
-    if (currentAttachments.length === 0 && sessionCapturesRef.current.length > 0) {
-      const now = Date.now();
-      const recentValid = sessionCapturesRef.current.filter((s) => now - s.timestamp < 15 * 60 * 1000);
-      if (recentValid.length > 0) {
-        currentAttachments = recentValid.map((s) => ({ path: s.path, preview: s.preview }));
-      }
-    }
-
-    if (!inputValue.trim() && currentAttachments.length === 0) return;
+    if (!inputValue.trim() && attachedContext.length === 0 && !pendingShotsRef.current.inFlight()) return;
 
     const rawUserText = inputValue;
     const userText = inputValue.trim();
@@ -9702,8 +9873,23 @@ Provide only the answer, nothing else.`;
 
     const conversationContextForSubmit = buildConversationContextFromMessages(messages);
 
-    // Clear inputs immediately
+    // Cleared now, before the wait below (2026-11-06): what is typed during
+    // it is the next question, and clearing after the wait erased it.
     setInputValue('');
+
+    // ⌘H then Enter in one motion: wait for a screenshot still capturing.
+    let currentAttachments = attachedContext;
+    for (const shot of await pendingShotsRef.current.settle()) {
+      currentAttachments = addAttachment(currentAttachments, shot);
+    }
+    if (!userText && currentAttachments.length === 0) {
+      // Empty input sent only for a capture that then failed: nothing to send.
+      manualSubmitInFlightRef.current = false;
+      lastManualSubmitRef.current = last;
+      return;
+    }
+
+    // Clear the tray (the input was cleared before the wait above)
     setAttachedContext([]);
     pendingCaptureRef.current = null;
 
@@ -9831,6 +10017,7 @@ Provide only the answer, nothing else.`;
     setIsExpanded(true);
     setIsProcessing(true);
     pinAnswerPanel();
+    const mySubmit = ++manualSubmitSeqRef.current;
 
     try {
       // No RAG pre-flight here (issue #552). It used to intercept every typed
@@ -9845,15 +10032,26 @@ Provide only the answer, nothing else.`;
       // Pass imagePath if attached, AND conversation context
       // R-17: claim the desktop surface before the round-trip (see the note at
       // the other streamGeminiChat call site).
+      // Until main names this question's stream, every desktop chat event is
+      // an older question's and is dropped (isStaleDesktopChatEvent).
+      awaitingChatStreamStartRef.current = true;
       chatStreamIdRef.current = null;
       chatStreamSourceRef.current = 'desktop';
       requestStartTimeRef.current = Date.now();
+      // Sent: the next question may go while this one streams (main stops this
+      // stream for it). The double-press dedupe above still applies.
+      manualSubmitInFlightRef.current = false;
       await window.electronAPI.streamGeminiChat(
         userText || 'Analyze this screenshot',
         currentAttachments.length > 0 ? currentAttachments.map((s) => s.path) : undefined,
         effectiveConversationContext, // Pass freshly-derived context + active DOM context
       );
     } catch (err) {
+      // A newer question replaced this one (main stopped this stream): its card,
+      // claim and spinner belong to that question now.
+      if (mySubmit !== manualSubmitSeqRef.current) return;
+      // No stream will start for a send that failed.
+      awaitingChatStreamStartRef.current = false;
       // R-17: release the claim taken above — see the note at the other call site.
       chatStreamIdRef.current = null;
       chatStreamSourceRef.current = null;
@@ -9878,7 +10076,56 @@ Provide only the answer, nothing else.`;
         ];
       });
     } finally {
-      manualSubmitInFlightRef.current = false;
+      if (mySubmit === manualSubmitSeqRef.current) manualSubmitInFlightRef.current = false;
+    }
+  };
+
+  // A button the user made (Settings › Overlay › Your buttons). It runs like
+  // Define: main puts the button's contract in the system prompt as its
+  // action, with the mode and the core rules, and reads the conversation as
+  // context (llm/customButtons.ts); the answer streams into Recap's card.
+  // With "Screenshot every press" the screen goes with it.
+  const handleCustomButton = async (id: OverlayCustomButtonId) => {
+    const button = getOverlayCustomButton(id);
+    if (!button) return;
+    const actionKey = `custom:${button.id}`;
+    if (!tryBeginOverlayAction(actionKey)) return;
+    setIsExpanded(true);
+    setIsProcessing(true);
+    setMessages((prev) => [
+      ...prev,
+      { id: genMessageId(), role: 'user', text: button.name, isQuickActionLabel: true },
+    ]);
+    analytics.trackCommandExecuted(button.screenshot ? 'custom_button_screenshot' : 'custom_button');
+
+    try {
+      const imagePaths: string[] = [];
+      if (button.screenshot) {
+        try {
+          const shot = await window.electronAPI.takeScreenshot();
+          if (shot?.path) imagePaths.push(shot.path);
+        } catch (err) {
+          console.warn('[custom-button] screenshot failed; asking without it:', err);
+        }
+      }
+      prepareIntelligenceStreamPlaceholder('recap');
+      // A button saved before its contract was written runs on the user's own words.
+      const instruction = button.instruction || button.prompt;
+      const result = await window.electronAPI.generateCustomButton?.({ name: button.name, instruction, imagePaths, readMinutes: overlayCustomReadMinutes(button.prompt) });
+      if (!result?.text) discardEmptyPlaceholder('recap');
+    } catch (err) {
+      discardEmptyPlaceholder('recap');
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: genMessageId(),
+          role: 'system',
+          ...failedLine(err),
+        },
+      ]);
+    } finally {
+      endOverlayAction(actionKey);
+      setIsProcessing(false);
     }
   };
 
@@ -10788,9 +11035,12 @@ Provide only the answer, nothing else.`;
     },
     takeScreenshot: async () => {
       try {
-        const data = await window.electronAPI.takeScreenshot();
-        if (data && data.path) {
-          handleScreenshotAttach(data as { path: string; preview: string });
+        const data = await pendingShotsRef.current.track(
+          window.electronAPI.takeScreenshot() as Promise<{ path: string; preview: string } | null>,
+        );
+        // A send pressed while this was capturing already took it along.
+        if (data && data.path && !pendingShotsRef.current.claimed(data.path)) {
+          handleScreenshotAttach(data);
         }
       } catch (err) {
         console.error('Error triggering screenshot:', err);
@@ -10829,9 +11079,12 @@ Provide only the answer, nothing else.`;
     },
     takeScreenshot: async () => {
       try {
-        const data = await window.electronAPI.takeScreenshot();
-        if (data && data.path) {
-          handleScreenshotAttach(data as { path: string; preview: string });
+        const data = await pendingShotsRef.current.track(
+          window.electronAPI.takeScreenshot() as Promise<{ path: string; preview: string } | null>,
+        );
+        // A send pressed while this was capturing already took it along.
+        if (data && data.path && !pendingShotsRef.current.claimed(data.path)) {
+          handleScreenshotAttach(data);
         }
       } catch (err) {
         console.error('Error triggering screenshot:', err);
@@ -11288,25 +11541,45 @@ Provide only the answer, nothing else.`;
   // the user presses the hotkey, nothing happens, and they assume the
   // stealth feature is broken. We filter to the stealth-typing keybind
   // and render an inline banner pointing to Settings → Shortcuts.
+  //
+  // Two gaps closed (2026-11-09):
+  //  - a conflict already there at launch was never shown: main's boot-time
+  //    registration runs before this window exists, so the push is missed.
+  //    The snapshot (getKeybindRegistrationFailures) is read on mount, unless
+  //    a live push has already said something newer;
+  //  - a closed banner came back: every full re-registration (a mode switch,
+  //    a meeting start) re-tests the shortcut and re-sends the same failure.
+  //    The close holds while the failure is the same accelerator; a success,
+  //    or a conflict on another accelerator, is new and shows again.
+  const dismissedHotkeyConflictRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!window.electronAPI?.onKeybindRegistrationFailed) return;
-    const unsubscribe = window.electronAPI.onKeybindRegistrationFailed(({ id, accelerator }) => {
+    const api = window.electronAPI;
+    if (!api?.onKeybindRegistrationFailed) return;
+    let heardLive = false;
+    const offFailed = api.onKeybindRegistrationFailed(({ id, accelerator }) => {
       if (id !== 'chat:focusInput') return;
+      heardLive = true;
+      if (dismissedHotkeyConflictRef.current === accelerator) return;
+      dismissedHotkeyConflictRef.current = null;
       setStealthHotkeyConflict(accelerator);
     });
-    return unsubscribe;
-  }, []);
-
-  // Clears a stale conflict banner once the shortcut re-registers successfully
-  // (e.g. right after the user rebinds it via the "Rebind" button → Settings),
-  // instead of leaving it up until the user manually dismisses it.
-  useEffect(() => {
-    if (!window.electronAPI?.onKeybindRegistrationSucceeded) return;
-    const unsubscribe = window.electronAPI.onKeybindRegistrationSucceeded(({ id }) => {
+    // Clears a stale conflict banner once the shortcut re-registers successfully
+    // (e.g. right after the user rebinds it via the "Rebind" button → Settings),
+    // instead of leaving it up until the user manually dismisses it.
+    const offSucceeded = api.onKeybindRegistrationSucceeded?.(({ id }) => {
       if (id !== 'chat:focusInput') return;
+      heardLive = true;
+      dismissedHotkeyConflictRef.current = null;
       setStealthHotkeyConflict(null);
     });
-    return unsubscribe;
+    api.getKeybindRegistrationFailures?.()
+      .then((failures) => {
+        if (heardLive) return;
+        const conflict = failures?.find((f) => f.id === 'chat:focusInput');
+        if (conflict?.accelerator) setStealthHotkeyConflict(conflict.accelerator);
+      })
+      .catch(() => { /* older main without the snapshot: the pushes still work */ });
+    return () => { offFailed(); offSucceeded?.(); };
   }, []);
 
   // ── Click-to-activate: engage CGEventTap on chat-input click only
@@ -11489,50 +11762,145 @@ Provide only the answer, nothing else.`;
   // When an audio-capture-failure banner is showing it already conveys the
   // hard failure with the fix, so the STT failure banner stands down rather
   // than saying the same thing twice.
-  const audioFailureBannerActive = systemAudioWarning?.kind === 'audio-capture-failure';
+  // Not for advice (a Bluetooth mic in call mode): that does not explain a stop.
+  const audioFailureBannerActive = systemAudioWarning?.kind === 'audio-capture-failure' && audioWarningSeverity(systemAudioWarning) >= 2;
   // With no keys the transcription provider is 'none', so "Transcription Not
   // Configured" is true in three moments where saying it would be wrong: the
   // second it takes the automatic trial to arrive; after the trial has run out
   // (the expiry reverts the provider to 'none'); and when the trial could not
   // start. In the last two the trial banner already says what happened and
   // what to do, and "open Settings → Audio" beside it is the wrong advice.
+  // An "ended" the user closed still explains it (useOverlayTrial `closed`).
   const trialExplainsNoStt = trial.pending || trial.banner === 'ended' || trial.banner === 'failed';
   const sttFailed = sttUserStatus === 'failed' || sttInterviewerStatus === 'failed';
   const sttReconnecting = sttUserStatus === 'reconnecting' || sttInterviewerStatus === 'reconnecting';
   const shouldShowSttSummaryPill =
     !sttNotConfigured && !sttFailed && !sttReconnecting &&
     (sttUserStatus === 'preparing' || sttInterviewerStatus === 'preparing');
-  const sttStatusBanner: { tone: 'warning' | 'error'; title: string; message: string } | null =
-    sttNotConfigured
+  // What to do depends on why. An antivirus re-signing the connection, or a
+  // firewall dropping it, was reported as "check your provider and its key",
+  // and a customer reinstalled ten times before turning their antivirus off.
+  const sttConnectionAdvice = (() => {
+    const cause = sttConnectionCause([
+      sttUserStatus === 'failed' || sttUserStatus === 'reconnecting' ? sttUserError : '',
+      sttInterviewerStatus === 'failed' || sttInterviewerStatus === 'reconnecting' ? sttInterviewerError : '',
+    ]);
+    if (cause === 'secure-connection') return t('Antivirus HTTPS scanning or a network filter is intercepting the connection. Allow Natively in your antivirus, or turn off its HTTPS scanning for Natively.');
+    if (cause === 'unreachable') return t('Natively cannot reach the transcription service. Check your internet connection, and allow Natively in your firewall and antivirus.');
+    return null;
+  })();
+  // An on-device model has no key and no provider to check (issue #707: a
+  // Windows user whose local model was refused for memory was told to check
+  // its key). A local failure is terminal, so only a failed channel counts.
+  const sttLocalModelAdvice = (() => {
+    const cause = sttLocalModelCause([
+      sttUserStatus === 'failed' ? sttUserError : '',
+      sttInterviewerStatus === 'failed' ? sttInterviewerError : '',
+    ]);
+    if (cause === 'memory') return t('There is not enough free memory for the local model. Close other apps, or choose a smaller local model in Settings → Audio.');
+    if (cause === 'download') return t('The local model has not finished downloading. Check your internet connection, or choose a cloud provider in Settings → Audio.');
+    if (cause === 'model') return t('The local speech model stopped. Restart the meeting, or choose another local model or a cloud provider in Settings → Audio.');
+    if (cause === 'slow') return t('This local model is too slow for this computer, so text arrives later and later. Choose a lighter local model in Settings → Audio.');
+    return null;
+  })();
+  // kind picks the icon: only a live reconnect spins. The backup-provider
+  // banner used the same spinning arrows, and a user whose key was stopped for
+  // quota reported it as "transcription reconnecting" (user log 2026-11-03).
+  //
+  // Every one of them has the banner's ✕ (2026-11-09): "Your pack has ended"
+  // and the backup-provider note could sit there for the rest of a call. A
+  // close holds for this meeting (sttBannerDismissed, keyed below), and a
+  // banner that says something new (reconnecting → stopped, another pack
+  // reason, another stand-in) shows again.
+  const sttStatusBanner: { tone: 'warning' | 'error'; kind: 'stopped' | 'reconnecting' | 'backup' | 'pack' | 'behind'; title: string; message: string; key: string; settingsTab?: string; action?: string } | null =
+    packEndedReason
+      ? {
+          // Before every transcription case: when the pack is the cause, the
+          // provider advice below is wrong. Says what the pack covered, not
+          // that Pro stopped: a lifetime or Pro licence the user also owns
+          // keeps Pro on (packClockWiring re-checks it after this is sent).
+          tone: 'error',
+          kind: 'pack',
+          title: packEndedReason === 'hours_used' ? t('Your pack hours are used up') : t('Your pack has ended'),
+          message: sttFailed
+            ? t('Natively transcription has stopped. Add hours or choose a plan in Plans & Billing.')
+            : t('What the pack included has stopped. Add hours or choose a plan in Plans & Billing.'),
+          settingsTab: 'plans',
+          action: t('Add hours'),
+          key: `pack:${packEndedReason}`,
+        }
+      : sttNotConfigured
       ? null
       : sttFailed && !audioFailureBannerActive
         ? {
             tone: 'error',
+            kind: 'stopped',
             title: t('Transcription Stopped'),
             // Two lines: what stopped, then what to do. The provider's own
             // error (often a bare status like "401 Unauthorized") is not
             // shown; a code on screen explains nothing.
-            message:
+            message: `${
               sttUserStatus === 'failed' && sttInterviewerStatus === 'failed'
-                ? t('Nothing is being transcribed right now. Check your transcription provider and its key in Settings.')
+                ? t('Nothing is being transcribed right now.')
                 : sttUserStatus === 'failed'
-                  ? t('Your microphone is no longer being transcribed. Check your transcription provider and its key in Settings.')
-                  : t('Interviewer audio is no longer being transcribed. Check your transcription provider and its key in Settings.'),
+                  ? t('Your microphone is no longer being transcribed.')
+                  : t('Interviewer audio is no longer being transcribed.')
+            } ${sttConnectionAdvice ?? sttLocalModelAdvice ?? t('Check your transcription provider and its key in Settings.')}`,
+            key: sttStoppedKey(sttUserStatus, sttInterviewerStatus),
           }
         : sttReconnecting && !sttFailed
           ? {
               tone: 'warning',
+              kind: 'reconnecting',
               title: t('Transcription Reconnecting'),
-              message: t('The connection to your speech-to-text provider dropped. Retrying.'),
+              message: `${t('The connection to your speech-to-text provider dropped.')} ${sttConnectionAdvice ?? t('Retrying.')}`,
+              key: sttReconnectingKey(sttUserStatus, sttInterviewerStatus),
             }
           : (sttUserFallback || sttInterviewerFallback)
             ? {
                 // Still transcribing, on a stand-in: a warning, not a failure.
                 tone: 'warning',
+                kind: 'backup',
                 title: t('Transcribing on a backup provider'),
                 message: sttInterviewerFallback || sttUserFallback,
+                key: `backup:${sttInterviewerFallback || sttUserFallback}`,
               }
-            : null;
+            : sttBehind
+              ? {
+                  // Text still comes, only late: advice, not a fault.
+                  tone: 'warning',
+                  kind: 'behind',
+                  title: t('Transcription Falling Behind'),
+                  message: t('This local model is too slow for this computer, so text arrives later and later. Choose a lighter local model in Settings → Audio.'),
+                  settingsTab: 'audio',
+                  key: 'behind',
+                }
+              : null;
+  const sttStatusBannerOpen = !!sttStatusBanner && !sttBannerDismissed.includes(sttStatusBanner.key);
+
+  // At most two banners at once, the most important first
+  // (overlay/overlayBannerSlots.mjs holds the order and why, 2026-11-09). About
+  // a dozen folds used to stack without limit and push the answer off screen
+  // mid-call. One that wants to show but has no slot is only held: its state
+  // is untouched, so it folds in by itself when a slot frees.
+  // The audio banner that stands in for "Transcription Stopped" takes its rank,
+  // so the cap never holds both back.
+  const audioBannerSlotId = audioBannerId(audioWarningSeverity(systemAudioWarning), audioFailureBannerActive && sttFailed);
+  const bannerSlots = pickOverlayBanners({
+    [audioBannerSlotId]: !!systemAudioWarning,
+    'stt-error': sttStatusBannerOpen && sttStatusBanner?.tone === 'error',
+    'stt-not-configured': sttNotConfigured && !trialExplainsNoStt,
+    'stt-warning': sttStatusBannerOpen && sttStatusBanner?.tone === 'warning',
+    'ambient-mic': showAmbientMicNotice,
+    trial: !!trial.banner,
+    'auto-stop': autoStop.stopsAt !== null,
+    'last-time': !!lastTime.recap,
+    'capture-fallback': !!captureFallback,
+    'refusal-retry': !!refusalRetryNotice,
+    'stealth-permission': (isMac || isWindows) && stealthPermissionMissing,
+    'hotkey-conflict': !!stealthHotkeyConflict,
+  });
+  const audioWarningSlotted = !!systemAudioWarning && bannerSlots.has(audioBannerSlotId);
   // Whether the vision chip will render (mirrors the IIFE's early-return guard).
   const visionPillFailed = screenContextStatus === 'failed' || !!latestVisionFailureReason;
   const visionPillSucceeded =
@@ -11830,7 +12198,7 @@ Provide only the answer, nothing else.`;
                 row wraps (rather than crushing the text into a ~150px ribbon,
                 the shape that shipped the vertical-overflow bug).
               */}
-              <ChromeFold show={!!systemAudioWarning} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-audio-warning">
+              <ChromeFold show={audioWarningSlotted} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-audio-warning">
               {systemAudioWarning && (() => {
                 /*
                   Which macOS pane actually FIXES this warning.
@@ -11880,6 +12248,7 @@ Provide only the answer, nothing else.`;
                   channel: systemAudioWarning.channel,
                   titleKey: systemAudioWarning.titleKey,
                   message: systemAudioWarning.message,
+                  advisory: audioWarningSeverity(systemAudioWarning) === 1,
                 });
                 const deepLinkUrl = warningAction.type === 'external' ? warningAction.url : null;
                 const wantsMicrophonePane = warningAction.type === 'external' && warningAction.pane === 'microphone';
@@ -11927,7 +12296,7 @@ Provide only the answer, nothing else.`;
                     }
                     message={systemAudioWarning.message}
                     messageTooltip={systemAudioWarning.message}
-                    onDismiss={() => setSystemAudioWarning(null)}
+                    onDismiss={() => setAudioWarnings(dismissShownAudioWarning)}
                     dismissLabel={t('Dismiss')}
                     actions={
                       <>
@@ -12013,21 +12382,21 @@ Provide only the answer, nothing else.`;
 
               {/* A recurring meeting started: what last time's notes left open
                   (overlay/LastTimeRecapNotice.tsx; main: AssistService). */}
-              <ChromeFold show={!!lastTime.recap} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-last-time">
+              <ChromeFold show={!!lastTime.recap && bannerSlots.has('last-time')} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-last-time">
               {lastTime.recap && <LastTimeRecapBanner state={lastTime} />}
               </ChromeFold>
 
               {/* The free trial that starts by itself with a meeting: it began,
                   it is nearly over, it ran out, or it could not start
                   (overlay/TrialNotice.tsx). Never blocks the overlay. */}
-              <ChromeFold show={!!trial.banner} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-trial-notice">
+              <ChromeFold show={!!trial.banner && bannerSlots.has('trial')} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-trial-notice">
               {trial.banner && <TrialNoticeBanner trial={trial} />}
               </ChromeFold>
 
               {/* Nothing said for a while: Natively stops in a minute unless
                   something is said or the user keeps going
                   (overlay/AutoStopNotice.tsx; main: MeetingEndDetector). */}
-              <ChromeFold show={autoStop.stopsAt !== null} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-auto-stop">
+              <ChromeFold show={autoStop.stopsAt !== null && bannerSlots.has('auto-stop')} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-auto-stop">
               {autoStop.stopsAt !== null && <AutoStopNoticeBanner notice={autoStop} />}
               </ChromeFold>
 
@@ -12035,7 +12404,7 @@ Provide only the answer, nothing else.`;
                   setting on thinking it is something good, then report the mic
                   as broken. Say why, and turn it off from here; main starts
                   the meeting's capture (setAmbientChatEnabled). */}
-              <ChromeFold show={showAmbientMicNotice} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-ambient-mic">
+              <ChromeFold show={showAmbientMicNotice && bannerSlots.has('ambient-mic')} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-ambient-mic">
               {showAmbientMicNotice && (
                 <OverlayBanner
                   className="mx-4"
@@ -12058,7 +12427,7 @@ Provide only the answer, nothing else.`;
               </ChromeFold>
 
               {/* PR #173: STT Not Configured Warning Banner */}
-              <ChromeFold show={sttNotConfigured && !trialExplainsNoStt} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-stt-not-configured">
+              <ChromeFold show={sttNotConfigured && !trialExplainsNoStt && bannerSlots.has('stt-not-configured')} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-stt-not-configured">
               {sttNotConfigured && !trialExplainsNoStt && (
                 /*
                   The shared banner, as an error: with no provider nothing is
@@ -12093,20 +12462,28 @@ Provide only the answer, nothing else.`;
                   reconnecting"); warnings and errors are banners now (owner
                   request), so each says what happened in a sentence and the
                   failure carries the fix. */}
-              <ChromeFold show={!!sttStatusBanner} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-stt-status">
+              <ChromeFold show={sttStatusBannerOpen && bannerSlots.has(sttStatusBanner?.tone === 'error' ? 'stt-error' : 'stt-warning')} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-stt-status">
               {sttStatusBanner && (
                 <OverlayBanner
                   className="mx-4"
                   tone={sttStatusBanner.tone}
-                  icon={sttStatusBanner.tone === 'error' ? <MicOff strokeWidth={2.2} /> : <RefreshCw strokeWidth={2.2} className="ov-banner-spin" />}
+                  icon={sttStatusBanner.kind === 'pack' || sttStatusBanner.kind === 'behind'
+                    ? <Clock strokeWidth={2.2} />
+                    : sttStatusBanner.kind === 'stopped'
+                    ? <MicOff strokeWidth={2.2} />
+                    : sttStatusBanner.kind === 'backup'
+                      ? <Repeat2 strokeWidth={2.2} />
+                      : <RefreshCw strokeWidth={2.2} className="ov-banner-spin" />}
                   title={sttStatusBanner.title}
                   message={sttStatusBanner.message}
-                  actions={sttStatusBanner.tone === 'error' ? (
+                  onDismiss={() => setSttBannerDismissed((prev) => (prev.includes(sttStatusBanner.key) ? prev : [...prev, sttStatusBanner.key]))}
+                  dismissLabel={t('Dismiss')}
+                  actions={sttStatusBanner.tone === 'error' || sttStatusBanner.kind === 'behind' ? (
                     <OverlayBannerButton
                       variant="primary"
-                      onClick={() => window.electronAPI?.openSettingsTab?.('audio')}
+                      onClick={() => window.electronAPI?.openSettingsTab?.(sttStatusBanner.settingsTab ?? 'audio')}
                     >
-                      {t('Open Settings')}
+                      {sttStatusBanner.action ?? t('Open Settings')}
                     </OverlayBannerButton>
                   ) : undefined}
                 />
@@ -12118,7 +12495,7 @@ Provide only the answer, nothing else.`;
                   explanation lived in a tooltip; the banner shows the
                   explanation. Label and detail are main's own strings
                   (electron/services/pageCaptureFallback.ts). */}
-              <ChromeFold show={!!captureFallback} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-capture-fallback">
+              <ChromeFold show={!!captureFallback && bannerSlots.has('capture-fallback')} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-capture-fallback">
               {captureFallback && (
                 <OverlayBanner
                   className="mx-4"
@@ -12149,7 +12526,7 @@ Provide only the answer, nothing else.`;
                   to the browser's page area. Warning tone: the answer the
                   user sees is degraded, and the selective screenshot
                   (⌘/Ctrl+Shift+H) is the way around it. */}
-              <ChromeFold show={!!refusalRetryNotice} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-refusal-retry">
+              <ChromeFold show={!!refusalRetryNotice && bannerSlots.has('refusal-retry')} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-refusal-retry">
               {refusalRetryNotice && (
                 <OverlayBanner
                   className="mx-4"
@@ -12172,7 +12549,7 @@ Provide only the answer, nothing else.`;
                                   activation hotkey is already claimed by another app or by the
                                   OS). Click-to-activate still works (mousedown listener is
                                   independent of the hotkey), but the user can rebind in Settings. */}
-              <ChromeFold show={!!stealthHotkeyConflict} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-hotkey-conflict">
+              <ChromeFold show={!!stealthHotkeyConflict && bannerSlots.has('hotkey-conflict')} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-hotkey-conflict">
               {stealthHotkeyConflict && (
                 /*
                   The shared banner, as a warning: clicking the input still
@@ -12198,7 +12575,10 @@ Provide only the answer, nothing else.`;
                       {t('is already in use. Click the input to activate, or rebind in Settings.')}
                     </>
                   }
-                  onDismiss={() => setStealthHotkeyConflict(null)}
+                  onDismiss={() => {
+                    dismissedHotkeyConflictRef.current = stealthHotkeyConflict;
+                    setStealthHotkeyConflict(null);
+                  }}
                   dismissLabel={t('Dismiss')}
                   dismissButtonProps={{ 'data-stealth-ignore': 'true' }}
                   actions={
@@ -12220,7 +12600,7 @@ Provide only the answer, nothing else.`;
                                   doesn't exist on Windows, and the underlying CGEventTap
                                   Rust module ships only in the Darwin binary. Gating here
                                   is belt-and-suspenders on top of the native-side gate. */}
-              <ChromeFold show={isMac && stealthPermissionMissing} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-accessibility">
+              <ChromeFold show={isMac && stealthPermissionMissing && bannerSlots.has('stealth-permission')} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-accessibility">
               {isMac && stealthPermissionMissing && (
                 <OverlayBanner
                   className="mx-4"
@@ -12279,7 +12659,7 @@ Provide only the answer, nothing else.`;
                   so stealth typing just did nothing. There is no permission
                   to grant; the usual cause is security software blocking the
                   low-level hook. */}
-              <ChromeFold show={isWindows && stealthPermissionMissing} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-stealth-hook-blocked">
+              <ChromeFold show={isWindows && stealthPermissionMissing && bannerSlots.has('stealth-permission')} overlayVisible={isExpanded} requestHeightMotion={requestChromeHeightMotion} innerClassName="pt-3 pb-1" testId="fold-stealth-hook-blocked">
               {isWindows && stealthPermissionMissing && (
                 <OverlayBanner
                   className="mx-4"
@@ -12369,7 +12749,7 @@ Provide only the answer, nothing else.`;
               {showAnswerPanel && (
                 <motion.div
                   ref={scrollContainerRef}
-                  className={`relative flex-1 overflow-y-auto overflow-x-hidden ${hasChatContent ? 'p-4 space-y-3' : 'p-0'} no-drag isolate`}
+                  className={`overlay-scroll-fade relative flex-1 overflow-y-auto overflow-x-hidden ${hasChatContent ? 'p-4 space-y-3' : 'p-0'} no-drag isolate`}
                   layout={false}
                   style={{ scrollbarWidth: 'none', maxHeight: scrollMaxH, minHeight: scrollMinH }}
                 >
@@ -12700,13 +13080,15 @@ Provide only the answer, nothing else.`;
                   // Lavender: the hero's paper pill (hlg-*), icon and label in its slots.
                   const heroChipClass = 'hlg-sm hero-pill hero-hotkey interaction-base interaction-press shrink-0';
                   const heroIcon = (Icon: typeof Mic) => <Icon size={11} strokeWidth={2} />;
+                  // From the shared list, so Settings › Overlay draws the same word.
+                  const answerLabel = t(OVERLAY_BUTTONS.answer.label);
                   const answerContent = isLavenderTheme ? (
                     <span className="flex items-center gap-[5px]">
-                      <Mic size={11} strokeWidth={2} /> {t('Answer')}
+                      <Mic size={11} strokeWidth={2} /> {answerLabel}
                     </span>
                   ) : (
                     <span className="flex items-center gap-1.5">
-                      <Mic className="w-3 h-3 opacity-70" /> {t('Answer')}
+                      <Mic className="w-3 h-3 opacity-70" /> {answerLabel}
                     </span>
                   );
                   const stopContent = (
@@ -12715,14 +13097,18 @@ Provide only the answer, nothing else.`;
                       {t('Stop')}
                     </span>
                   );
-                  // The Answer chip is as wide as its wider label: invisible
-                  // copies of both share one grid cell with the live label, so
-                  // Answer ⇄ Stop never slides the rest of the row sideways.
+                  // The voice chip is labelled Speak, not Answer (the owner,
+                  // 2026-10-30: "Answer" sat beside "What to answer?"; you
+                  // speak a question and Stop sends it). Speak over Ask for
+                  // its width, close to Answer's. It is as wide as its wider
+                  // label: invisible copies of both share one grid cell with
+                  // the live label, so Speak ⇄ Stop never slides the rest of
+                  // the row sideways.
                   const answerSizers = (
                     <>
                       <span className="ov-chip-sizer flex items-center gap-1.5" aria-hidden>
                         <span className="w-3 h-3 shrink-0" />
-                        {ghost(t('Answer'))}
+                        {ghost(answerLabel)}
                       </span>
                       <span className="ov-chip-sizer flex items-center gap-1.5" aria-hidden>
                         <span className="w-1.5 h-1.5 shrink-0" />
@@ -12736,7 +13122,7 @@ Provide only the answer, nothing else.`;
                   // not buttons, and CSS-drawn labels.
                   const measureChip = (id: OverlayButtonId) => {
                     if (isLavenderTheme) {
-                      const { Icon, label } = OVERLAY_BUTTONS[id];
+                      const { Icon, label } = overlayButtonFace(id, t, overlayCustomButtons);
                       return (
                         <span key={id} className={`hlg-button hlg-lavender ${heroChipClass}${id === 'answer' ? ' min-w-[74px]' : ''}`}>
                           <span className="hlg-content">
@@ -12745,7 +13131,7 @@ Provide only the answer, nothing else.`;
                             ) : (
                               <>
                                 <span className="hlg-icon">{heroIcon(Icon)}</span>
-                                <span className="hlg-label">{ghost(t(label))}</span>
+                                <span className="hlg-label">{ghost(label)}</span>
                               </>
                             )}
                           </span>
@@ -12759,15 +13145,15 @@ Provide only the answer, nothing else.`;
                         </span>
                       );
                     }
-                    const { Icon, label } = OVERLAY_BUTTONS[id];
+                    const { Icon, label } = overlayButtonFace(id, t, overlayCustomButtons);
                     return (
                       <span key={id} className={chipClass} style={appearance.chipStyle}>
                         <Icon className="w-3 h-3 opacity-70" />
-                        {ghost(t(label))}
+                        {ghost(label)}
                       </span>
                     );
                   };
-                  const onChip: Record<Exclude<OverlayButtonId, 'answer'>, () => void> = {
+                  const onBuiltinChip: Record<Exclude<BuiltinOverlayButtonId, 'answer'>, () => void> = {
                     what_to_answer: () => void handleWhatToSay(),
                     clarify: () => void handleClarify(),
                     recap: () => void handleRecap(),
@@ -12777,6 +13163,9 @@ Provide only the answer, nothing else.`;
                     define: () => void handleLiveHelper('define'),
                     sound_smart: () => void handleLiveHelper('sound_smart'),
                   };
+                  // The user's own buttons ask their prompt (handleCustomButton).
+                  const onChip = (id: Exclude<OverlayButtonId, 'answer'>) =>
+                    isBuiltinOverlayButtonId(id) ? onBuiltinChip[id] : () => void handleCustomButton(id);
                   const chip = (id: OverlayButtonId) => {
                     if (isLavenderTheme) {
                       if (id === 'answer') {
@@ -12798,10 +13187,10 @@ Provide only the answer, nothing else.`;
                           </HeroGlassButton>
                         );
                       }
-                      const { Icon, label } = OVERLAY_BUTTONS[id];
+                      const { Icon, label } = overlayButtonFace(id, t, overlayCustomButtons);
                       return (
-                        <HeroGlassButton key={id} variant="lavender" onClick={onChip[id]} className={heroChipClass} icon={heroIcon(Icon)}>
-                          {t(label)}
+                        <HeroGlassButton key={id} variant="lavender" onClick={onChip(id)} className={heroChipClass} icon={heroIcon(Icon)}>
+                          {label}
                         </HeroGlassButton>
                       );
                     }
@@ -12824,10 +13213,10 @@ Provide only the answer, nothing else.`;
                         </button>
                       );
                     }
-                    const { Icon, label } = OVERLAY_BUTTONS[id];
+                    const { Icon, label } = overlayButtonFace(id, t, overlayCustomButtons);
                     return (
-                      <button key={id} onClick={onChip[id]} className={chipClass} style={appearance.chipStyle}>
-                        <Icon className="w-3 h-3 opacity-70" /> {t(label)}
+                      <button key={id} onClick={onChip(id)} className={chipClass} style={appearance.chipStyle}>
+                        <Icon className="w-3 h-3 opacity-70" /> {label}
                       </button>
                     );
                   };
@@ -13021,9 +13410,6 @@ Provide only the answer, nothing else.`;
                   {/* Custom Rich Placeholder */}
                   {!inputValue && (
                     <div className="absolute inset-x-3 top-1/2 -translate-y-1/2 min-w-0 overflow-hidden whitespace-nowrap pointer-events-none text-[13px] overlay-text-muted">
-                      {isLavenderTheme ? (
-                      <span className="overlay-input-placeholder-full">{t('Ask anything on screen or conversation')}</span>
-                      ) : (
                       <span className="overlay-input-placeholder-full inline-flex items-center gap-1.5">
                         <span>{t('Ask anything on screen or conversation, or')}</span>
                       <span className="flex items-center gap-1 opacity-80">
@@ -13043,7 +13429,6 @@ Provide only the answer, nothing else.`;
                       </span>
                       <span>{t('for selective screenshot')}</span>
                       </span>
-                      )}
                       <span className="overlay-input-placeholder-compact">{t('Ask anything…')}</span>
                     </div>
                   )}
@@ -13090,7 +13475,9 @@ Provide only the answer, nothing else.`;
                       {isLavenderTheme && <span className="hlg-lens" aria-hidden="true" />}
                       <span className={isLavenderTheme ? 'hlg-content' : 'contents'}>
                       <ModelSelectorLabel>
-                        {(() => {
+                        {/* The model's own name only, in every style: no
+                            provider, no prefix, no slug (modelChipName). */}
+                        {modelChipName((() => {
                           const m = currentModel;
                           const codexCliName = getCodexCliModelDisplayName(m);
                           if (codexCliName) return codexCliName;
@@ -13145,7 +13532,7 @@ Provide only the answer, nothing else.`;
                           // Retired 2026-09-10; DeepSeek serves it as deepseek-flash (V4.1).
                           if (m === 'deepseek-v4-flash') return 'DeepSeek V4.1 Flash';
                           return m;
-                        })()}
+                        })())}
                       </ModelSelectorLabel>
                       {isLavenderTheme ? (
                         <svg className="shrink-0" width="8" height="8" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M3 4l2 2 2-2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
@@ -13188,23 +13575,9 @@ Provide only the answer, nothing else.`;
                       </button>
                     </div>
 
-                    {/* Notes: the notes window, where the user types their own notes for
-                        this meeting; they go into the meeting notes at Stop. Lavender's
-                        row is the hero's, without Notes and Passthrough (owner request);
-                        passthrough keeps its global shortcut there. */}
-                    {!isLavenderTheme && (<>
-                    <div className="relative">
-                      <button
-                        onClick={() => { void window.electronAPI?.notesWindowToggle?.(); }}
-                        data-state={isNotesOpen ? 'open' : undefined}
-                        aria-label={t('Notes')}
-                        aria-pressed={isNotesOpen}
-                        className="w-7 h-7 rounded-[9px] flex items-center justify-center interaction-base interaction-press overlay-bare-icon"
-                      >
-                        <NotebookPen className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-
+                    {/* No Notes button in any style (the owner, 2026-10-30): the
+                        notepad is reached from Settings › Overlay, so the row keeps
+                        settings and click-through only. */}
                     {/* Mouse Passthrough Toggle. Opens into a pill with the
                         exit hotkey when turned on — once click-through is on
                         this button can no longer be clicked, so the hotkey is
@@ -13222,7 +13595,6 @@ Provide only the answer, nothing else.`;
                         ariaLabel={t('Toggle Mouse Passthrough')}
                       />
                     </div>
-                    </>)}
                   </div>
 
                   {isLavenderTheme ? (

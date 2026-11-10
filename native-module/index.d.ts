@@ -12,6 +12,11 @@ export declare class MicrophoneCapture {
    * diagnostics and HFP/Bluetooth-degradation detection only.
    */
   getNativeSampleRate(): number
+  /**
+   * Channels the device delivers before one is kept (2-4 on many laptop
+   * mic arrays) — diagnostics only; the emitted PCM is always mono.
+   */
+  getChannelCount(): number
   start(callback: ((err: Error | null, arg: Buffer) => any), onSpeechEnded?: (((err: Error | null, arg: boolean) => any)) | undefined | null, onSpeechEdge?: (((err: Error | null, arg: SpeechEdgeEvent) => any)) | undefined | null): void
   stop(): void
 }
@@ -268,6 +273,13 @@ export interface CapturedKey {
 export declare function deactivateDodoKey(licenseKey: string, instanceId: string): Promise<unknown>
 
 /**
+ * Make the BrowserWindow whose handle is passed in (getNativeWindowHandle())
+ * answer WM_MOUSEACTIVATE with MA_NOACTIVATE. Idempotent. Returns whether the
+ * window is now subclassed.
+ */
+export declare function deliverClicksWithoutActivation(handle: Buffer): boolean
+
+/**
  * The occurrences overlapping [start_ms, end_ms]; null without full access or
  * on another OS. Runs on a worker thread.
  */
@@ -337,6 +349,13 @@ export declare function inputInUse(): boolean | null
  * Cheap; safe to poll from JS to drive UI state.
  */
 export declare function isAccessibilityGranted(): boolean
+
+/**
+ * True when the active keyboard layout is a CJK IME (Chinese / Japanese /
+ * Korean), i.e. one where text is composed rather than typed key-for-key.
+ * Windows only; JS reports stealth typing unavailable while it is true.
+ */
+export declare function isImeKeyboardActive(): boolean
 
 export interface MicUser {
   /** macOS: the capturing process. Windows: unknown (the consent store is per app). */

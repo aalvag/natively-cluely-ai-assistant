@@ -1,5 +1,5 @@
 // Unit tests for electron/audio/whisper/vadProcessor.ts — the energy-based
-// VAD (30 ms / 480-sample windows at 16 kHz, RMS threshold 0.008, 10-frame
+// VAD (30 ms / 480-sample windows at 16 kHz, local RMS threshold 0.0015, 10-frame
 // hangover, 15 s force-flush) that cuts mic/system audio into speech segments
 // for local Whisper.
 //
@@ -68,13 +68,13 @@ describe('VadProcessor — initial state and trivial input', () => {
 describe('VadProcessor — energy threshold', () => {
   test('a frame just below the RMS threshold is not speech', () => {
     const vad = new VadProcessor();
-    vad.push(frames(1, 0.007));
+    vad.push(frames(1, 0.0014));
     assert.equal(vad.isInSpeech(), false);
   });
 
   test('a frame just above the RMS threshold is speech', () => {
     const vad = new VadProcessor();
-    vad.push(frames(1, 0.009));
+    vad.push(frames(1, 0.0016));
     assert.equal(vad.isInSpeech(), true);
     assert.equal(vad.currentSegmentId(), 1);
   });
@@ -86,16 +86,16 @@ describe('VadProcessor — energy threshold', () => {
   });
 
   test('energy is RMS over the whole window, not peak', () => {
-    // One 0.1 spike in an otherwise silent frame: rms = 0.1/sqrt(480) ~ 0.00456 < 0.008.
+    // One 0.02 spike in an otherwise silent frame: rms = 0.02/sqrt(480) ~ 0.000913 < 0.0015.
     const spike = silence(1);
-    spike[100] = 0.1;
+    spike[100] = 0.02;
     const quiet = new VadProcessor();
     quiet.push(spike);
     assert.equal(quiet.isInSpeech(), false);
 
-    // Four such spikes: rms = 0.1*sqrt(4/480) ~ 0.00913 >= 0.008.
+    // Four such spikes: rms = 0.02*sqrt(4/480) ~ 0.001826 >= 0.0015.
     const four = silence(1);
-    four[0] = four[100] = four[200] = four[300] = 0.1;
+    four[0] = four[100] = four[200] = four[300] = 0.02;
     const loud = new VadProcessor();
     loud.push(four);
     assert.equal(loud.isInSpeech(), true);

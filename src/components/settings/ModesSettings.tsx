@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { useResolvedTheme } from '../../hooks/useResolvedTheme';
 import { useT } from '../../i18n';
+import { useConfirmDialog } from '../ui/ConfirmDialog';
 
 export interface Mode {
     id: string;
@@ -64,6 +65,7 @@ export const ModesSettings: React.FC<ModesSettingsProps> = ({
     const theme = useResolvedTheme();
     const isLight = theme === 'light';
     const t = useT();
+    const { confirm: askConfirm, dialog: confirmDialog } = useConfirmDialog();
 
     const [modes, setModes] = useState<Mode[]>([]);
     const [activeModeId, setActiveModeId] = useState<string | null>(null);
@@ -198,7 +200,11 @@ export const ModesSettings: React.FC<ModesSettingsProps> = ({
 
     // ── Delete Mode ────────────────────────────────────────────────────────────
     const handleDeleteMode = async (modeId: string) => {
-        if (!confirm('Are you sure you want to delete this custom mode?')) return;
+        if (!(await askConfirm({
+            title: t('Delete custom mode?'),
+            description: t('This removes the custom mode and its reference files.'),
+            confirmLabel: t('Delete'),
+        }))) return;
         try {
             const api = (window as any).electronAPI;
             if (!api?.modesDelete) return;
@@ -267,6 +273,7 @@ export const ModesSettings: React.FC<ModesSettingsProps> = ({
 
     return (
         <div className={`flex flex-col h-full w-full select-none ${isLight ? 'bg-slate-50 text-slate-900' : 'bg-[#0f0f11] text-slate-100'}`}>
+            {confirmDialog}
             {/* Header */}
             <div className={`flex items-center justify-between px-6 py-4 border-b ${isLight ? 'border-slate-200 bg-white' : 'border-white/10 bg-[#141416]'}`}>
                 <div className="flex items-center gap-3">
