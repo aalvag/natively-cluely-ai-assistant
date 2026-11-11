@@ -2380,6 +2380,8 @@ export class AppState {
           actionId === 'chat:auto-type-last-code' ||
           actionId === 'chat:scrollUp' ||
           actionId === 'chat:scrollDown' ||
+          actionId === 'chat:transcriptScrollUp' ||
+          actionId === 'chat:transcriptScrollDown' ||
           actionId === 'chat:scrollLeft' ||
           actionId === 'chat:scrollRight'
         ) {
@@ -2395,6 +2397,8 @@ export class AppState {
             'chat:auto-type-last-code': 'autoTypeLastCode',
             'chat:scrollUp': 'scrollUp',
             'chat:scrollDown': 'scrollDown',
+            'chat:transcriptScrollUp': 'transcriptScrollUp',
+            'chat:transcriptScrollDown': 'transcriptScrollDown',
             'chat:scrollLeft': 'scrollLeft',
             'chat:scrollRight': 'scrollRight',
           };
