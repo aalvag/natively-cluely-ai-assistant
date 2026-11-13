@@ -1062,6 +1062,12 @@ export class IntelligenceEngine extends EventEmitter {
 
     // Fires speculative LLM inference on a stable high-confidence interviewer partial.
     // Debounced so rapid word-by-word partials don't spawn multiple streams.
+    private static onlySmallTalk(text: string): boolean {
+        try {
+            return (require('./llm/smallTalk') as typeof import('./llm/smallTalk')).isOnlySmallTalk(text);
+        } catch { return false; }
+    }
+
     private maybeSpeculate(segment: TranscriptSegment): void {
         if (this.activeMode !== 'idle' && this.activeMode !== 'assist') return;
 
@@ -1074,6 +1080,8 @@ export class IntelligenceEngine extends EventEmitter {
             words.length < this.SPECULATIVE_MIN_WORDS ||
             !IntelligenceEngine.hasQuestionSignal(text)
         ) return;
+        // Small talk gets no speculative generation (F-LAT-08; see smallTalk.ts).
+        if (IntelligenceEngine.onlySmallTalk(text)) return;
 
         if (this.speculativeTimer !== null) {
             clearTimeout(this.speculativeTimer);
@@ -1474,6 +1482,10 @@ export class IntelligenceEngine extends EventEmitter {
     prefetchAutoAnswer(questionId: string, text: string): void {
         const trimmed = (text ?? '').trim();
         if (trimmed.length < 12) return;
+        // "How are you doing today?" is not drafted before the judge rules on
+        // it: the replay spent four answer-sized calls on that greeting and
+        // showed none (forensics 2026-11-13, F-LAT-08; see smallTalk.ts).
+        if (IntelligenceEngine.onlySmallTalk(trimmed)) return;
         this.releaseExpiredSpeculation();
         // The engine's OWN speculation (from an interviewer interim) is not a
         // busy engine: the candidate below is the same speech, finished.
