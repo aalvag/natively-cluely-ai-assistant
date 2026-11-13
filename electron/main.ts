@@ -1320,6 +1320,7 @@ import { AudioDevices } from "./audio/AudioDevices"
 import { isInternalCaptureDevice, resolveRequestedInputDevice } from "./audio/audioDeviceSelection.mjs"
 import { loadNativeModule } from "./audio/nativeModuleLoader"
 import { GoogleSTT } from "./audio/GoogleSTT"
+import { MicEchoGuard } from "./audio/micEchoGuard"
 import { RestSTT } from "./audio/RestSTT"
 import { DeepgramStreamingSTT } from "./audio/DeepgramStreamingSTT"
 import { isIntelligenceFlagEnabled } from "./intelligence/intelligenceFlags"
@@ -3805,6 +3806,8 @@ export class AppState {
    * user set up carries the live stream until it is back.
    */
   private readonly _sttFailover: Record<SttSource, SttFailover | null> = { mic: null, system: null };
+  /** Interviewer words just heard, to tell speaker bleed on the mic from the user (F-CTX-12). */
+  private readonly _micEcho = new MicEchoGuard();
   private readonly sttGap = new SttGapRecoveryCoordinator({
     transcribers: (source) => {
       const { buildRecoveryTranscribers } = require('./audio/sttRecoveryTranscribers');
@@ -4376,23 +4379,33 @@ export class AppState {
       // Any text proves the connection works: closes an open outage (sttGapRecovery.ts).
       this.sttGap.onTranscript(gapSource, segment.text, segment.isFinal);
 
-      this.intelligenceManager.handleTranscript({
-        speaker: speaker,
-        ...(speakerId ? { speakerId } : {}),
-        text: segment.text,
-        timestamp: Date.now(),
-        final: segment.isFinal,
-        confidence: segment.confidence,
-        // Defect B (2026-08-01): this is the ONLY real spoken-audio seam —
-        // provenance 'stt' makes these segments memory-eligible; typed chat
-        // and assistant answers (other origins) are excluded from extraction.
-        origin: 'stt',
-        // WTA audit F9: provider identity + punctuation provenance, so
-        // downstream question scoring can treat a missing '?' as NEUTRAL
-        // when this provider never guaranteed punctuation.
-        sttProvider: sttId,
-        punctuationSource: punctuationSourceFor(sttId, segment.isFinal),
-      });
+      // Speaker bleed (audio/micEchoGuard.ts, F-CTX-12): a mic final that
+      // repeats what the interviewer just said is their voice through the
+      // user's speakers, not the user. It stays out of the session ([ME]
+      // context, refinement follow-ups) and retrieval; the display still gets it.
+      if (speaker === 'interviewer') this._micEcho.noteInterviewer(segment.text, segment.isFinal, Date.now());
+      const micEcho = speaker === 'user' && segment.isFinal && this._micEcho.isEcho(segment.text, Date.now());
+      if (micEcho) console.log(`[STT] mic final repeats the interviewer (${segment.text.length} chars): not counted as the user`);
+
+      if (!micEcho) {
+        this.intelligenceManager.handleTranscript({
+          speaker: speaker,
+          ...(speakerId ? { speakerId } : {}),
+          text: segment.text,
+          timestamp: Date.now(),
+          final: segment.isFinal,
+          confidence: segment.confidence,
+          // Defect B (2026-08-01): this is the ONLY real spoken-audio seam —
+          // provenance 'stt' makes these segments memory-eligible; typed chat
+          // and assistant answers (other origins) are excluded from extraction.
+          origin: 'stt',
+          // WTA audit F9: provider identity + punctuation provenance, so
+          // downstream question scoring can treat a missing '?' as NEUTRAL
+          // when this provider never guaranteed punctuation.
+          sttProvider: sttId,
+          punctuationSource: punctuationSourceFor(sttId, segment.isFinal),
+        });
+      }
 
       // Auto Answer (Settings > General, default OFF). Engine per the A/B
       // switch: legacy = the PR #497 debounce on interviewer finals only;
@@ -4417,7 +4430,7 @@ export class AppState {
       }
 
       // Feed final transcript to JIT RAG indexer
-      if (segment.isFinal && this.ragManager) {
+      if (segment.isFinal && this.ragManager && !micEcho) {
         this.ragManager.feedLiveTranscript([{
           speaker: speaker,
           text: segment.text,
