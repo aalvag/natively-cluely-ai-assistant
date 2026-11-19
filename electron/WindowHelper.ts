@@ -93,6 +93,9 @@ export class WindowHelper {
   // Main-process-driven maximize/restore animation (animateLauncherBounds).
   private launcherResizeTimer: NodeJS.Timeout | null = null;
   private launcherAnimating = false;
+  // Set when OS activate recreates a closed launcher so ready-to-show raises it.
+  private pendingRaiseOnReady = false;
+  private launcherRaiseRetryTimer: NodeJS.Timeout | null = null;
   private overlayBounds: Electron.Rectangle | null = null;
   // ── Overlay auxiliary windows (hug-at-rest, phase 2) ────────────────────
   // The TopPill and the resize toggle live in their OWN tiny BrowserWindows,
@@ -1001,8 +1004,27 @@ export class WindowHelper {
 
     // --- 3. Startup Sequence ---
     this.launcherWindow.once('ready-to-show', () => {
+      const shouldRaiseOnReady = this.pendingRaiseOnReady;
+      this.pendingRaiseOnReady = false;
       this.switchToLauncher();
       this.isWindowVisible = true;
+      const isAgentRun = Boolean(process.env.NATIVELY_TEST_USER_DATA_DIR);
+      let openedAtLogin = false;
+      try {
+        openedAtLogin =
+          process.platform === 'darwin' && app.getLoginItemSettings?.().wasOpenedAtLogin === true;
+      } catch {
+        openedAtLogin = false;
+      }
+      if (
+        shouldRaiseOnReady ||
+        (process.platform === 'darwin' &&
+          this.appState.getUndetectable() &&
+          !openedAtLogin &&
+          !isAgentRun)
+      ) {
+        this.raiseLauncherWindow(false);
+      }
     });
 
     this.setupWindowListeners();
@@ -1271,6 +1293,7 @@ export class WindowHelper {
 
     this.launcherWindow.on('closed', () => {
       this.cancelLauncherResizeAnimation();
+      this.cancelLauncherRaiseRetry();
       this.appState.recordNativeOomTrace('launcher-window-closed', { window: 'launcher' });
       this.appState.stopNativeOomContentTrace('launcher-window-closed');
       this.launcherWindow = null;
@@ -1430,6 +1453,7 @@ export class WindowHelper {
       this.toggleWindow?.setOpacity(0);
     }
     this.launcherWindow?.hide();
+    this.cancelLauncherRaiseRetry();
     // Hide the aux chrome explicitly and BEFORE the overlay body. This path
     // feeds screenshot capture, which waits a fixed 80ms after hide() for the
     // compositor to flush; an event-chained pill hide spends part of that
@@ -2596,8 +2620,82 @@ export class WindowHelper {
       // In undetectable mode, show without stealing focus from the foreground app.
       this.switchToOverlay(stealthShow ? true : undefined);
     } else {
-      this.switchToLauncher(stealthShow ? true : undefined);
-      this.launcherWindow?.center();
+      this.raiseLauncherWindow(true);
+    }
+  }
+
+  /** Request that the next launcher ready-to-show brings the window forward. */
+  public requestRaiseOnReady(): void {
+    this.pendingRaiseOnReady = true;
+  }
+
+  private cancelLauncherRaiseRetry(): void {
+    if (this.launcherRaiseRetryTimer) {
+      clearTimeout(this.launcherRaiseRetryTimer);
+      this.launcherRaiseRetryTimer = null;
+    }
+  }
+
+  private focusAndRaiseWindow(win: BrowserWindow): void {
+    win.show();
+    if (process.platform === 'darwin') {
+      app.focus({ steal: true });
+    }
+    try {
+      win.moveTop();
+    } catch {
+      /* moveTop can throw on wayland; ordering is best-effort there */
+    }
+    win.focus();
+  }
+
+  /**
+   * Show, un-minimize, raise, and focus the launcher on an explicit user open
+   * (Finder/Spotlight activate, duplicate launch, tray "Show Natively").
+   * In macOS undetectable mode, app.dock.hide() turns the process into an
+   * accessory UIElement, so showInactive()/focus() alone leaves the launcher
+   * buried behind the active app; stealing focus briefly + moveTop() followed
+   * by reassertUndetectableStealth() raises it while keeping the Dock hidden.
+   */
+  public raiseLauncherWindow(center = false): void {
+    this.cancelLauncherRaiseRetry();
+    this.overlayHeldHidden = false;
+    this.switchToLauncher(false);
+
+    const win = this.launcherWindow;
+    if (!win || win.isDestroyed()) return;
+
+    if (win.isMinimized()) {
+      win.restore();
+    }
+    if (center) {
+      win.center();
+    }
+    win.setOpacity(1);
+    win.setContentProtection(this.contentProtection);
+    this.focusAndRaiseWindow(win);
+    this.lastLauncherShowInactive = false;
+    this.isWindowVisible = true;
+
+    if (process.platform === 'darwin' && this.appState.getUndetectable()) {
+      this.appState.reassertUndetectableStealth();
+      // app.dock.hide() after LaunchServices activate can asynchronously hand
+      // foreground back to the previous app; re-focus once after accessory
+      // transition settles if the launcher lost focus.
+      this.launcherRaiseRetryTimer = setTimeout(() => {
+        this.launcherRaiseRetryTimer = null;
+        const current = this.launcherWindow;
+        if (
+          !current ||
+          current.isDestroyed() ||
+          this.currentWindowMode !== 'launcher' ||
+          !this.isWindowVisible ||
+          current.isFocused()
+        ) {
+          return;
+        }
+        this.focusAndRaiseWindow(current);
+      }, 150);
     }
   }
 

@@ -9764,6 +9764,27 @@ export class AppState {
     this.windowHelper.centerAndShowWindow()
   }
 
+  /**
+   * Handle macOS `activate` when a main window already exists: raise the
+   * launcher even if it is already visible behind another window (or minimized
+   * / hidden), while keeping active-meeting overlays non-intrusive.
+   */
+  public presentExistingWindow(): void {
+    if (this.windowHelper.getCurrentWindowMode() === 'overlay') {
+      if (!this.isVisible()) {
+        this.toggleMainWindow(true);
+      }
+      return;
+    }
+    const launcher = this.windowHelper.getLauncherWindow();
+    if (!launcher || launcher.isDestroyed()) {
+      this.windowHelper.requestRaiseOnReady();
+      this.createWindow();
+      return;
+    }
+    this.windowHelper.raiseLauncherWindow(false);
+  }
+
   public createTray(): void {
     this.showTray();
   }
@@ -12155,14 +12176,12 @@ if (process.env.THINKING_MATRIX === '1') {
       }
     }
 
-    // If no window exists, create it
+    // If no window exists, create it (and raise once ready)
     if (appState.getMainWindow() === null) {
-      appState.createWindow()
+      appState.getWindowHelper().requestRaiseOnReady();
+      appState.createWindow();
     } else {
-      // If the window exists but is hidden, clicking the dock icon should restore it
-      if (!appState.isVisible()) {
-        appState.toggleMainWindow();
-      }
+      appState.presentExistingWindow();
     }
   })
 
