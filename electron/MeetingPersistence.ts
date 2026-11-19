@@ -1966,6 +1966,25 @@ export class MeetingPersistence {
                 console.warn('[Hindsight] post-meeting retain skipped (non-fatal):', (hsErr as any)?.message);
             }
 
+            // Daily Brain sync (Engram + rolling Team Meet reference digest, non-blocking).
+            if (meetingData.summaryStatus !== 'failed') {
+                try {
+                    const { syncSavedMeetingToDailyBrain } = require('./services/knowledge/engramBridge') as typeof import('./services/knowledge/engramBridge');
+                    void syncSavedMeetingToDailyBrain({
+                        id: meetingId,
+                        title,
+                        date: meetingData.date,
+                        detailedSummary: summaryData,
+                        userNotes: metadata?.userNotes,
+                        summaryStatus: meetingData.summaryStatus,
+                        modeName: modeSnapshot?.name,
+                        modeTemplateType: modeSnapshot?.templateType,
+                    });
+                } catch (ebErr) {
+                    console.warn('[EngramBridge] post-meeting sync skipped (non-fatal):', (ebErr as any)?.message);
+                }
+            }
+
             // Metadata was already snapshotted before session.reset() — nothing to clear here.
 
             // Notify Frontend to refresh list.
