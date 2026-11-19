@@ -2192,8 +2192,9 @@ export function initializeIpcHandlers(appState: AppState): void {
           await mcpClient.ensureServerForActiveMode();
           if (myController.signal.aborted || _chatStreamsBySender.get(senderId)?.streamId !== myStreamId) return null;
           if (mcpClient.repoPath) {
-            console.log("[MCP] Intercepting chat message to check for codebase context...");
-            event.sender.send('gemini-chat-progress', { text: "🔍 Buscando en el repositorio con GitNexus...", override: true, streamId: myStreamId });
+            const backendLabel = mcpClient.backend === 'gitnexus' ? 'GitNexus' : 'CodeGraph';
+            console.log(`[MCP] Intercepting chat message to check for codebase context (${backendLabel})...`);
+            event.sender.send('gemini-chat-progress', { text: `🔍 Buscando en el repositorio con ${backendLabel}...`, override: true, streamId: myStreamId });
             mcpContextBlock = await mcpClient.resolveMcpContext(message, llmHelper);
             if (myController.signal.aborted || _chatStreamsBySender.get(senderId)?.streamId !== myStreamId) return null;
             if (mcpContextBlock) {
@@ -20383,37 +20384,58 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (result.canceled || !result.filePaths?.[0]) return { success: false, cancelled: true };
       const folderPath = result.filePaths[0];
 
-      // --- MCP INTEGRATION ---
+      // --- MCP INTEGRATION (CodeGraph preferred, legacy GitNexus fallback) ---
       const pathLib = require('path');
       const fs = require('fs');
+      const {
+        CODEGRAPH_REF_PREFIX,
+        LEGACY_GITNEXUS_REF_PREFIX,
+        buildAugmentedEnv,
+        mcpClient,
+        resolveCodegraphBinary,
+      } = require('./mcp/McpClientManager') as typeof import('./mcp/McpClientManager');
+
+      const codegraphBin = resolveCodegraphBinary();
+      const codegraphDir = pathLib.join(folderPath, '.codegraph');
       const gitnexusDir = pathLib.join(folderPath, '.gitnexus');
-      if (!fs.existsSync(gitnexusDir)) {
+      const useCodegraph = Boolean(codegraphBin) && (fs.existsSync(codegraphDir) || !fs.existsSync(gitnexusDir));
+
+      if (useCodegraph && codegraphBin && !fs.existsSync(codegraphDir)) {
+        console.log(`[MCP] No .codegraph directory found in ${folderPath}. Spawning codegraph init -i in background...`);
+        const { spawn } = require('child_process');
+        const indexProc = spawn(codegraphBin, ['init', '-i', folderPath], {
+          detached: true,
+          stdio: 'ignore',
+          env: buildAugmentedEnv(),
+        });
+        indexProc.unref();
+      } else if (!useCodegraph && !fs.existsSync(gitnexusDir)) {
         console.log(`[MCP] No .gitnexus directory found in ${folderPath}. Spawning gitnexus analyze in background...`);
         const { spawn } = require('child_process');
         const analyzeProc = spawn(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['-y', 'gitnexus', 'analyze', folderPath], {
           detached: true,
-          stdio: 'ignore'
+          stdio: 'ignore',
+          env: buildAugmentedEnv(),
         });
         analyzeProc.unref();
       }
 
       try {
-        const { mcpClient } = require('./mcp/McpClientManager');
-        await mcpClient.startServer(folderPath);
-        console.log(`[MCP] Server started automatically from folder upload for ${folderPath}`);
+        await mcpClient.startServer(folderPath, useCodegraph ? 'codegraph' : 'gitnexus');
+        console.log(`[MCP] Server started automatically from folder upload for ${folderPath} (${mcpClient.backend})`);
       } catch (e) {
         console.error("[MCP] Failed to start server from folder upload:", e);
       }
       // -----------------------
 
-      // Persist reference file in database with GitNexus path
+      // Persist reference file in database with CodeGraph (or GitNexus) path
       const folderName = pathLib.basename(folderPath);
-      
+
       const { ModesManager } = require('./services/ModesManager');
       const virtualFile = ModesManager.getInstance().addReferenceFile({
         modeId,
-        fileName: '🧠 GitNexus MCP: ' + folderName,
-        content: `mcp_gitnexus_path:${folderPath}`,
+        fileName: useCodegraph ? `🧠 CodeGraph MCP: ${folderName}` : `🧠 GitNexus MCP: ${folderName}`,
+        content: useCodegraph ? `${CODEGRAPH_REF_PREFIX}${folderPath}` : `${LEGACY_GITNEXUS_REF_PREFIX}${folderPath}`,
       });
 
       return { success: true, ingestedFiles: [virtualFile] };
