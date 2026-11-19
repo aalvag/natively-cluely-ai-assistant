@@ -1359,6 +1359,13 @@ export class ModesManager {
 
     /** Kick indexing for every not-yet-ready file of a mode (mode activation prewarm). */
     public async prewarmModeReferenceIndex(modeId: string): Promise<void> {
+        const targetMode = this.getModes().find(m => m.id === modeId);
+        if (targetMode && (targetMode.templateType === 'team-meet' || targetMode.name === 'Team Meet')) {
+            try {
+                const { syncSlackBrainFromDiskIntoTeamMeet } = require('./knowledge/slackBrainBridge') as typeof import('./knowledge/slackBrainBridge');
+                await syncSlackBrainFromDiskIntoTeamMeet();
+            } catch { /* non-fatal */ }
+        }
         const files = this.getReferenceFiles(modeId);
         for (const file of files) {
             const { status } = this.modeContextRetriever.getReferenceFileIndexStatus(file.id);

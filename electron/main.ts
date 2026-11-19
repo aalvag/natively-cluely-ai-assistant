@@ -2937,6 +2937,10 @@ export class AppState {
     if (!pipeline) return;
 
     this.modeReferenceRetryPromise = pipeline.waitForReady(15000).then(async () => {
+      try {
+        const { syncSlackBrainFromDiskIntoTeamMeet } = require('./services/knowledge/slackBrainBridge') as typeof import('./services/knowledge/slackBrainBridge');
+        await syncSlackBrainFromDiskIntoTeamMeet();
+      } catch { /* non-fatal */ }
       const { ModesManager } = require('./services/ModesManager');
       const modesManager = ModesManager.getInstance();
       await modesManager.retryAllLexicalOnlyFiles().catch(() => { /* logged inside */ });
