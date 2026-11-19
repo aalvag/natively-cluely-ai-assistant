@@ -3939,6 +3939,12 @@ export class AppState {
         return ModesManager.getInstance().getActiveMode()?.name ?? null;
       } catch { return null; }
     },
+    modeTemplateType: () => {
+      try {
+        const { ModesManager } = require('./services/ModesManager');
+        return ModesManager.getInstance().getActiveMode()?.templateType ?? null;
+      } catch { return null; }
+    },
     // Who the USER is, so "Raj, can you…" in a team meet stays quiet: the
     // active résumé's name, else the connected Calendar account's.
     userName: () => this.currentUserName(),

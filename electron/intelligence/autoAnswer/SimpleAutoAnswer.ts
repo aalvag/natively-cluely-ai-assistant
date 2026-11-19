@@ -36,7 +36,7 @@ import type { TranscriptTurn } from '../../llm/transcriptCleaner';
 import type { Clock, ClockTimer } from './AutoAnswerClock';
 import { systemClock } from './AutoAnswerClock';
 import {
-    JUDGE_DEADLINE_MS, JUDGE_CONTEXT_TURNS, parseJudgeVerdict, routeForVerdict, type JudgeRequest,
+    isGroupMeetingMode, JUDGE_DEADLINE_MS, JUDGE_CONTEXT_TURNS, parseJudgeVerdict, routeForVerdict, type JudgeRequest,
 } from './AutoAnswerJudge';
 import { isMidWordCut, joinTranscriptParts, normalizeForCompare, tokenContainment } from './AutoAnswerText';
 import type { AutoAnswerThresholds } from './AutoAnswerPolicy';
@@ -432,6 +432,7 @@ export interface SimpleAutoAnswerHost {
      */
     warmQuery?(text: string): void;
     modeName?(): string | null;
+    modeTemplateType?(): string | null;
     /** The USER's name, so the judge can tell an ask to them from one to a teammate. */
     userName?(): string | null;
     telemetry?(event: AutoAnswerTelemetryEvent): void;
@@ -886,6 +887,8 @@ export class SimpleAutoAnswerEngine {
         // the real words must still be judged: nothing else will re-arm.
         const onStandIn = this.pending.some(p => p.provisional);
         const standInReplaced = () => onStandIn && !this.pending.some(p => p.provisional);
+        const modeTemplateType = this.host.modeTemplateType?.() ?? null;
+        const groupMeeting = isGroupMeetingMode(modeTemplateType);
         let raw: string | null = null;
         let outcome: 'verdict' | 'timeout' | 'error' | 'unparseable' | 'absent' = 'verdict';
         if (!this.host.judgeCandidate) {
@@ -906,6 +909,7 @@ export class SimpleAutoAnswerEngine {
                         speakers: turns.map(t => (t.role === 'interviewer' ? this.speakerByTurn.get(normalizeForCompare(t.text)) : undefined)),
                         candidateParts: parts,
                         modeName: this.host.modeName?.() ?? null,
+                        ...(this.host.modeTemplateType ? { modeTemplateType } : {}),
                         questionId: id,
                         lastAnsweredText: this.lastAnsweredText,
                         userName: this.host.userName?.() ?? null,
@@ -913,8 +917,9 @@ export class SimpleAutoAnswerEngine {
                     }, abort.signal),
                     new Promise<null>((resolve) => {
                         // A candidate with a literal '?' is answered by the fallback when
-                        // the judge times out, so a stalled call only delays that answer.
-                        const asked = /\?\s*$/.test(candidate) || sentencesOf(unjudged).some(x => /\?\s*$/.test(x));
+                        // the judge times out in 1-on-1 interviews, so wait the shorter cap there.
+                        // Group meetings fail silent on judge timeout and get the full deadline.
+                        const asked = !groupMeeting && (/\?\s*$/.test(candidate) || sentencesOf(unjudged).some(x => /\?\s*$/.test(x)));
                         timer = this.clock.setTimeout(() => { timedOut = true; resolve(null); }, asked ? QUESTION_JUDGE_DEADLINE_MS : JUDGE_DEADLINE_MS);
                     }),
                 ]);
@@ -991,6 +996,10 @@ export class SimpleAutoAnswerEngine {
             // (review 2026-08-25): clear the key so the next stoppage retries.
             this.lastJudgedKey = '';
             if (standInReplaced()) { this.arm(ENDPOINT_CONFIRM_MS); return; }
+            if (groupMeeting && outcome !== 'absent') {
+                this.host.log?.(`[AutoAnswer:simple] judge ${outcome} — fail-silent in group meeting`);
+                return;
+            }
             // Near-legacy fallback: a question mark, or — on providers that
             // never guarantee punctuation — an interrogative-led utterance,
             // read per sentence from the finals no verdict has ruled on (the
