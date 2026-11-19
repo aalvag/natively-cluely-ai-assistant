@@ -11,12 +11,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 const mainSource = readFileSync(path.resolve(__dirname, '../../../electron/main.ts'), 'utf8');
 const whSource = readFileSync(path.resolve(__dirname, '../../../electron/WindowHelper.ts'), 'utf8');
+const { shortcutRestoreBounds, shortcutRestoreDisplay } = require(path.resolve(__dirname, '../../../dist-electron/electron/utils/shortcutRestore.js'));
 
 function extractMethodBody(source, signatureNeedle) {
   const idx = source.indexOf(signatureNeedle);
@@ -72,4 +75,34 @@ test('raiseLauncherWindow restores, brings to front, focuses, and re-asserts ste
     'must re-assert undetectable stealth after raising so Dock stays hidden',
   );
   assert.match(raiseBody, /setTimeout\(/, 'must re-focus once after accessory transition settles if needed');
+});
+
+test('raiseLauncherWindow moves launcher to cursor display before showing on dual-monitor setups', () => {
+  const raiseBody = extractMethodBody(whSource, 'public raiseLauncherWindow(');
+  const posIdx = raiseBody.indexOf('this.positionLauncherOnCursorDisplay(');
+  const switchIdx = raiseBody.indexOf('this.switchToLauncher(false)');
+  assert.ok(posIdx >= 0 && posIdx < switchIdx, 'must move launcher to cursor display before switchToLauncher(false)');
+
+  const posHelperBody = extractMethodBody(whSource, 'private positionLauncherOnCursorDisplay(');
+  assert.match(posHelperBody, /shortcutRestoreDisplay\(screen,\s*null,\s*bounds\)/);
+  assert.match(posHelperBody, /shortcutRestoreBounds\(/);
+
+  // Simulate stacked dual-monitor layout (upper 4K above bottom laptop display).
+  const bottomDisplay = { id: 1, workArea: { x: 0, y: 25, width: 2056, height: 1304 } };
+  const topDisplay = { id: 2, workArea: { x: -975, y: -2160, width: 3840, height: 2135 } };
+  const launcherBounds = { x: 428, y: 100, width: 1200, height: 800 };
+  const targetDisplay = shortcutRestoreDisplay(
+    {
+      getCursorScreenPoint: () => ({ x: 500, y: -900 }),
+      getDisplayNearestPoint: () => topDisplay,
+      getDisplayMatching: () => bottomDisplay,
+      getPrimaryDisplay: () => bottomDisplay,
+    },
+    null,
+    launcherBounds,
+  );
+  assert.equal(targetDisplay.id, topDisplay.id);
+  const moved = shortcutRestoreBounds(launcherBounds, targetDisplay.workArea, true, { launcher: true });
+  assert.ok(moved.y < 0, 'launcher moves to upper monitor where the cursor is');
+  assert.equal(moved.x, Math.round(-975 + (3840 - 1200) / 2));
 });

@@ -2649,6 +2649,47 @@ export class WindowHelper {
     win.focus();
   }
 
+  /** Position the launcher on the display under the cursor before showing or raising it. */
+  private positionLauncherOnCursorDisplay(win: BrowserWindow, forceCenter: boolean): void {
+    const bounds = win.getBounds();
+    const display = shortcutRestoreDisplay(screen, null, bounds);
+    const minimum = this.refreshLauncherMinimum(display.workArea);
+    const restoreBounds = {
+      ...bounds,
+      width: Math.max(bounds.width, minimum.width),
+      height: Math.max(bounds.height, minimum.height),
+    };
+    const changingDisplay = screen.getDisplayMatching(bounds).id !== display.id;
+    let target = shortcutRestoreBounds(
+      restoreBounds,
+      display.workArea,
+      changingDisplay || forceCenter,
+      { launcher: !this.launcherFilled },
+    );
+    if (changingDisplay && (this.launcherFilled || this.launcherZoomed)) {
+      target = this.launcherFilled ? { ...display.workArea } : zoomedLauncherBounds(display.workArea);
+      if (this.launcherNormalBounds) {
+        this.launcherNormalBounds = shortcutRestoreBounds(
+          this.launcherNormalBounds,
+          display.workArea,
+          true,
+          { launcher: true },
+        );
+      }
+    }
+    if (
+      target.x !== bounds.x ||
+      target.y !== bounds.y ||
+      target.width !== bounds.width ||
+      target.height !== bounds.height
+    ) {
+      win.setBounds(target, false);
+    }
+    const actual = win.getBounds();
+    this.launcherPosition = { x: actual.x, y: actual.y };
+    this.launcherSize = { width: actual.width, height: actual.height };
+  }
+
   /**
    * Show, un-minimize, raise, and focus the launcher on an explicit user open
    * (Finder/Spotlight activate, duplicate launch, tray "Show Natively").
@@ -2660,6 +2701,13 @@ export class WindowHelper {
   public raiseLauncherWindow(center = false): void {
     this.cancelLauncherRaiseRetry();
     this.overlayHeldHidden = false;
+    const preShowWin = this.launcherWindow;
+    if (preShowWin && !preShowWin.isDestroyed()) {
+      if (preShowWin.isMinimized()) {
+        preShowWin.restore();
+      }
+      this.positionLauncherOnCursorDisplay(preShowWin, center);
+    }
     this.switchToLauncher(false);
 
     const win = this.launcherWindow;
@@ -2667,9 +2715,6 @@ export class WindowHelper {
 
     if (win.isMinimized()) {
       win.restore();
-    }
-    if (center) {
-      win.center();
     }
     win.setOpacity(1);
     win.setContentProtection(this.contentProtection);
