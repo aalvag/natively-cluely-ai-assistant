@@ -2902,6 +2902,13 @@ export class LLMHelper {
     return first || null;
   }
 
+  /** Try the user's selected Antigravity model before Codex CLI when Antigravity is active. */
+  public static resolveSummaryOAuthOrder(currentModelId: string | null | undefined): Array<'antigravity' | 'codex'> {
+    return typeof currentModelId === 'string' && currentModelId.startsWith('antigravity:')
+      ? ['antigravity', 'codex']
+      : ['codex', 'antigravity'];
+  }
+
   private isCodexAvailable(): boolean {
     // The store spells this family 'codex-cli'; isProviderFamilyDisabled also
     // accepts the router's 'codex'.
@@ -15795,12 +15802,11 @@ let isMultimodal = !!(imagePaths?.length);
     promise.catch(() => { });
 
     return Promise.race([
-      promise.then(result => {
-        clearTimeout(timeoutHandle!);
-        return result;
-      }),
+      promise,
       timeoutPromise,
-    ]);
+    ]).finally(() => {
+      clearTimeout(timeoutHandle!);
+    });
   }
 
   /**
@@ -15934,13 +15940,16 @@ let isMultimodal = !!(imagePaths?.length);
       }
     }
 
-    // ATTEMPT 2: Codex CLI (if user has it enabled and signed in — text-only path)
-    if (this.isCodexAvailable()) {
+    // ATTEMPT 2 & 2b: OAuth providers (Codex CLI and Antigravity).
+    // When the user's active model is an Antigravity model, try Antigravity
+    // first instead of waiting on a 60s Codex CLI timeout beforehand.
+    const tryCodexSummary = async (): Promise<string | null> => {
+      if (!this.isCodexAvailable()) return null;
       console.log(`[LLMHelper] Attempting Codex CLI for summary...`);
       try {
         const text = await this.withTimeout(
           this.generateWithCodexCli(`Context:\n${context}`, systemPrompt),
-          Math.max(this.codexCliConfig.timeoutMs, 60000),
+          opts?.timeoutMs ? opts.timeoutMs + 5000 : Math.max(this.codexCliConfig.timeoutMs, 60000),
           'Codex CLI Summary'
         );
         if (text.trim().length > 0) {
@@ -15950,18 +15959,12 @@ let isMultimodal = !!(imagePaths?.length);
       } catch (e: any) {
         console.warn(`[LLMHelper] ⚠️ Codex CLI summary failed: ${e.message}. Falling back...`);
       }
-    }
+      return null;
+    };
 
-    // ATTEMPT 2b: Antigravity (signed in). Beside Codex CLI, the chain's other
-    // OAuth provider. This chain is FIXED — it does not consult the active model
-    // — so before this rung a user whose only working provider was Antigravity
-    // got no meeting summary at all once Natively and Codex were unavailable.
-    //
-    // Consumes the streaming generator rather than adding a non-streaming path:
-    // AntigravityService only exposes stream(), and one more shape to maintain
-    // is not worth saving a join here.
-    const antigravitySummaryModel = this.antigravityFallbackModel();
-    if (antigravitySummaryModel) {
+    const tryAntigravitySummary = async (): Promise<string | null> => {
+      const antigravitySummaryModel = this.antigravityFallbackModel();
+      if (!antigravitySummaryModel) return null;
       console.log(`[LLMHelper] Attempting Antigravity for summary...`);
       // withTimeout only RACES: when the timer wins, the loser keeps running.
       // stream() honours input.signal, so an abort is what actually stops the
@@ -15992,6 +15995,14 @@ let isMultimodal = !!(imagePaths?.length);
       } finally {
         antigravityAbort.abort();
       }
+      return null;
+    };
+
+    for (const provider of LLMHelper.resolveSummaryOAuthOrder(this.currentModelId)) {
+      const text = provider === 'antigravity'
+        ? await tryAntigravitySummary()
+        : await tryCodexSummary();
+      if (text !== null) return text;
     }
 
     // The user's own key (2026-10-15). The chain had rungs only for Natively,
